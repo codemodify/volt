@@ -1,0 +1,361 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "volt",
+  "scopeName": "source.volt",
+  "fileTypes": ["volt"],
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#package" },
+    { "include": "#import" },
+    { "include": "#method-declaration" },
+    { "include": "#function-declaration" },
+    { "include": "#type-declaration" },
+    { "include": "#var-const-declaration" },
+    { "include": "#keywords" },
+    { "include": "#builtin-constants" },
+    { "include": "#builtin-types" },
+    { "include": "#strings" },
+    { "include": "#runes" },
+    { "include": "#numbers" },
+    { "include": "#channel-ops" },
+    { "include": "#operators" },
+    { "include": "#function-call" },
+    { "include": "#punctuation" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.volt",
+          "begin": "//",
+          "end": "$",
+          "beginCaptures": {
+            "0": { "name": "punctuation.definition.comment.volt" }
+          }
+        },
+        {
+          "name": "comment.block.volt",
+          "begin": "/\\*",
+          "end": "\\*/",
+          "captures": {
+            "0": { "name": "punctuation.definition.comment.volt" }
+          }
+        }
+      ]
+    },
+
+    "package": {
+      "match": "^\\s*(package)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.other.package.volt" },
+        "2": { "name": "entity.name.namespace.volt" }
+      }
+    },
+
+    "import": {
+      "patterns": [
+        {
+          "name": "meta.import.block.volt",
+          "begin": "\\b(import)\\s*\\(",
+          "end": "\\)",
+          "beginCaptures": {
+            "1": { "name": "keyword.other.import.volt" }
+          },
+          "patterns": [
+            { "include": "#comments" },
+            { "include": "#strings" }
+          ]
+        },
+        {
+          "name": "meta.import.single.volt",
+          "match": "\\b(import)\\s+(\".*?\")",
+          "captures": {
+            "1": { "name": "keyword.other.import.volt" },
+            "2": { "name": "string.quoted.double.volt" }
+          }
+        }
+      ]
+    },
+
+    "method-declaration": {
+      "begin": "\\b(fun)\\s*\\(\\s*([A-Za-z_][A-Za-z0-9_]*)\\s+(\\*|&)?\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*\\)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+      "end": "(?<=\\))",
+      "beginCaptures": {
+        "1": { "name": "keyword.declaration.function.volt" },
+        "2": { "name": "variable.parameter.receiver.volt" },
+        "3": { "name": "storage.modifier.borrow.volt" },
+        "4": { "name": "entity.name.type.volt" },
+        "5": { "name": "entity.name.function.volt" }
+      },
+      "patterns": [
+        { "include": "#function-signature" }
+      ]
+    },
+
+    "function-declaration": {
+      "begin": "\\b(fun)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+      "end": "(?<=\\))",
+      "beginCaptures": {
+        "1": { "name": "keyword.declaration.function.volt" },
+        "2": { "name": "entity.name.function.volt" }
+      },
+      "patterns": [
+        { "include": "#function-signature" }
+      ]
+    },
+
+    "function-signature": {
+      "patterns": [
+        { "include": "#comments" },
+        { "include": "#builtin-types" },
+        { "include": "#type-sigils" },
+        { "include": "#punctuation" },
+        { "include": "#keywords-type-context" },
+        {
+          "name": "entity.name.type.volt",
+          "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+        },
+        {
+          "name": "variable.parameter.volt",
+          "match": "\\b[a-z_][A-Za-z0-9_]*\\b"
+        }
+      ]
+    },
+
+    "type-declaration": {
+      "patterns": [
+        {
+          "match": "\\b(type)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+(struct|interface)\\b",
+          "captures": {
+            "1": { "name": "keyword.declaration.type.volt" },
+            "2": { "name": "entity.name.type.volt" },
+            "3": { "name": "storage.type.volt" }
+          }
+        },
+        {
+          "match": "\\b(type)\\s+([A-Za-z_][A-Za-z0-9_]*)\\b",
+          "captures": {
+            "1": { "name": "keyword.declaration.type.volt" },
+            "2": { "name": "entity.name.type.volt" }
+          }
+        }
+      ]
+    },
+
+    "var-const-declaration": {
+      "match": "\\b(var|const)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.declaration.variable.volt" },
+        "2": { "name": "variable.other.declaration.volt" }
+      }
+    },
+
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.volt",
+          "match": "\\b(if|else|switch|case|default|for|range|break|continue|select|ret)\\b"
+        },
+        {
+          "name": "keyword.control.concurrency.volt",
+          "match": "\\b(run|def|chan)\\b"
+        },
+        {
+          "name": "keyword.operator.new.volt",
+          "match": "\\b(new)\\b"
+        },
+        {
+          "name": "keyword.declaration.volt",
+          "match": "\\b(var|const|type|fun|package|import|struct|interface|map)\\b"
+        }
+      ]
+    },
+
+    "keywords-type-context": {
+      "name": "storage.type.volt",
+      "match": "\\b(chan|map|struct|interface|fun)\\b"
+    },
+
+    "builtin-constants": {
+      "patterns": [
+        {
+          "name": "constant.language.boolean.volt",
+          "match": "\\b(true|false)\\b"
+        },
+        {
+          "name": "constant.language.nil.volt",
+          "match": "\\bnil\\b"
+        }
+      ]
+    },
+
+    "builtin-types": {
+      "name": "support.type.builtin.volt",
+      "match": "\\b(int|int8|int16|int32|int64|uint|uint8|uint16|uint32|uint64|float|float32|float64|byte|rune|bool|string|error|any|void)\\b"
+    },
+
+    "type-sigils": {
+      "patterns": [
+        {
+          "name": "storage.modifier.pointer.volt",
+          "match": "(?<![\\w\\)\\]])\\*(?=[A-Za-z_\\[])"
+        },
+        {
+          "name": "storage.modifier.borrow.volt",
+          "match": "(?<![\\w\\)\\]])&(?=[A-Za-z_\\[])"
+        }
+      ]
+    },
+
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.volt",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            { "include": "#string-escapes" }
+          ]
+        },
+        {
+          "name": "string.quoted.raw.volt",
+          "begin": "`",
+          "end": "`"
+        }
+      ]
+    },
+
+    "string-escapes": {
+      "patterns": [
+        {
+          "name": "constant.character.escape.volt",
+          "match": "\\\\([abfnrtv\\\\'\"]|x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}|[0-7]{3})"
+        },
+        {
+          "name": "invalid.illegal.escape.volt",
+          "match": "\\\\."
+        }
+      ]
+    },
+
+    "runes": {
+      "name": "string.quoted.single.volt",
+      "begin": "'",
+      "end": "'",
+      "patterns": [
+        { "include": "#string-escapes" }
+      ]
+    },
+
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.hex.volt",
+          "match": "\\b0[xX][0-9A-Fa-f][0-9A-Fa-f_]*\\b"
+        },
+        {
+          "name": "constant.numeric.binary.volt",
+          "match": "\\b0[bB][01][01_]*\\b"
+        },
+        {
+          "name": "constant.numeric.octal.volt",
+          "match": "\\b0[oO][0-7][0-7_]*\\b"
+        },
+        {
+          "name": "constant.numeric.float.volt",
+          "match": "\\b\\d[\\d_]*\\.[\\d_]*([eE][+-]?\\d[\\d_]*)?\\b|\\b\\d[\\d_]*[eE][+-]?\\d[\\d_]*\\b|(?<!\\w)\\.\\d[\\d_]*([eE][+-]?\\d[\\d_]*)?\\b"
+        },
+        {
+          "name": "constant.numeric.decimal.volt",
+          "match": "\\b\\d[\\d_]*\\b"
+        }
+      ]
+    },
+
+    "channel-ops": {
+      "name": "keyword.operator.channel.volt",
+      "match": "<-"
+    },
+
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.assignment.volt",
+          "match": "(\\+=|-=|\\*=|/=|%=|&=|\\|=|\\^=|<<=|>>=|:=|=)"
+        },
+        {
+          "name": "keyword.operator.comparison.volt",
+          "match": "(==|!=|<=|>=|<|>)"
+        },
+        {
+          "name": "keyword.operator.logical.volt",
+          "match": "(&&|\\|\\||!)"
+        },
+        {
+          "name": "keyword.operator.arithmetic.volt",
+          "match": "(\\+\\+|--|\\+|-|\\*|/|%)"
+        },
+        {
+          "name": "keyword.operator.bitwise.volt",
+          "match": "(<<|>>|\\^|\\||&)"
+        },
+        {
+          "name": "keyword.operator.variadic.volt",
+          "match": "\\.\\.\\."
+        }
+      ]
+    },
+
+    "function-call": {
+      "patterns": [
+        {
+          "match": "\\b([a-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+          "captures": {
+            "1": { "name": "entity.name.function.call.volt" }
+          }
+        },
+        {
+          "match": "\\.([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+          "captures": {
+            "1": { "name": "entity.name.function.method-call.volt" }
+          }
+        },
+        {
+          "match": "\\.([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "variable.other.member.volt" }
+          }
+        }
+      ]
+    },
+
+    "punctuation": {
+      "patterns": [
+        {
+          "name": "punctuation.separator.volt",
+          "match": "[,;]"
+        },
+        {
+          "name": "punctuation.section.parens.volt",
+          "match": "[()]"
+        },
+        {
+          "name": "punctuation.section.brackets.volt",
+          "match": "[\\[\\]]"
+        },
+        {
+          "name": "punctuation.section.braces.volt",
+          "match": "[{}]"
+        },
+        {
+          "name": "punctuation.accessor.volt",
+          "match": "\\."
+        },
+        {
+          "name": "punctuation.separator.colon.volt",
+          "match": ":"
+        }
+      ]
+    }
+  }
+}

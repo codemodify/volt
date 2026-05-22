@@ -1,0 +1,351 @@
+// =====================================================================
+// volt grammar (EBNF) — first draft, 2026-05-21
+// =====================================================================
+// Working document. Not normative yet. Captures every syntactic
+// decision made during the design conversation so far. Expect this to
+// iterate as the lexer/parser get written.
+//
+// Conventions in this file:
+//   "..."           — literal terminal (token)
+//   identifier      — refers to a production defined below
+//   { X }           — zero or more of X
+//   [ X ]           — optional X
+//   X | Y           — alternation
+//   ( X Y )         — grouping
+//
+// Whitespace and comments are handled by the lexer (not shown here).
+// Statement terminators (";") are automatically inserted at line ends —
+// the lexer is responsible for this, Go-style.
+
+// =====================================================================
+// 1. Source file structure
+// =====================================================================
+
+SourceFile      = PackageClause ";" { ImportDecl ";" } { TopLevelDecl ";" } .
+
+PackageClause   = "package" PackageName .
+PackageName     = identifier .
+
+ImportDecl      = "import" ( ImportSpec | "(" { ImportSpec ";" } ")" ) .
+ImportSpec      = string_lit .                  // import path, e.g. "time"
+
+TopLevelDecl    = VarDecl
+                | ConstDecl
+                | TypeDecl
+                | FuncDecl
+                | MethodDecl .
+
+
+// =====================================================================
+// 2. Lexical tokens
+// =====================================================================
+
+// --- identifiers ---
+identifier      = letter { letter | digit } .
+letter          = "A"..."Z" | "a"..."z" | "_" .
+digit           = "0"..."9" .
+
+// --- keywords (reserved, cannot be identifiers) ---
+//   3-letter "special" set:        var fun ret def run new int for nil map
+//   Go-style longer keywords kept: package import type struct interface
+//                                  if else switch case default chan range
+//                                  break continue const select true false
+//
+// Renamed from Go:  go → run,  defer → def,  return → ret,  func → fun.
+// Dropped from Go:  goto, fallthrough, iota, init (compiler emits startup).
+
+// --- literals ---
+// Underscore as digit separator allowed in all numeric forms (e.g. 1_000_000,
+// 0xFFFF_FFFF, 0b1010_0101). Lexer strips them before parsing the value.
+int_lit         = decimal_lit | hex_lit | binary_lit | octal_lit .
+decimal_lit     = ( "1"..."9" ) { decimal_digit | "_" decimal_digit } | "0" .
+hex_lit         = "0" ("x"|"X") hex_digit { hex_digit | "_" hex_digit } .
+binary_lit      = "0" ("b"|"B") binary_digit { binary_digit | "_" binary_digit } .
+octal_lit       = "0" ("o"|"O") octal_digit { octal_digit | "_" octal_digit } .
+
+float_lit       = decimal_digits "." [ decimal_digits ] [ exponent ]
+                | decimal_digits exponent
+                | "." decimal_digits [ exponent ] .
+exponent        = ("e"|"E") [ "+" | "-" ] decimal_digits .
+
+rune_lit        = "'" ( unicode_value | byte_value | escape_seq ) "'" .
+
+string_lit      = interpreted_string_lit | raw_string_lit .
+interpreted_string_lit = `"` { unicode_value | escape_seq } `"` .
+raw_string_lit         = "`" { unicode_char } "`" .   // multi-line, no escapes
+
+// Escape sequences: take Go's set verbatim.
+escape_seq      = "\\" ( "a" | "b" | "f" | "n" | "r" | "t" | "v" | "\\" | "'" | `"`
+                       | octal3 | "x" hex2 | "u" hex4 | "U" hex8 ) .
+
+bool_lit        = "true" | "false" .
+
+// --- comments (consumed by lexer) ---
+line_comment    = "//" { unicode_char_no_nl } newline .
+block_comment   = "/*" { unicode_char } "*/" .
+
+
+// =====================================================================
+// 3. Types
+// =====================================================================
+
+Type            = TypeName | TypeLit | "(" Type ")" .
+TypeName        = identifier [ "." identifier ] .       // pkg.TypeName
+
+TypeLit         = ArrayType
+                | SliceType
+                | StructType
+                | PointerType
+                | BorrowType
+                | FunctionType
+                | InterfaceType
+                | MapType
+                | ChannelType .
+
+// --- compound types ---
+ArrayType       = "[" Expression "]" Type .             // [4096]byte
+SliceType       = "[" "]" Type .                        // []byte
+MapType         = "map" "[" Type "]" Type .             // map[string]int
+ChannelType     = "chan" Type .                         // chan int
+
+// --- borrow / pointer types ---
+// The volt memory model: T is owned, &T is shared read-only,
+// *T is unique mutable. Both &T and *T are non-nullable.
+BorrowType      = "&" Type .                            // &T  shared, read-only
+PointerType     = "*" Type .                            // *T  unique, read/write
+
+// --- struct ---
+StructType      = "struct" "{" { FieldDecl ";" } "}" .
+FieldDecl       = identifier Type .                     // (no embedding for v1)
+
+// --- function type ---
+FunctionType    = "fun" Signature .
+Signature       = "(" [ ParamList ] ")" [ Result ] .
+ParamList       = ParamDecl { "," ParamDecl } .
+ParamDecl       = identifier Type .
+Result          = Type | "(" Type { "," Type } ")" .
+
+// --- interface (structural) ---
+InterfaceType   = "interface" "{" { MethodSpec ";" } "}" .
+MethodSpec      = identifier Signature .
+
+
+// =====================================================================
+// 4. Declarations
+// =====================================================================
+
+// --- variable declaration ---
+VarDecl         = "var" identifier Type [ "=" Expression ]
+                | "var" identifier "=" Expression .     // type inferred
+
+// --- constant declaration ---
+ConstDecl       = "const" identifier [ Type ] "=" Expression .
+
+// --- type declaration ---
+TypeDecl        = "type" identifier Type .
+
+// --- function declaration ---
+FuncDecl        = "fun" identifier Signature Block .
+
+// --- method declaration ---
+MethodDecl      = "fun" Receiver identifier Signature Block .
+Receiver        = "(" identifier ReceiverType ")" .
+ReceiverType    = TypeName                              // takes ownership
+                | "&" TypeName                          // shared borrow
+                | "*" TypeName .                        // unique mutable borrow
+
+Block           = "{" { Statement ";" } "}" .
+
+
+// =====================================================================
+// 5. Statements
+// =====================================================================
+
+Statement       = Declaration
+                | SimpleStmt
+                | ReturnStmt
+                | BreakStmt
+                | ContinueStmt
+                | Block
+                | IfStmt
+                | SwitchStmt
+                | SelectStmt
+                | ForStmt
+                | DeferStmt
+                | RunStmt
+                | LabeledStmt .
+
+Declaration     = VarDecl | ConstDecl | TypeDecl .
+
+// --- simple statements ---
+SimpleStmt      = EmptyStmt
+                | ExpressionStmt
+                | SendStmt
+                | IncDecStmt
+                | Assignment
+                | ShortVarDecl .
+
+EmptyStmt       = .
+ExpressionStmt  = Expression .
+SendStmt        = Expression "<-" Expression .          // ch <- v
+IncDecStmt      = Expression ( "++" | "--" ) .
+Assignment      = ExpressionList AssignOp ExpressionList .
+AssignOp        = "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^=" | "<<=" | ">>=" .
+ShortVarDecl    = IdentifierList ":=" ExpressionList .
+
+// --- ret / def / run ---
+ReturnStmt      = "ret" [ ExpressionList ] .
+DeferStmt       = "def" Expression .                    // expression is usually a call
+RunStmt         = "run" Expression .                    // launches a goroutine
+
+// --- control flow ---
+BreakStmt       = "break" [ Label ] .                   // optional label for nested loop
+ContinueStmt    = "continue" [ Label ] .
+LabeledStmt     = Label ":" Statement .                 // labels remain (for break/continue)
+Label           = identifier .
+
+IfStmt          = "if" [ SimpleStmt ";" ] Expression Block [ "else" ( IfStmt | Block ) ] .
+
+SwitchStmt      = "switch" [ SimpleStmt ";" ] [ Expression ] "{" { ExprCaseClause } "}" .
+ExprCaseClause  = ExprSwitchCase ":" { Statement } .
+ExprSwitchCase  = "case" ExpressionList | "default" .
+
+SelectStmt      = "select" "{" { CommClause } "}" .
+CommClause      = CommCase ":" { Statement } .
+CommCase        = "case" ( SendStmt | RecvStmt ) | "default" .
+RecvStmt        = [ ExpressionList ( "=" | ":=" ) ] RecvExpr .
+RecvExpr        = "<-" Expression .
+
+ForStmt         = "for" [ ForHeader ] Block .
+ForHeader       = Condition | ForClause | RangeClause .
+Condition       = Expression .
+ForClause       = [ SimpleStmt ] ";" [ Condition ] ";" [ SimpleStmt ] .
+RangeClause     = [ IdentifierList ":=" ] "range" Expression .
+
+
+// =====================================================================
+// 6. Expressions
+// =====================================================================
+
+Expression      = UnaryExpr | Expression BinaryOp Expression .
+
+UnaryExpr       = PrimaryExpr | UnaryOp UnaryExpr .
+
+PrimaryExpr     = Operand
+                | PrimaryExpr Selector
+                | PrimaryExpr Index
+                | PrimaryExpr Slice
+                | PrimaryExpr Arguments .
+
+Operand         = Literal
+                | OperandName
+                | NewExpr
+                | "(" Expression ")" .
+
+OperandName     = identifier [ "." identifier ] .       // x or pkg.X
+
+// --- literals ---
+Literal         = BasicLit | CompositeLit | FunctionLit .
+BasicLit        = int_lit | float_lit | string_lit | rune_lit | bool_lit | "nil" .
+
+CompositeLit    = LiteralType "{" [ ElementList ] "}" .
+LiteralType     = StructType | ArrayType | SliceType | MapType | TypeName .
+ElementList     = KeyedElement { "," KeyedElement } [ "," ] .
+KeyedElement    = [ Key ":" ] Element .
+Key             = identifier | Expression .             // field name or map key
+Element         = Expression | LiteralValue .
+LiteralValue    = "{" [ ElementList ] "}" .             // nested literal
+
+FunctionLit     = "fun" Signature Block .
+
+// --- new expression (heap allocation, type inferred from context) ---
+NewExpr         = "new" NewBody .
+NewBody         = "(" [ ExpressionList ] ")"            // new(args), type from LHS
+                | "{" [ ElementList ] "}"               // new{fields}, type from LHS
+                | Type ( "(" [ ExpressionList ] ")" | "{" [ ElementList ] "}" ) .
+                  // explicit-type fallback: new T(args) or new T{fields}
+
+// --- access / call ---
+Selector        = "." identifier .
+Index           = "[" Expression "]" .
+Slice           = "[" [ Expression ] ":" [ Expression ] [ ":" Expression ] "]" .
+Arguments       = "(" [ ExpressionList [ "..." ] ] ")" .
+
+// --- expression lists ---
+ExpressionList  = Expression { "," Expression } .
+IdentifierList  = identifier { "," identifier } .
+
+
+// =====================================================================
+// 7. Operators and precedence
+// =====================================================================
+
+// Lowest to highest precedence (left-associative within each row):
+//
+//   1.  ||
+//   2.  &&
+//   3.  ==  !=  <  <=  >  >=
+//   4.  +   -   |   ^
+//   5.  *   /   %   <<  >>  &  &^
+//   6.  unary:  +  -  !  ^  <-  *   (deref)
+//
+// Notes on sigil disambiguation:
+//   *  - binary: multiplication;  unary in expression: deref;  in type position: PointerType
+//   &  - binary: bitwise AND;     in type position: BorrowType
+//   <- - binary: channel send;    unary: channel receive
+//
+// There is NO `&` operator at call/expression sites in user code:
+//   call sites use bare names; the compiler infers move / &T / *T from
+//   the receiver's parameter type. The `&` token only appears in TYPE
+//   positions (function signatures, struct fields, var declarations).
+
+BinaryOp        = "||" | "&&"
+                | "==" | "!=" | "<" | "<=" | ">" | ">="
+                | "+" | "-" | "|" | "^"
+                | "*" | "/" | "%" | "<<" | ">>" | "&" .
+
+UnaryOp         = "+" | "-" | "!" | "^" | "<-" | "*" .
+
+
+// =====================================================================
+// 8. Operator and punctuation tokens (for the lexer)
+// =====================================================================
+
+// Operators:    +  -  *  /  %
+//               &  |  ^  <<  >>
+//               &&  ||  !
+//               ==  !=  <  <=  >  >=
+//               =   :=
+//               +=  -=  *=  /=  %=  &=  |=  ^=  <<=  >>=
+//               <-                    (channel send/recv)
+//               ++  --
+// Punctuation:  ( )  [ ]  { }
+//               ,  ;  :  .  ...
+
+
+// =====================================================================
+// 9. Things deliberately NOT in this grammar
+// =====================================================================
+//
+// - Generics / type parameters         — ruled out forever
+// - Macros                              — ruled out
+// - `?T` optional type                  — removed; use multi-return
+// - `make` keyword                      — replaced by unified `new`
+// - `'a` lifetime annotations           — fully inferred
+// - `unsafe` keyword in user code       — package-level only
+// - Sum types / enums                   — out for v1
+// - Pattern matching                    — out (no sum types)
+// - `iota`                              — out (use explicit const values)
+// - `goto` / `fallthrough`              — out (smaller surface)
+// - `init()` package-init hook          — out; compiler emits startup
+// - `&^` (bit-clear) operator           — out (rarely used)
+// - `?` token reserved                  — out (no future-reserved tokens)
+// - Embedded struct fields              — out for v1; revisit later
+// - Anonymous structs as type literals  — out for v1; revisit
+//
+// Things known to be unresolved at grammar level:
+// - How channel/map/slice "reference-typed-ness" is expressed in types
+//   (probably no special syntax; semantics live in the type checker)
+// - Method dispatch for structural interfaces (no syntax change; type checker)
+// - Exact rules for type inference contexts (when `new(...)` works — handled
+//   by the type checker, not the parser)
