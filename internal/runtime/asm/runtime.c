@@ -101,6 +101,11 @@ static void cond_signal(cond_t* c) {
     sys_futex(&c->seq, FUTEX_WAKE, 1);
 }
 
+static void cond_broadcast(cond_t* c) {
+    __atomic_add_fetch(&c->seq, 1, __ATOMIC_RELEASE);
+    sys_futex(&c->seq, FUTEX_WAKE, 0x7fffffff);
+}
+
 // ---------------------------------------------------------------------
 // Blocking channel (single element type = i64)
 // ---------------------------------------------------------------------
@@ -135,8 +140,12 @@ void* volt_chan_new(i64 cap) {
 void volt_chan_send(void* ch_, i64 v) {
     chan_i64_t* c = (chan_i64_t*)ch_;
     mutex_lock(&c->lock);
-    while (c->len >= c->cap) {
+    while (c->len >= c->cap && !c->closed) {
         cond_wait(&c->not_full, &c->lock);
+    }
+    if (c->closed) {
+        mutex_unlock(&c->lock);
+        volt_die(); // send on closed channel — panic (Go-style)
     }
     c->buf[c->tail] = v;
     c->tail = (c->tail + 1) % c->cap;
@@ -148,8 +157,13 @@ void volt_chan_send(void* ch_, i64 v) {
 i64 volt_chan_recv(void* ch_) {
     chan_i64_t* c = (chan_i64_t*)ch_;
     mutex_lock(&c->lock);
-    while (c->len == 0) {
+    while (c->len == 0 && !c->closed) {
         cond_wait(&c->not_empty, &c->lock);
+    }
+    if (c->len == 0 && c->closed) {
+        // Empty + closed: return zero value (Go-like — drained).
+        mutex_unlock(&c->lock);
+        return 0;
     }
     i64 v = c->buf[c->head];
     c->head = (c->head + 1) % c->cap;
@@ -157,6 +171,41 @@ i64 volt_chan_recv(void* ch_) {
     cond_signal(&c->not_full);
     mutex_unlock(&c->lock);
     return v;
+}
+
+// Two-value form: returns {value, ok}. `ok` is 0 if the channel was
+// closed AND empty when we tried to receive; 1 otherwise.
+typedef struct { i64 v; i64 ok; } chan_recv2_t;
+
+chan_recv2_t volt_chan_recv2(void* ch_) {
+    chan_i64_t* c = (chan_i64_t*)ch_;
+    chan_recv2_t r;
+    mutex_lock(&c->lock);
+    while (c->len == 0 && !c->closed) {
+        cond_wait(&c->not_empty, &c->lock);
+    }
+    if (c->len == 0 && c->closed) {
+        mutex_unlock(&c->lock);
+        r.v = 0;
+        r.ok = 0;
+        return r;
+    }
+    r.v = c->buf[c->head];
+    c->head = (c->head + 1) % c->cap;
+    c->len--;
+    cond_signal(&c->not_full);
+    mutex_unlock(&c->lock);
+    r.ok = 1;
+    return r;
+}
+
+void volt_chan_close(void* ch_) {
+    chan_i64_t* c = (chan_i64_t*)ch_;
+    mutex_lock(&c->lock);
+    c->closed = 1;
+    cond_broadcast(&c->not_empty);
+    cond_broadcast(&c->not_full);
+    mutex_unlock(&c->lock);
 }
 
 // ---------------------------------------------------------------------

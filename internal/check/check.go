@@ -87,6 +87,34 @@ type state struct {
 	moved   ast.Node // nil if alive; otherwise the statement that moved it
 }
 
+// cloneSyms returns an independent copy of the ownership state.
+func cloneSyms(in map[string]*state) map[string]*state {
+	out := make(map[string]*state, len(in))
+	for k, v := range in {
+		nv := *v // copy struct value
+		out[k] = &nv
+	}
+	return out
+}
+
+// mergeSyms unions branch states back into `dst`. A variable is considered
+// moved post-branches if it was moved in any branch — conservative,
+// catches "moved in some path" use-after-move bugs.
+func mergeSyms(dst, a, b map[string]*state) {
+	for k, ds := range dst {
+		as, aOK := a[k]
+		bs, bOK := b[k]
+		if aOK && as.moved != nil {
+			ds.moved = as.moved
+			continue
+		}
+		if bOK && bs.moved != nil {
+			ds.moved = bs.moved
+		}
+	}
+	// Variables newly declared inside a branch don't escape — drop them.
+}
+
 func (c *Checker) checkFunc(fd *ast.FuncDecl) {
 	syms := make(map[string]*state)
 	for _, p := range fd.Params {
@@ -131,23 +159,37 @@ func (c *Checker) checkStmt(s ast.Stmt, syms map[string]*state) {
 		}
 	case *ast.IfStmt:
 		c.checkExprUse(s.Cond, syms)
+		// Branch-join: each branch sees a clone of the pre-if state;
+		// after the if, a variable is considered moved if it was moved
+		// in *any* branch we could have taken (conservative — over-rejects
+		// rather than miss bugs).
+		thenSyms := cloneSyms(syms)
 		if s.Then != nil {
-			c.checkBlock(s.Then, syms)
+			c.checkBlock(s.Then, thenSyms)
 		}
+		elseSyms := cloneSyms(syms)
 		if s.Else != nil {
-			c.checkStmt(s.Else, syms)
+			c.checkStmt(s.Else, elseSyms)
 		}
+		mergeSyms(syms, thenSyms, elseSyms)
 	case *ast.ForStmt:
+		// Loop body executes 0+ times. Treat as a branch: clone state,
+		// check the body, then merge back. A move inside the loop must
+		// taint the post-loop state. (We also run the body once for the
+		// "ran at least once" path — that's what the merge captures.)
 		if s.Init != nil {
 			c.checkStmt(s.Init, syms)
 		}
 		c.checkExprUse(s.Cond, syms)
+		loopSyms := cloneSyms(syms)
 		if s.Body != nil {
-			c.checkBlock(s.Body, syms)
+			c.checkBlock(s.Body, loopSyms)
 		}
 		if s.Post != nil {
-			c.checkStmt(s.Post, syms)
+			c.checkStmt(s.Post, loopSyms)
 		}
+		// Skip-the-body state = syms; loop state = loopSyms.
+		mergeSyms(syms, cloneSyms(syms), loopSyms)
 	case *ast.Block:
 		c.checkBlock(s, syms)
 	}

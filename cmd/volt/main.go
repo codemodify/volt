@@ -45,6 +45,10 @@ func main() {
 		runFmt(args)
 	case "test":
 		runTest(args)
+	case "mod":
+		runMod(args)
+	case "doc":
+		runDoc(args)
 	default:
 		fmt.Fprintf(os.Stderr, "volt: unknown command %q\n", cmd)
 		usage()
@@ -156,7 +160,26 @@ func resolveAndCompile(srcPath string) ([]*compiledUnit, error) {
 // build / run
 // ---------------------------------------------------------------------
 
+// Debug-info flag: when true, codegen adds clang `-g` to embed DWARF
+// debug information, allowing gdb/lldb to break by source line.
+var buildEmitDebug bool
+
 func runBuild(args []string, andRun bool) {
+	buildEmitDebug = false
+	for len(args) > 0 && len(args[0]) > 0 && args[0][0] == '-' {
+		switch args[0] {
+		case "-g":
+			buildEmitDebug = true
+			args = args[1:]
+		case "--":
+			args = args[1:]
+			goto done
+		default:
+			fmt.Fprintf(os.Stderr, "volt: unknown flag %q\n", args[0])
+			os.Exit(2)
+		}
+	}
+done:
 	if len(args) < 1 {
 		fmt.Fprintln(os.Stderr, "volt: missing source file")
 		os.Exit(2)
@@ -213,9 +236,11 @@ func assembleAndLink(units []*compiledUnit, outPath string) error {
 	inputs = append(inputs, rtcPath)
 
 	clangArgs := []string{"-nostdlib", "-nostartfiles", "-static"}
-	// Use mold if available — 5-10x faster linking than ld on large binaries.
 	if _, err := exec.LookPath("mold"); err == nil {
 		clangArgs = append(clangArgs, "-fuse-ld=mold")
+	}
+	if buildEmitDebug {
+		clangArgs = append(clangArgs, "-g")
 	}
 	clangArgs = append(clangArgs, "-o", outPath)
 	clangArgs = append(clangArgs, inputs...)
@@ -333,13 +358,259 @@ func runTest(args []string) {
 		os.Exit(2)
 	}
 	srcPath := args[0]
-	units, err := resolveAndCompile(srcPath)
+
+	// Discover TestX functions in the source.
+	src, err := os.ReadFile(srcPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		fmt.Fprintf(os.Stderr, "FAIL  %s (compile error)\n", srcPath)
 		os.Exit(1)
 	}
+	probe, err := parseSource(srcPath, src)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	var tests []string
+	hasMain := false
+	hasLogImport := false
+	for _, im := range probe.file.Imports {
+		if im.Path == "log" {
+			hasLogImport = true
+		}
+	}
+	for _, d := range probe.file.Decls {
+		fd, ok := d.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+		if fd.Name == "main" && fd.Receiver == nil {
+			hasMain = true
+		}
+		if fd.Receiver == nil && len(fd.Params) == 0 &&
+			strings.HasPrefix(fd.Name, "Test") &&
+			len(fd.Results) == 1 {
+			tests = append(tests, fd.Name)
+		}
+	}
 
+	// If the source has a main and no TestX functions, just build+run as before.
+	if len(tests) == 0 {
+		if !hasMain {
+			fmt.Fprintf(os.Stderr, "volt test: %s has no TestX functions and no main\n", srcPath)
+			os.Exit(1)
+		}
+		buildAndRun(srcPath, "")
+		return
+	}
+
+	// Synthesize a wrapper main that calls every TestX and tallies failures.
+	// `import "log"` must precede top-level decls, so insert it right after
+	// the package line rather than at end-of-file.
+	var wrap strings.Builder
+	if hasLogImport {
+		wrap.Write(src)
+	} else {
+		lines := strings.SplitAfter(string(src), "\n")
+		inserted := false
+		for _, line := range lines {
+			wrap.WriteString(line)
+			if !inserted && strings.HasPrefix(strings.TrimSpace(line), "package ") {
+				wrap.WriteString(`import "log"` + "\n")
+				inserted = true
+			}
+		}
+	}
+	wrap.WriteString("\n// ---- synthesized by `volt test` ----\n")
+	wrap.WriteString("fun main() int {\n")
+	wrap.WriteString("\tvar failed int = 0\n")
+	for _, name := range tests {
+		fmt.Fprintf(&wrap, "\tif %s() != 0 {\n", name)
+		fmt.Fprintf(&wrap, "\t\tlog.Println(\"FAIL  %s\")\n", name)
+		wrap.WriteString("\t\tfailed = failed + 1\n")
+		wrap.WriteString("\t} else {\n")
+		fmt.Fprintf(&wrap, "\t\tlog.Println(\"PASS  %s\")\n", name)
+		wrap.WriteString("\t}\n")
+	}
+	wrap.WriteString("\tret failed\n")
+	wrap.WriteString("}\n")
+
+	// Write the augmented source to a tempfile and build it.
+	tmp, err := os.MkdirTemp("", "volt-test-*")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	defer os.RemoveAll(tmp)
+	augPath := filepath.Join(tmp, "_test.volt")
+	if err := os.WriteFile(augPath, []byte(wrap.String()), 0o644); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	buildAndRun(augPath, srcPath)
+}
+
+// ---------------------------------------------------------------------
+// volt mod — manage the volt.mod file (module declaration).
+//
+// `volt mod init <module-path>` writes a minimal volt.mod in the CWD.
+// ---------------------------------------------------------------------
+
+func runMod(args []string) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: volt mod init <module-path>")
+		os.Exit(2)
+	}
+	switch args[0] {
+	case "init":
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "volt mod init: missing module path")
+			os.Exit(2)
+		}
+		mod := args[1]
+		path := "volt.mod"
+		if _, err := os.Stat(path); err == nil {
+			fmt.Fprintf(os.Stderr, "volt mod init: %s already exists\n", path)
+			os.Exit(1)
+		}
+		body := fmt.Sprintf("module %s\n\nvolt 0.5\n", mod)
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Printf("created volt.mod (module %s)\n", mod)
+	default:
+		fmt.Fprintf(os.Stderr, "volt mod: unknown subcommand %q\n", args[0])
+		os.Exit(2)
+	}
+}
+
+// ---------------------------------------------------------------------
+// volt doc — list exported (Capitalized) top-level declarations.
+// ---------------------------------------------------------------------
+
+func runDoc(args []string) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: volt doc <file>")
+		os.Exit(2)
+	}
+	srcPath := args[0]
+	src, err := os.ReadFile(srcPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	u, err := parseSource(srcPath, src)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	fmt.Printf("package %s\n\n", u.pkg)
+	for _, d := range u.file.Decls {
+		switch d := d.(type) {
+		case *ast.FuncDecl:
+			if !isExported(d.Name) || d.Receiver != nil {
+				continue
+			}
+			fmt.Printf("fun %s%s\n", d.Name, formatSignature(d))
+		case *ast.TypeDecl:
+			if !isExported(d.Name) {
+				continue
+			}
+			if _, ok := d.Type.(*ast.StructType); ok {
+				fmt.Printf("type %s struct { ... }\n", d.Name)
+			} else {
+				fmt.Printf("type %s\n", d.Name)
+			}
+		case *ast.ConstDecl:
+			if !isExported(d.Name) {
+				continue
+			}
+			fmt.Printf("const %s\n", d.Name)
+		}
+	}
+	// Methods on exported types (also exported if Capitalized).
+	for _, d := range u.file.Decls {
+		fd, ok := d.(*ast.FuncDecl)
+		if !ok || fd.Receiver == nil {
+			continue
+		}
+		if !isExported(fd.Name) {
+			continue
+		}
+		recvTypeName := fd.ReceiverTypeName()
+		if !isExported(recvTypeName) {
+			continue
+		}
+		fmt.Printf("fun (r %s) %s%s\n", typeStr(fd.Receiver.Type), fd.Name, formatSignature(fd))
+	}
+}
+
+func isExported(name string) bool {
+	if name == "" {
+		return false
+	}
+	c := name[0]
+	return c >= 'A' && c <= 'Z'
+}
+
+func formatSignature(fd *ast.FuncDecl) string {
+	var sb strings.Builder
+	sb.WriteByte('(')
+	for i, p := range fd.Params {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteString(p.Name + " " + typeStr(p.Type))
+	}
+	sb.WriteByte(')')
+	switch len(fd.Results) {
+	case 0:
+		// void
+	case 1:
+		sb.WriteString(" " + typeStr(fd.Results[0]))
+	default:
+		sb.WriteString(" (")
+		for i, r := range fd.Results {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteString(typeStr(r))
+		}
+		sb.WriteByte(')')
+	}
+	return sb.String()
+}
+
+func typeStr(t ast.Type) string {
+	switch t := t.(type) {
+	case *ast.NamedType:
+		return t.Name
+	case *ast.BorrowType:
+		return "&" + typeStr(t.Elem)
+	case *ast.PointerType:
+		return "*" + typeStr(t.Elem)
+	case *ast.SliceType:
+		return "[]" + typeStr(t.Elem)
+	case *ast.ChanType:
+		return "chan " + typeStr(t.Elem)
+	case *ast.MapType:
+		return "map[" + typeStr(t.Key) + "]" + typeStr(t.Value)
+	}
+	return "<?>"
+}
+
+// buildAndRun compiles `src` (using `label` for status output), runs it,
+// and exits the volt-test process with non-zero on any failure.
+func buildAndRun(src, label string) {
+	if label == "" {
+		label = src
+	}
+	units, err := resolveAndCompile(src)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintf(os.Stderr, "FAIL  %s (compile error)\n", label)
+		os.Exit(1)
+	}
 	tmp, err := os.MkdirTemp("", "volt-test-*")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -349,7 +620,7 @@ func runTest(args []string) {
 	outPath := filepath.Join(tmp, "test.bin")
 	if err := assembleAndLink(units, outPath); err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		fmt.Fprintf(os.Stderr, "FAIL  %s (link error)\n", srcPath)
+		fmt.Fprintf(os.Stderr, "FAIL  %s (link error)\n", label)
 		os.Exit(1)
 	}
 	cmd := exec.Command(outPath)
@@ -357,13 +628,13 @@ func runTest(args []string) {
 	cmd.Stderr = os.Stderr
 	err = cmd.Run()
 	if err == nil {
-		fmt.Fprintf(os.Stderr, "PASS  %s\n", srcPath)
+		fmt.Fprintf(os.Stderr, "ok    %s\n", label)
 		return
 	}
 	if exitErr, ok := err.(*exec.ExitError); ok {
-		fmt.Fprintf(os.Stderr, "FAIL  %s (exit %d)\n", srcPath, exitErr.ExitCode())
+		fmt.Fprintf(os.Stderr, "FAIL  %s (%d failed)\n", label, exitErr.ExitCode())
 		os.Exit(1)
 	}
-	fmt.Fprintf(os.Stderr, "FAIL  %s (%v)\n", srcPath, err)
+	fmt.Fprintf(os.Stderr, "FAIL  %s (%v)\n", label, err)
 	os.Exit(1)
 }

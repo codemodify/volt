@@ -425,7 +425,12 @@ func (p *Parser) parseBlock() *ast.Block {
 		if s != nil {
 			b.Stmts = append(b.Stmts, s)
 		}
-		p.expect(lex.Semi)
+		// A trailing `}` on the same line as the last statement means
+		// no auto-semicolon was inserted; tolerate the missing one so
+		// single-line forms like `if cond { ret 1 }` parse.
+		if p.tok.Kind != lex.RBrace {
+			p.expect(lex.Semi)
+		}
 		p.skipSemis()
 	}
 	p.expect(lex.RBrace)

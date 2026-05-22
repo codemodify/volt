@@ -453,8 +453,42 @@ func (c *funcCtx) emitStmt(s ast.Stmt) error {
 	return fmt.Errorf("%s: unsupported statement %T", s.Pos(), s)
 }
 
+// tryRecv2 detects `<-ch` as a multi-value source. Returns the aggregate
+// SSA name and the two field types {i64, i64} on success.
+func (c *funcCtx) tryRecv2(rhs ast.Expr) (string, []string, bool) {
+	un, ok := rhs.(*ast.UnaryExpr)
+	if !ok || un.Op != "<-" {
+		return "", nil, false
+	}
+	ch, err := c.emitExpr(un.X)
+	if err != nil {
+		return "", nil, false
+	}
+	c.e.ensureDeclare("declare {i64, i64} @volt_chan_recv2(ptr)")
+	agg := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = call {i64, i64} @volt_chan_recv2(ptr %s)\n", agg, ch.Name)
+	return agg, []string{"i64", "i64"}, true
+}
+
 // emitMultiVar handles `a, b := foo()` where foo() returns multiple values.
+// Also recognizes `v, ok := <-ch` and routes to volt_chan_recv2.
 func (c *funcCtx) emitMultiVar(s *ast.MultiVarStmt) error {
+	if agg, fieldTypes, ok := c.tryRecv2(s.RHS); ok {
+		if len(s.Names) != 2 {
+			return fmt.Errorf("%s: `<-ch` two-value form requires exactly two LHS names", s.Pos())
+		}
+		aggT := "{i64, i64}"
+		for i, name := range s.Names {
+			resultT := fieldTypes[i]
+			ptr := fmt.Sprintf("%%%s.addr", name)
+			fmt.Fprintf(&c.body, "  %s = alloca %s\n", ptr, resultT)
+			ev := c.newTemp()
+			fmt.Fprintf(&c.body, "  %s = extractvalue %s %s, %d\n", ev, aggT, agg, i)
+			fmt.Fprintf(&c.body, "  store %s %s, ptr %s\n", resultT, ev, ptr)
+			c.symbols[name] = symbol{Ptr: ptr, Type: resultT}
+		}
+		return nil
+	}
 	agg, fieldTypes, err := c.emitMultiReturnCall(s.RHS)
 	if err != nil {
 		return err
@@ -967,6 +1001,9 @@ func (c *funcCtx) emitFor(s *ast.ForStmt) error {
 	postLbl := condLbl
 	if s.Post != nil {
 		postLbl = c.newLabel("for.post")
+	} else if s.Cond == nil {
+		// Infinite loop: no cond block; fall-through back to body.
+		postLbl = bodyLbl
 	}
 	endLbl := c.newLabel("for.end")
 
@@ -1015,9 +1052,9 @@ func (c *funcCtx) emitFor(s *ast.ForStmt) error {
 		c.terminated = true
 	}
 
-	if s.Cond != nil {
-		c.startBlock(endLbl)
-	}
+	// Always start the end block so `break` has a valid target and any
+	// statements after the for-loop land in a fresh basic block.
+	c.startBlock(endLbl)
 	return nil
 }
 
@@ -1394,10 +1431,29 @@ func (c *funcCtx) emitCall(call *ast.CallExpr) (Value, error) {
 		switch fn.Name {
 		case "len":
 			return c.emitBuiltinLen(call)
+		case "close":
+			return c.emitBuiltinClose(call)
 		}
 		return c.emitUnqualifiedCall(call, fn)
 	}
 	return Value{}, fmt.Errorf("%s: unsupported call form", call.Pos())
+}
+
+// emitBuiltinClose lowers `close(ch)` to volt_chan_close(ch).
+func (c *funcCtx) emitBuiltinClose(call *ast.CallExpr) (Value, error) {
+	if len(call.Args) != 1 {
+		return Value{}, fmt.Errorf("%s: close takes exactly 1 argument", call.Pos())
+	}
+	arg, err := c.emitExpr(call.Args[0])
+	if err != nil {
+		return Value{}, err
+	}
+	if arg.Type != "ptr" {
+		return Value{}, fmt.Errorf("%s: close requires a channel, got %s", call.Pos(), arg.Type)
+	}
+	c.e.ensureDeclare("declare void @volt_chan_close(ptr)")
+	fmt.Fprintf(&c.body, "  call void @volt_chan_close(ptr %s)\n", arg.Name)
+	return Value{Name: "", Type: "void"}, nil
 }
 
 // emitBuiltinLen lowers `len(x)` where x is a slice, string, or map.
