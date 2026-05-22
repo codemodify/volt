@@ -146,6 +146,17 @@ type SliceType struct {
 func (t *SliceType) Pos() lex.Pos { return t.P }
 func (t *SliceType) typeNode()    {}
 
+// MapType is `map[K]V`. v0.5 only supports map[string]int — codegen
+// will reject other forms.
+type MapType struct {
+	P     lex.Pos
+	Key   Type
+	Value Type
+}
+
+func (t *MapType) Pos() lex.Pos { return t.P }
+func (t *MapType) typeNode()    {}
+
 // Field is one declaration inside a struct.
 type Field struct {
 	P    lex.Pos
@@ -164,6 +175,18 @@ type TypeDecl struct {
 
 func (d *TypeDecl) Pos() lex.Pos { return d.P }
 func (d *TypeDecl) declNode()    {}
+
+// ConstDecl is a top-level `const Name = Value` declaration. v0.5 limits
+// Value to a literal-constant expression; codegen substitutes the value
+// at each use site.
+type ConstDecl struct {
+	P     lex.Pos
+	Name  string
+	Value Expr
+}
+
+func (d *ConstDecl) Pos() lex.Pos { return d.P }
+func (d *ConstDecl) declNode()    {}
 
 // ---------------------------------------------------------------------
 // Statements

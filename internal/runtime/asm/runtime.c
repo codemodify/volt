@@ -158,3 +158,92 @@ i64 volt_chan_recv(void* ch_) {
     mutex_unlock(&c->lock);
     return v;
 }
+
+// ---------------------------------------------------------------------
+// Map (string → i64). Chained hash table, fixed bucket count.
+// Keys are passed as (ptr, len) pairs (the same {ptr, i64} the volt
+// `%string` layout uses). Values are i64. Concurrent access is guarded
+// by a per-map mutex so map ops are thread-safe.
+// ---------------------------------------------------------------------
+
+#define MAP_BUCKETS 256
+
+typedef struct map_entry {
+    struct map_entry* next;
+    char*             key_ptr;
+    i64               key_len;
+    i64               value;
+} map_entry_t;
+
+typedef struct {
+    mutex_t      lock;
+    i64          count;
+    map_entry_t* buckets[MAP_BUCKETS];
+} map_t;
+
+static u64 hash_bytes(const char* p, i64 n) {
+    u64 h = 5381;
+    for (i64 i = 0; i < n; i++) {
+        h = ((h << 5) + h) + (u64)(unsigned char)p[i]; // djb2
+    }
+    return h;
+}
+
+static int key_eq(const char* a, i64 alen, const char* b, i64 blen) {
+    if (alen != blen) return 0;
+    for (i64 i = 0; i < alen; i++) {
+        if (a[i] != b[i]) return 0;
+    }
+    return 1;
+}
+
+void* volt_map_new(void) {
+    return (void*)volt_alloc((i64)sizeof(map_t));
+}
+
+i64 volt_map_get(void* m_, char* key_ptr, i64 key_len) {
+    map_t* m = (map_t*)m_;
+    if (m == 0) return 0;
+    mutex_lock(&m->lock);
+    u64 h = hash_bytes(key_ptr, key_len);
+    map_entry_t* e = m->buckets[h % MAP_BUCKETS];
+    while (e) {
+        if (key_eq(e->key_ptr, e->key_len, key_ptr, key_len)) {
+            i64 v = e->value;
+            mutex_unlock(&m->lock);
+            return v;
+        }
+        e = e->next;
+    }
+    mutex_unlock(&m->lock);
+    return 0; // not found: zero value (Go-like)
+}
+
+void volt_map_set(void* m_, char* key_ptr, i64 key_len, i64 value) {
+    map_t* m = (map_t*)m_;
+    mutex_lock(&m->lock);
+    u64 h = hash_bytes(key_ptr, key_len);
+    map_entry_t** bucket = &m->buckets[h % MAP_BUCKETS];
+    map_entry_t* e = *bucket;
+    while (e) {
+        if (key_eq(e->key_ptr, e->key_len, key_ptr, key_len)) {
+            e->value = value;
+            mutex_unlock(&m->lock);
+            return;
+        }
+        e = e->next;
+    }
+    map_entry_t* ne = (map_entry_t*)volt_alloc((i64)sizeof(map_entry_t));
+    ne->next    = *bucket;
+    ne->key_ptr = key_ptr;
+    ne->key_len = key_len;
+    ne->value   = value;
+    *bucket = ne;
+    m->count++;
+    mutex_unlock(&m->lock);
+}
+
+i64 volt_map_len(void* m_) {
+    if (m_ == 0) return 0;
+    return ((map_t*)m_)->count;
+}

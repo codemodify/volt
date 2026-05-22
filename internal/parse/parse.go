@@ -108,10 +108,32 @@ func (p *Parser) parseTopLevelDecl() ast.Decl {
 		return p.parseFuncDecl()
 	case lex.KwType:
 		return p.parseTypeDecl()
+	case lex.KwConst:
+		return p.parseConstDecl()
 	}
 	p.errorf("unexpected token %s at top level", p.tok.Kind)
 	p.advance()
 	return nil
+}
+
+func (p *Parser) parseConstDecl() *ast.ConstDecl {
+	start := p.tok.Pos
+	p.advance() // consume `const`
+	if p.tok.Kind != lex.Ident {
+		p.errorf("expected const name, got %s", p.tok.Kind)
+		return nil
+	}
+	name := p.tok.Text
+	p.advance()
+	// Optional type annotation (consume but ignore for now).
+	if p.tok.Kind != lex.Assign {
+		_ = p.parseType()
+	}
+	if !p.expect(lex.Assign) {
+		return nil
+	}
+	val := p.parseExpr()
+	return &ast.ConstDecl{P: start, Name: name, Value: val}
 }
 
 func (p *Parser) parseTypeDecl() *ast.TypeDecl {
@@ -251,6 +273,24 @@ func (p *Parser) parseType() ast.Type {
 			return nil
 		}
 		return &ast.ChanType{P: pos, Elem: elem}
+	case lex.KwMap:
+		pos := p.tok.Pos
+		p.advance()
+		if !p.expect(lex.LBrack) {
+			return nil
+		}
+		k := p.parseType()
+		if k == nil {
+			return nil
+		}
+		if !p.expect(lex.RBrack) {
+			return nil
+		}
+		v := p.parseType()
+		if v == nil {
+			return nil
+		}
+		return &ast.MapType{P: pos, Key: k, Value: v}
 	case lex.KwStruct:
 		return p.parseStructType()
 	case lex.Ident:
@@ -309,7 +349,8 @@ func (p *Parser) parseNewExpr() ast.Expr {
 		}
 		p.expect(lex.RParen)
 	default:
-		p.errorf("expected '{' or '(' after type in `new`, got %s", p.tok.Kind)
+		// Bare `new T` — default-construct (e.g. `new map[K]V`,
+		// `new chan T` for unbuffered). Args/Pairs stay nil.
 	}
 	return expr
 }

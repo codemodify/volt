@@ -5,11 +5,11 @@
 
 # why new language
 - I love `Go`, easy and simple, gets you going and keeps you going.
-- I'm curious about `Rust` and how it made it into the `Kernel` like mental virus.
+- I'm curious about `Rust` and how it made it into the `Kernel` like a mental virus.
 	- `Rust` is interesting as academic research model.
 - I think better tooling around `C` can take care of all the issues that Rust wanted to fix.
-	- today in 2026 - AI is the answer to that gap and and can take care of the issues Rust was intended for.
-	- plus a better and cleaner agreement on C code writing will help a lot with the "mess" in codebases, a timid and unfinished attempt was made here [libcore](https://github.com/codemodify/libcore).
+	- in fact today in 2026 - AI is the answer to that gap and can take care of the issues Rust wants to fix.
+	- in addition if there was going to be an agreement for better and cleaner `C` code writing style, that will help a lot with the "mess" in codebases; in that regard a timid and unfinished attempt was made here [libcore](https://github.com/codemodify/libcore).
 - I'm curious about `Zig` and the intent of modernized `C`.
 
 # how is it different

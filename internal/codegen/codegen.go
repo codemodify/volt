@@ -21,6 +21,7 @@ import (
 	"strings"
 
 	"github.com/codemodify/volt/internal/ast"
+	"github.com/codemodify/volt/internal/lex"
 )
 
 // ---------------------------------------------------------------------
@@ -48,6 +49,7 @@ type Emitter struct {
 	imports    []string                  // import paths used by this file
 	imported   map[string]bool           // import-path basename → true
 	structs    map[string]*structInfo    // user-defined struct types
+	consts     map[string]ast.Expr       // top-level const Name → value expr
 }
 
 // structInfo carries field ordering + name→index for a struct type.
@@ -63,6 +65,7 @@ func New() *Emitter {
 		methods:  make(map[string]map[string]*ast.FuncDecl),
 		imported: make(map[string]bool),
 		structs:  make(map[string]*structInfo),
+		consts:   make(map[string]ast.Expr),
 	}
 }
 
@@ -100,6 +103,8 @@ func (e *Emitter) Emit(file *ast.File) (string, error) {
 			} else {
 				e.funcs[d.Name] = d
 			}
+		case *ast.ConstDecl:
+			e.consts[d.Name] = d.Value
 		case *ast.TypeDecl:
 			if st, ok := d.Type.(*ast.StructType); ok {
 				idx := make(map[string]int, len(st.Fields))
@@ -202,8 +207,16 @@ func (e *Emitter) llvmType(t ast.Type) string {
 	case *ast.ChanType:
 		// Channels are runtime-allocated; we carry an opaque ptr.
 		return "ptr"
+	case *ast.MapType:
+		return "ptr"
 	}
 	return "void"
+}
+
+// isMapType reports whether t is a *ast.MapType.
+func isMapType(t ast.Type) bool {
+	_, ok := t.(*ast.MapType)
+	return ok
 }
 
 // chanElemLLVM returns the LLVM element type for a ChanType, or "" otherwise.
@@ -309,6 +322,7 @@ func (e *Emitter) emitFunc(out *strings.Builder, fd *ast.FuncDecl) error {
 			Type:      pt,
 			Elem:      e.elemType(p.Type),
 			SliceElem: e.sliceElemLLVM(p.Type),
+			IsMap:     isMapType(p.Type),
 		}
 	}
 
@@ -351,6 +365,7 @@ type symbol struct {
 	Type      string // LLVM type stored at alloca (e.g., "i64", "%string", "%slice", "ptr")
 	Elem      string // for borrow/pointer symbols: the pointee LLVM type
 	SliceElem string // for %slice symbols: the LLVM element type
+	IsMap     bool   // true if this symbol is a map[string]int handle (ptr)
 }
 
 type funcCtx struct {
@@ -730,7 +745,11 @@ func (c *funcCtx) emitVar(s *ast.VarStmt) error {
 		val = c.convertInt(val, typeStr)
 		fmt.Fprintf(&c.body, "  store %s %s, ptr %s\n", typeStr, val.Name, ptr)
 	}
-	c.symbols[s.Name] = symbol{Ptr: ptr, Type: typeStr, Elem: elem, SliceElem: sliceElem}
+	isMap := false
+	if s.Type != nil {
+		isMap = isMapType(s.Type)
+	}
+	c.symbols[s.Name] = symbol{Ptr: ptr, Type: typeStr, Elem: elem, SliceElem: sliceElem, IsMap: isMap}
 	return nil
 }
 
@@ -740,8 +759,16 @@ func (c *funcCtx) emitAssign(s *ast.AssignStmt) error {
 		return c.emitIdentAssign(lhs, s.RHS)
 	case *ast.SelectorExpr:
 		return c.emitFieldAssign(lhs, s.RHS)
+	case *ast.IndexExpr:
+		// m[k] = v on a map variable.
+		if id, ok := lhs.X.(*ast.IdentExpr); ok {
+			if sym, ok := c.symbols[id.Name]; ok && sym.IsMap {
+				return c.emitMapSet(sym, lhs.Index, s.RHS, lhs.Pos())
+			}
+		}
+		return fmt.Errorf("%s: indexed assignment only supported on map variables in v0.5", lhs.Pos())
 	}
-	return fmt.Errorf("%s: assignment target must be a variable or field access", s.LHS.Pos())
+	return fmt.Errorf("%s: assignment target must be a variable or field/index access", s.LHS.Pos())
 }
 
 func (c *funcCtx) emitIdentAssign(lhs *ast.IdentExpr, rhsExpr ast.Expr) error {
@@ -1055,6 +1082,13 @@ func (c *funcCtx) emitSliceLit(ex *ast.SliceLit) (Value, error) {
 }
 
 func (c *funcCtx) emitIndex(ex *ast.IndexExpr) (Value, error) {
+	// Map[key] lookup if X is a map-typed variable.
+	if id, ok := ex.X.(*ast.IdentExpr); ok {
+		if sym, ok := c.symbols[id.Name]; ok && sym.IsMap {
+			return c.emitMapGet(sym, ex.Index, ex.Pos())
+		}
+	}
+
 	xv, err := c.emitExpr(ex.X)
 	if err != nil {
 		return Value{}, err
@@ -1111,6 +1145,14 @@ func (c *funcCtx) emitFieldAccess(ex *ast.SelectorExpr) (Value, error) {
 // an SSA struct value built via insertvalue. The result is an owned T —
 // the caller (typically a var declaration) puts it in storage.
 func (c *funcCtx) emitNew(ex *ast.NewExpr) (Value, error) {
+	// Special-case: `new map[K]V` → runtime call.
+	if _, ok := ex.Type.(*ast.MapType); ok {
+		c.e.ensureDeclare("declare ptr @volt_map_new()")
+		t := c.newTemp()
+		fmt.Fprintf(&c.body, "  %s = call ptr @volt_map_new()\n", t)
+		return Value{Name: t, Type: "ptr"}, nil
+	}
+
 	// Special-case: `new chan T(capacity)` → runtime call.
 	if _, ok := ex.Type.(*ast.ChanType); ok {
 		var capVal Value
@@ -1243,6 +1285,10 @@ func (c *funcCtx) emitStringLit(ex *ast.StringLit) (Value, error) {
 }
 
 func (c *funcCtx) emitIdent(ex *ast.IdentExpr) (Value, error) {
+	// Top-level const? Substitute its value expression.
+	if cv, ok := c.e.consts[ex.Name]; ok {
+		return c.emitExpr(cv)
+	}
 	sym, ok := c.symbols[ex.Name]
 	if !ok {
 		return Value{}, fmt.Errorf("%s: undefined identifier %q", ex.Pos(), ex.Name)
@@ -1354,21 +1400,83 @@ func (c *funcCtx) emitCall(call *ast.CallExpr) (Value, error) {
 	return Value{}, fmt.Errorf("%s: unsupported call form", call.Pos())
 }
 
-// emitBuiltinLen lowers `len(x)` where x is a slice or string.
+// emitBuiltinLen lowers `len(x)` where x is a slice, string, or map.
 func (c *funcCtx) emitBuiltinLen(call *ast.CallExpr) (Value, error) {
 	if len(call.Args) != 1 {
 		return Value{}, fmt.Errorf("%s: len takes exactly 1 argument", call.Pos())
+	}
+	// Map case — len(m) → volt_map_len(m).
+	if id, ok := call.Args[0].(*ast.IdentExpr); ok {
+		if sym, ok := c.symbols[id.Name]; ok && sym.IsMap {
+			mapPtr := c.newTemp()
+			fmt.Fprintf(&c.body, "  %s = load ptr, ptr %s\n", mapPtr, sym.Ptr)
+			c.e.ensureDeclare("declare i64 @volt_map_len(ptr)")
+			t := c.newTemp()
+			fmt.Fprintf(&c.body, "  %s = call i64 @volt_map_len(ptr %s)\n", t, mapPtr)
+			return Value{Name: t, Type: "i64"}, nil
+		}
 	}
 	arg, err := c.emitExpr(call.Args[0])
 	if err != nil {
 		return Value{}, err
 	}
 	if arg.Type != "%slice" && arg.Type != "%string" {
-		return Value{}, fmt.Errorf("%s: len() requires a slice or string, got %s", call.Pos(), arg.Type)
+		return Value{}, fmt.Errorf("%s: len() requires a slice, string, or map, got %s", call.Pos(), arg.Type)
 	}
 	t := c.newTemp()
 	fmt.Fprintf(&c.body, "  %s = extractvalue %s %s, 1\n", t, arg.Type, arg.Name)
 	return Value{Name: t, Type: "i64"}, nil
+}
+
+// emitMapGet lowers `m[key]` to volt_map_get(m, key_ptr, key_len).
+// v0.5 supports only map[string]i64.
+func (c *funcCtx) emitMapGet(sym symbol, keyExpr ast.Expr, pos lex.Pos) (Value, error) {
+	mapPtr := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = load ptr, ptr %s\n", mapPtr, sym.Ptr)
+
+	k, err := c.emitExpr(keyExpr)
+	if err != nil {
+		return Value{}, err
+	}
+	if k.Type != "%string" {
+		return Value{}, fmt.Errorf("%s: map key must be string in v0.5, got %s", pos, k.Type)
+	}
+	kp := c.newTemp()
+	kl := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = extractvalue %%string %s, 0\n", kp, k.Name)
+	fmt.Fprintf(&c.body, "  %s = extractvalue %%string %s, 1\n", kl, k.Name)
+	c.e.ensureDeclare("declare i64 @volt_map_get(ptr, ptr, i64)")
+	t := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = call i64 @volt_map_get(ptr %s, ptr %s, i64 %s)\n", t, mapPtr, kp, kl)
+	return Value{Name: t, Type: "i64"}, nil
+}
+
+// emitMapSet lowers `m[key] = v` to volt_map_set(m, key_ptr, key_len, v).
+func (c *funcCtx) emitMapSet(sym symbol, keyExpr ast.Expr, valExpr ast.Expr, pos lex.Pos) error {
+	mapPtr := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = load ptr, ptr %s\n", mapPtr, sym.Ptr)
+
+	k, err := c.emitExpr(keyExpr)
+	if err != nil {
+		return err
+	}
+	if k.Type != "%string" {
+		return fmt.Errorf("%s: map key must be string in v0.5", pos)
+	}
+	kp := c.newTemp()
+	kl := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = extractvalue %%string %s, 0\n", kp, k.Name)
+	fmt.Fprintf(&c.body, "  %s = extractvalue %%string %s, 1\n", kl, k.Name)
+
+	v, err := c.emitExpr(valExpr)
+	if err != nil {
+		return err
+	}
+	v = c.convertInt(v, "i64")
+	c.e.ensureDeclare("declare void @volt_map_set(ptr, ptr, i64, i64)")
+	fmt.Fprintf(&c.body, "  call void @volt_map_set(ptr %s, ptr %s, i64 %s, i64 %s)\n",
+		mapPtr, kp, kl, v.Name)
+	return nil
 }
 
 func (c *funcCtx) emitQualifiedCall(call *ast.CallExpr, sel *ast.SelectorExpr) (Value, error) {
