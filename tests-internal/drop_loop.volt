@@ -16,10 +16,8 @@ fun (t *Tick) Drop() {
 }
 
 fun main() int {
-    var i int = 0
-    for i < 3 {
-        var t Tick = new Tick{id: i}
-        i = i + 1
+    for i := 0; i < 3; i++ {
+        var _t Tick = new Tick{id: i}
     }
     log.Println("after-loop")
     ret 42

@@ -2,13 +2,31 @@
 // 3-concurrency.volt — `run` and channels
 // =====================================================================
 // `run f()` launches f on a real OS thread. Channels are typed,
-// bounded, blocking, and reference-typed (passing a `chan T` value
-// gives another handle to the same channel — both endpoints must
-// hold it simultaneously).
+// blocking, reference-typed (passing a `chan T` value gives another
+// handle to the same channel), and **unbuffered by default** — `new()`
+// allocates cap=0 (rendezvous, same as Go); `new(N)` adds a buffer of N.
+//
+// Channel direction: `chan read T` permits only `read`; `chan write T`
+// permits only `write` and `close`. A plain `chan T` is an unrestricted
+// handle (both ops allowed) and narrows implicitly at the call site.
+// Many threads can share each direction — "many readers and many
+// writers" still applies on the same channel.
+//
+// Channel multiplicity contracts (compile-time, same runtime).
+// Notation: chan<readers><writers>, 1 = exactly one, N = one or more.
+//   chan11 T   — One Reader, One Writer
+//   chan1N T   — One Reader, Many Writers
+//   chanN1 T   — Many Readers, One Writer
+//   chanNN T   — Many Readers, Many Writers
+// The compiler counts reader / writer endpoints in the declaring scope
+// (direct read/write/close, `run f(ch)` direction, send sites) and
+// errors if the count violates the contract. `run f(ch)` inside a `for`
+// is treated as "many" spawns of that endpoint kind.
 //
 // Channel operations:
-//   write(ch, value)     — send (blocks if buffer full)
-//   read(ch)             — receive one value (blocks if empty)
+//   write(ch, value)     — send (blocks until paired with a reader on cap=0;
+//                          blocks if buffer full on cap>0)
+//   read(ch)             — receive one value (blocks if no sender pending)
 //   v, ok := read(ch)    — receive-or-closed (ok=false once drained+closed)
 //   close(ch)            — signal "no more sends"
 //
@@ -28,16 +46,14 @@ import "log"
 // 1. Channels — producer / consumer on real threads
 // =====================================================================
 
-fun producer(out chan int) {
-    var i int = 1
-    for i <= 5 {
-        write(out, i)                  // send (blocks if buffer is full)
-        i = i + 1
+fun producer(out chan write int) {     // write-only endpoint
+    for i := 1; i <= 5; i++ {
+        write(out, i)                  // blocks until a reader pairs (cap=0)
     }
     close(out)                         // signal "no more sends"
 }
 
-fun consumer(in chan int, done chan int) {
+fun consumer(in chan read int, done chan write int) {  // read-only on `in`
     var sum int = 0
     for {
         v, ok := read(in)              // receive-or-closed
@@ -48,11 +64,11 @@ fun consumer(in chan int, done chan int) {
 }
 
 fun producerConsumer() {
-    var ch   chan int = new(2) chan int    // small buffer forces blocking
-    var done chan int = new(1) chan int
+    var ch   chan int = new()              // cap=0 — rendezvous (default)
+    var done chan int = new(1) chan int    // small buffer so main isn't blocked
 
-    run producer(ch)                       // real OS thread
-    run consumer(ch, done)                 // another real OS thread
+    run producer(ch)                       // narrows to `chan write int`
+    run consumer(ch, done)                 // narrows to `chan read int` + `chan write int`
 
     var total int = read(done)             // -> 15  (1+2+3+4+5)
     if total == 15 {
@@ -115,16 +131,14 @@ fun selectDefault() {
 // instructions (no kernel call uncontested).
 
 fun atomicBumper(a atomic int, done chan int) {
-    var i int = 0
-    for i < 1000 {
+    for i := 0; i < 1000; i++ {
         a.Add(1)                           // single atomic add
-        i = i + 1
     }
     write(done, 1)
 }
 
 fun atomicDemo() {
-    var a    atomic int = new{}
+    var a    atomic int = new {}
     var done chan int   = new(2) chan int
 
     run atomicBumper(a, done)              // two threads racing the same counter
@@ -132,7 +146,7 @@ fun atomicDemo() {
     read(done)
     read(done)
 
-    if a.Load() == 2000 {                  // -> 2000 (no lost updates)
+    if a.Read() == 2000 {                  // -> 2000 (no lost updates)
         log.Println("atomic ok")
     }
 }
@@ -146,17 +160,15 @@ fun atomicDemo() {
 // goes out of scope — there is no Unlock method.
 
 fun mutexBumper(m mutex int, done chan int) {
-    var i int = 0
-    for i < 1000 {
+    for i := 0; i < 1000; i++ {
         var v int = m.Lock()               // acquire — v is a guard over the int
         v = v + 1                          // write through the guard
-        i = i + 1
     }                                      // guard drops at iteration end → lock released
     write(done, 1)
 }
 
 fun mutexDemo() {
-    var m    mutex int = new{}
+    var m    mutex int = new {}
     var done chan int  = new(2) chan int
 
     run mutexBumper(m, done)
@@ -179,28 +191,24 @@ fun mutexDemo() {
 // at scope end, same as mutex.
 
 fun rwWriter(r rwmutex int, done chan int) {
-    var i int = 0
-    for i < 100 {
+    for i := 0; i < 100; i++ {
         var v int = r.Lock()               // writer guard
         v = v + 1                          // exclusive write
-        i = i + 1
     }                                      // guard drops → exclusive lock released
     write(done, 1)
 }
 
 fun rwReader(r rwmutex int, done chan int) {
-    var i int = 0
     var sum int = 0
-    for i < 1000 {
+    for i := 0; i < 1000; i++ {
         var v int = r.LockRead()           // reader guard (read-only)
         sum = sum + v
-        i = i + 1
     }                                      // guard drops → read lock released
     write(done, 1)
 }
 
 fun rwmutexDemo() {
-    var r    rwmutex int = new{}
+    var r    rwmutex int = new {}
     var done chan int    = new(3) chan int
 
     run rwWriter(r, done)
@@ -216,6 +224,74 @@ fun rwmutexDemo() {
     }
 }
 
+// =====================================================================
+// 7. mutex Counter — struct payload (the "worked example" from the .md)
+// =====================================================================
+// Same shape as the int-payload demo but the protected value is a
+// struct. `c.Lock()` binds a guard whose field accesses (`v.value`)
+// read and write directly through the mutex's inline storage.
+
+type Counter struct {
+    value int
+}
+
+fun counterBumper(c mutex Counter, done chan int) {
+    for i := 0; i < 1000; i++ {
+        var v Counter = c.Lock()       // (1) acquire — v is the guard
+        v.value = v.value + 1          //     exclusive write through the guard
+    }                                  // (2) v drops at iteration end → unlock fires
+    write(done, 1)
+}
+
+fun mutexCounterDemo() {
+    var c    mutex Counter = new {value: 0}
+    var done chan int      = new(2) chan int
+
+    run counterBumper(c, done)
+    run counterBumper(c, done)
+    read(done)
+    read(done)
+
+    var snap Counter = c.Lock()        // (1) acquire at function scope
+    if snap.value == 2000 {
+        log.Println("mutex Counter ok")
+    }
+}                                      // (2) snap drops at function end → unlock fires
+
+// =====================================================================
+// 8. once — first-touch initialization (closure form, the only form)
+// =====================================================================
+// `o.Do(fun() { ... })` runs the closure exactly once across all
+// callers. Every caller blocks until that single run completes, then
+// proceeds. Anything that needs to happen "if I'm the first arriver"
+// goes inside the closure — the closure runs only on the first
+// arriver.
+
+fun onceWorker(o once, init_count atomic int, wg waitgroup) {
+    o.Do(fun() {
+        // This body runs on exactly one thread, even though many
+        // threads call onceWorker concurrently.
+        init_count.Add(1)
+    })
+    wg.Done()
+}
+
+fun onceDoDemo() {
+    var o          once       = new()
+    var init_count atomic int = new {}
+    var wg         waitgroup  = new()
+
+    for i := 0; i < 10; i++ {
+        wg.Add(1)
+        run onceWorker(o, init_count, wg)
+    }
+    wg.Wait()
+
+    if init_count.Read() == 1 {
+        log.Println("once.Do ok")
+    }
+}
+
 fun main() {
     producerConsumer()
     selectDemo()
@@ -223,5 +299,7 @@ fun main() {
     atomicDemo()
     mutexDemo()
     rwmutexDemo()
+    mutexCounterDemo()
+    onceDoDemo()
     log.Println("concurrency ok")
 }

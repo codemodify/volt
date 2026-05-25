@@ -4,12 +4,16 @@
 //   Print  (fmt string, args...)   — write formatted args to stderr (no newline)
 //   Println(fmt string, args...)   — write formatted args to stderr + "\n"
 //
-// Both also accept a single-string form: `log.Print("hello")` / `log.Println("hi")`.
+// Both also accept a single-string form: `log.Print("hello")`.
 //
 // Both are COMPILER INTRINSICS — see emitLogFormatCall in codegen. The
 // bodies below are stand-ins that never run; they only exist so that
 // `import "log"` resolves and method signatures are visible to the
 // type-checker.
+//
+// There is no `Fatal` / `Fatalf` — volt avoids hiding control-flow exits
+// behind logging functions. Use `syscall.Exit(code)` explicitly when you
+// need to terminate the process.
 //
 // Supported format verbs:
 //   %d   integer (any width — widened to i64 for printing)

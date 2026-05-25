@@ -33,22 +33,25 @@ volt_exit:
     syscall
     // not reached
 
-// volt_spawn(fn, arg1, arg2, arg3, arg4): clone a new thread that runs
-// fn(arg1, arg2, arg3, arg4) then exits this thread.
+// volt_spawn(fn, arg1..arg6): clone a new thread that runs
+// fn(arg1, arg2, arg3, arg4, arg5, arg6) then exits this thread.
 //
-// SysV: rdi = fn, rsi = arg1, rdx = arg2, rcx = arg3, r8 = arg4. For
-// fewer-arg fns pass 0s for the unused tail slots. v0.5+ max 4 args
-// (covers worker patterns needing shared mutex + chan-in + chan-out
-// + done/control).
+// SysV: rdi = fn, rsi = arg1, rdx = arg2, rcx = arg3, r8 = arg4,
+// r9 = arg5. arg6 arrives on the caller's stack at 16(%rbp) because
+// SysV places the 7th positional argument there (rdi is fn, then 5
+// args in regs, then the 7th total = arg6 on the stack).
+//
+// For fewer-arg fns pass 0s for the unused tail slots. v0.6 max 6
+// args, matching the SysV register-arg ceiling for the receiving fn.
 //
 // Steps:
-//   1. Stash fn + 4 args in callee-saved regs (mmap clobbers caller-saved).
+//   1. Stash fn + 6 args in callee-saved regs (mmap clobbers caller-saved).
 //   2. mmap 1 MB stack.
-//   3. Push (arg4, arg3, arg2, arg1, fn) so child pops fn → rax,
-//      arg1 → rdi, arg2 → rsi, arg3 → rdx, arg4 → rcx.
+//   3. Push (arg6, arg5, arg4, arg3, arg2, arg1, fn) so child pops fn,
+//      then arg1..arg6 into rdi/rsi/rdx/rcx/r8/r9.
 //   4. clone() with the standard pthread flags.
 //   5. Parent returns child TID.
-//   6. Child: pop into the calling-convention regs, call, sys_exit.
+//   6. Child: pop into the SysV-arg regs, call, sys_exit.
 .global volt_spawn
 volt_spawn:
     pushq   %rbp
@@ -58,12 +61,17 @@ volt_spawn:
     pushq   %r13
     pushq   %r14
     pushq   %r15
+    subq    $16, %rsp           // local slots for arg5/arg6 (caller-saved)
 
     movq    %rdi, %r12          // fn
     movq    %rsi, %r13          // arg1
     movq    %rdx, %r14          // arg2
     movq    %rcx, %r15          // arg3
     movq    %r8,  %rbx          // arg4
+    movq    %r9,  -8(%rbp)      // arg5 → stack slot (5 callee-saved
+                                //   regs in use; spill arg5 here)
+    movq    16(%rbp), %rax      // arg6 from caller's stack frame
+    movq    %rax, -16(%rbp)
 
     // mmap(NULL, 1MB, RW, PRIVATE|ANON, -1, 0)
     movq    $9,        %rax
@@ -76,7 +84,13 @@ volt_spawn:
     syscall
 
     addq    $1048576, %rax
-    // Push (arg4, arg3, arg2, arg1, fn) — fn ends up on top.
+    // Push (arg6, arg5, arg4, arg3, arg2, arg1, fn) — fn on top.
+    movq    -16(%rbp), %rcx     // reload arg6
+    subq    $8, %rax
+    movq    %rcx, (%rax)        // arg6
+    movq    -8(%rbp), %rcx      // reload arg5
+    subq    $8, %rax
+    movq    %rcx, (%rax)        // arg5
     subq    $8, %rax
     movq    %rbx, (%rax)        // arg4
     subq    $8, %rax
@@ -99,6 +113,7 @@ volt_spawn:
     testq   %rax, %rax
     jz      .Lvolt_spawn_child
 
+    addq    $16, %rsp
     popq    %r15
     popq    %r14
     popq    %r13
@@ -113,6 +128,8 @@ volt_spawn:
     popq    %rsi                // arg2
     popq    %rdx                // arg3
     popq    %rcx                // arg4
+    popq    %r8                 // arg5
+    popq    %r9                 // arg6
     callq   *%rax
     xorq    %rdi, %rdi
     movq    $60, %rax           // sys_exit (this thread only)

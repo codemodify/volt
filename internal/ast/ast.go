@@ -149,6 +149,20 @@ type InterfaceType struct {
 func (t *InterfaceType) Pos() lex.Pos { return t.P }
 func (t *InterfaceType) typeNode()    {}
 
+// FuncType is `fun(P1, P2) R` — a first-class function type. Used in
+// variable declarations, parameters, struct fields, etc. At LLVM
+// level a FuncType lowers to %fn_value = {ptr fn, ptr env} — a closure
+// fat pointer. Bare function names get a trampoline + null env when
+// used in a fn-typed context.
+type FuncType struct {
+	P       lex.Pos
+	Params  []*Param // unnamed positional params allowed (Name == "")
+	Results []Type   // empty = no return
+}
+
+func (t *FuncType) Pos() lex.Pos { return t.P }
+func (t *FuncType) typeNode()    {}
+
 // SliceType is `[]T`.
 type SliceType struct {
 	P    lex.Pos
@@ -265,9 +279,13 @@ type ContinueStmt struct {
 func (s *ContinueStmt) Pos() lex.Pos { return s.P }
 func (s *ContinueStmt) stmtNode()    {}
 
-// IfStmt is `if cond { Then } [else { Else } | else IfStmt]`.
+// IfStmt is `if [Init;] cond { Then } [else { Else } | else IfStmt]`.
+// Init, when present, is a SimpleStmt (typically VarStmt / MultiVarStmt /
+// AssignStmt) scoped to the entire if/else chain — its bindings are
+// visible in Cond, Then, and Else (including else-if Cond's).
 type IfStmt struct {
 	P    lex.Pos
+	Init Stmt // nil if no init clause
 	Cond Expr
 	Then *Block
 	Else Stmt // nil, *Block, or *IfStmt (for "else if")
@@ -278,12 +296,21 @@ func (s *IfStmt) stmtNode()    {}
 
 // ForStmt is `for [Init;] [Cond] [;Post] { Body }`.
 // All three of Init/Cond/Post may be nil (giving `for { ... }`, infinite).
+//
+// Range form: when RangeOver is non-nil, this is a `for i, v := range
+// EXPR { ... }` loop. RangeI is the index/key binding (or "_" / ""
+// for the single-variable form `for i := range`); RangeV is the value
+// binding (or "" if absent). Codegen lowers range to a normal
+// index-based for loop over the underlying slice / string / map.
 type ForStmt struct {
-	P    lex.Pos
-	Init Stmt // typically *VarStmt or *AssignStmt; may be nil
-	Cond Expr // may be nil
-	Post Stmt // typically *AssignStmt; may be nil
-	Body *Block
+	P         lex.Pos
+	Init      Stmt // typically *VarStmt or *AssignStmt; may be nil
+	Cond      Expr // may be nil
+	Post      Stmt // typically *AssignStmt; may be nil
+	Body      *Block
+	RangeI    string
+	RangeV    string
+	RangeOver Expr // nil for non-range loops
 }
 
 func (s *ForStmt) Pos() lex.Pos { return s.P }
@@ -382,10 +409,59 @@ type SelectCase struct {
 
 func (c *SelectCase) Pos() lex.Pos { return c.P }
 
-// ChanType is `chan T` — a channel carrying values of T.
+// ChanType is `chan T`, `chan read T`, `chan write T`, or one of the
+// multiplicity-contracted forms (`chan11 T`, `chan1N T`, `chanN1 T`,
+// `chanNN T`) — a channel carrying values of T with an optional
+// direction restriction (per-handle) and/or multiplicity contract
+// (per-channel-value). Direction is enforced at the read/write/close
+// builtin sites; multiplicity is enforced at the declaration site by
+// walking the function body and counting endpoints. At the LLVM level
+// all forms lower to `ptr`. Construction (`new(N)`) always produces a
+// bidirectional handle; narrowing is one-way: bidi → directional.
 type ChanType struct {
-	P    lex.Pos
-	Elem Type
+	P     lex.Pos
+	Elem  Type
+	Dir   ChanDir
+	Multi ChanMulti
+}
+
+// ChanDir is the access discipline on a channel handle.
+type ChanDir int
+
+const (
+	ChanBoth  ChanDir = iota // `chan T` — read + write
+	ChanRead                 // `chan read T` — read-only
+	ChanWrite                // `chan write T` — write-only
+)
+
+// ChanMulti is the endpoint-multiplicity contract on a channel value.
+// `1` = exactly one endpoint of that kind; `N` = one or more.
+// Notation is <readers><writers> — chan11 = one reader, one writer.
+// Verified at compile time at the declaring scope by walking the
+// function body and counting reader/writer endpoints.
+type ChanMulti int
+
+const (
+	ChanMultiNone ChanMulti = iota // `chan T` — no contract
+	ChanMulti11                    // `chan11 T` — One Reader, One Writer
+	ChanMulti1N                    // `chan1N T` — One Reader, Many Writers
+	ChanMultiN1                    // `chanN1 T` — Many Readers, One Writer
+	ChanMultiNN                    // `chanNN T` — Many Readers, Many Writers
+)
+
+// MultiName returns the surface-syntax keyword for a multiplicity.
+func (m ChanMulti) MultiName() string {
+	switch m {
+	case ChanMulti11:
+		return "chan11"
+	case ChanMulti1N:
+		return "chan1N"
+	case ChanMultiN1:
+		return "chanN1"
+	case ChanMultiNN:
+		return "chanNN"
+	}
+	return "chan"
 }
 
 func (t *ChanType) Pos() lex.Pos { return t.P }
@@ -519,6 +595,17 @@ type IntLit struct {
 func (e *IntLit) Pos() lex.Pos { return e.P }
 func (e *IntLit) exprNode()    {}
 
+// FloatLit is a floating-point literal. Text holds the original source
+// (digits, `.`, optional exponent, `_` separators stripped) and is
+// passed verbatim to LLVM — LLVM parses the actual numeric value.
+type FloatLit struct {
+	P    lex.Pos
+	Text string // canonical form (no `_`s)
+}
+
+func (e *FloatLit) Pos() lex.Pos { return e.P }
+func (e *FloatLit) exprNode()    {}
+
 // BoolLit is `true` or `false`.
 type BoolLit struct {
 	P     lex.Pos
@@ -535,6 +622,28 @@ type NilLit struct {
 
 func (e *NilLit) Pos() lex.Pos { return e.P }
 func (e *NilLit) exprNode()    {}
+
+// FuncLit is an anonymous function expression:
+//
+//	fun(x int) int { ret x + 1 }
+//
+// Codegen synthesizes a top-level function for the body. If the body
+// references identifiers from the enclosing scope, those are captured
+// (by-move for non-Copy types, by-copy for Copy types). The literal
+// evaluates to a closure value: %fn_value = {ptr fn, ptr env}.
+//
+// Captures is populated during the check pass — it lists the free
+// identifiers found in Body that resolve to enclosing-scope vars.
+type FuncLit struct {
+	P        lex.Pos
+	Params   []*Param
+	Results  []Type
+	Body     *Block
+	Captures []string // free-variable names; filled in by the check pass
+}
+
+func (e *FuncLit) Pos() lex.Pos { return e.P }
+func (e *FuncLit) exprNode()    {}
 
 // BinaryExpr is `X op Y` for binary operators (+, -, *, /, etc.).
 type BinaryExpr struct {

@@ -166,7 +166,7 @@
         },
         {
           "name": "keyword.declaration.volt",
-          "match": "\\b(var|const|type|fun|package|import|struct|interface|map)\\b"
+          "match": "\\b(var|const|type|fun|package|import|struct|interface|map|read|write)\\b"
         }
       ]
     },
@@ -191,7 +191,7 @@
 
     "builtin-types": {
       "name": "keyword.control.type.volt",
-      "match": "\\b(int|int8|int16|int32|int64|uint|uint8|uint16|uint32|uint64|float|float32|float64|byte|rune|bool|string|error|any|void|chan|mutex|rwmutex|atomic|waitgroup|once)\\b"
+      "match": "\\b(int|int8|int16|int32|int64|uint|uint8|uint16|uint32|uint64|float|float32|float64|byte|rune|bool|string|error|any|void|chan|chan11|chan1N|chanN1|chanNN|mutex|rwmutex|atomic|waitgroup|once)\\b"
     },
 
     "type-sigils": {

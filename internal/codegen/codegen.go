@@ -51,6 +51,28 @@ type Emitter struct {
 	structs    map[string]*structInfo    // user-defined struct types
 	interfaces map[string]bool           // user-declared interface type names (opaque ptr)
 	consts     map[string]ast.Expr       // top-level const Name → value expr
+	// errorImpls: concrete type names that satisfy the built-in `error`
+	// interface (i.e., have a method `fun (r *T) Error() string`).
+	// Populated after method registration; consulted when boxing into
+	// an `error`-typed variable and when dispatching `.Error()` calls.
+	errorImpls map[string]bool
+	// interfaceDecls keyed by interface NAME → its AST (method order
+	// is preserved so vtable indices match the declared method order).
+	interfaceDecls map[string]*ast.InterfaceType
+	// ifaceImpls keyed by concrete typeName → set of interface names it implements.
+	// Computed once after all types + methods are registered.
+	ifaceImpls map[string]map[string]bool
+	// fnTrampolines: set of (mangled) function symbols for which we've
+	// already emitted a `<sym>_$fn` trampoline that adapts the bare-fn
+	// ABI to the closure ABI `(ptr env, args...) -> ret`. Trampolines
+	// are emitted lazily on first use as a fn value.
+	fnTrampolines map[string]string // function symbol → trampoline symbol
+	// trampolineDefs accumulates IR for synthesized trampolines and
+	// closure bodies. Written out after the user's functions.
+	trampolineDefs strings.Builder
+	// closureLitID is a monotonic counter for naming synthesized
+	// closure-literal bodies and their env types.
+	closureLitID int
 	// Optional LLVM target triple. When empty, no `target triple` line
 	// is emitted — clang `--target=` then governs.
 	targetTriple string
@@ -71,9 +93,13 @@ func New() *Emitter {
 		funcs:    make(map[string]*ast.FuncDecl),
 		methods:  make(map[string]map[string]*ast.FuncDecl),
 		imported: make(map[string]bool),
-		structs:    make(map[string]*structInfo),
-		interfaces: make(map[string]bool),
-		consts:     make(map[string]ast.Expr),
+		structs:        make(map[string]*structInfo),
+		interfaces:     make(map[string]bool),
+		errorImpls:     make(map[string]bool),
+		interfaceDecls: make(map[string]*ast.InterfaceType),
+		ifaceImpls:     make(map[string]map[string]bool),
+		fnTrampolines:  make(map[string]string),
+		consts:         make(map[string]ast.Expr),
 	}
 }
 
@@ -123,7 +149,47 @@ func (e *Emitter) Emit(file *ast.File) (string, error) {
 				e.structs[d.Name] = &structInfo{Fields: td.Fields, Index: idx}
 			case *ast.InterfaceType:
 				e.interfaces[d.Name] = true
+				e.interfaceDecls[d.Name] = td
 			}
+		}
+	}
+
+	// Identify concrete types that satisfy the built-in `error`
+	// interface — i.e., declare a method `fun (r *T) Error() string`
+	// (no params, single string return). Method registration above is
+	// complete by this point.
+	for tn, m := range e.methods {
+		fd, ok := m["Error"]
+		if !ok {
+			continue
+		}
+		if len(fd.Params) != 0 || len(fd.Results) != 1 {
+			continue
+		}
+		if nt, ok := fd.Results[0].(*ast.NamedType); ok && nt.Name == "string" {
+			e.errorImpls[tn] = true
+		}
+	}
+	// Identify concrete types that satisfy each user-declared interface.
+	// v0.7 match: every method NAME declared on the interface must exist
+	// on the concrete type. Signature-strict matching comes later when
+	// the parser captures interface method signatures.
+	for ifaceName, iface := range e.interfaceDecls {
+		for tn, m := range e.methods {
+			ok := true
+			for _, mDecl := range iface.Methods {
+				if _, has := m[mDecl.Name]; !has {
+					ok = false
+					break
+				}
+			}
+			if !ok {
+				continue
+			}
+			if e.ifaceImpls[tn] == nil {
+				e.ifaceImpls[tn] = make(map[string]bool)
+			}
+			e.ifaceImpls[tn][ifaceName] = true
 		}
 	}
 
@@ -134,7 +200,22 @@ func (e *Emitter) Emit(file *ast.File) (string, error) {
 		e.header.WriteString("\n")
 	}
 	e.header.WriteString("%string = type { ptr, i64 }\n")
-	e.header.WriteString("%slice = type { ptr, i64 }\n")
+	// %slice = { data ptr, len, cap }. cap is the allocated capacity;
+	// new[]T(N) initializes len = N and cap = N. append() can grow cap
+	// past len when needed; sub-slicing (when it lands) will reuse the
+	// same backing while narrowing len.
+	e.header.WriteString("%slice = type { ptr, i64, i64 }\n")
+	// %error_box: fat pointer for error-typed values. data is the
+	// boxed concrete value, error_fn is the implementing type's
+	// Error() method (stored directly instead of via a separate
+	// vtable struct — error has exactly one method).
+	e.header.WriteString("%error_box = type { ptr, ptr }\n")
+	// %fn_value: closure fat pointer { ptr fn, ptr env }. Every
+	// function value (named-fn reference, anonymous literal,
+	// closure with captures) is this shape. The `fn` slot always
+	// has the signature `(env, args...) -> result`; bare-fn
+	// references use a synthesized trampoline that ignores env.
+	e.header.WriteString("%fn_value = type { ptr, ptr }\n")
 
 	// Emit named struct types. The order from the source file is preserved.
 	for _, d := range file.Decls {
@@ -156,6 +237,24 @@ func (e *Emitter) Emit(file *ast.File) (string, error) {
 		e.header.WriteString(" }\n")
 	}
 	e.header.WriteString("\n")
+
+	// Emit user-interface vtables: one constant array per (concrete
+	// type, interface) pair. Method order matches the interface's
+	// declaration order, so dispatch-time indices line up.
+	for tn, ifaces := range e.ifaceImpls {
+		for ifaceName := range ifaces {
+			iface := e.interfaceDecls[ifaceName]
+			var entries []string
+			for _, m := range iface.Methods {
+				entries = append(entries, "ptr @"+methodSymbol(e.pkg, tn, m.Name))
+			}
+			fmt.Fprintf(&e.header, "@%s_%s_vtable = constant [%d x ptr] [%s]\n",
+				tn, ifaceName, len(entries), strings.Join(entries, ", "))
+		}
+	}
+	if len(e.ifaceImpls) > 0 {
+		e.header.WriteString("\n")
+	}
 
 	var body strings.Builder
 	for _, d := range file.Decls {
@@ -181,6 +280,10 @@ func (e *Emitter) Emit(file *ast.File) (string, error) {
 		out.WriteString("\n")
 	}
 	out.WriteString(body.String())
+	if e.trampolineDefs.Len() > 0 {
+		out.WriteString("\n; -- synthesized trampolines + closure bodies --\n")
+		out.WriteString(e.trampolineDefs.String())
+	}
 	return out.String(), nil
 }
 
@@ -242,6 +345,12 @@ func (e *Emitter) llvmType(t ast.Type) string {
 		// containing the wrapped value plus any lock state. Reference-
 		// typed (copying the value yields another handle).
 		return "ptr"
+	case *ast.FuncType:
+		// First-class function values are %fn_value = {ptr fn, ptr env}.
+		// The signature is carried in the AST node; codegen looks at the
+		// declared type at the call site to produce the right indirect-
+		// call signature.
+		return "%fn_value"
 	}
 	return "void"
 }
@@ -339,15 +448,17 @@ func (e *Emitter) emitFunc(out *strings.Builder, fd *ast.FuncDecl) error {
 	out.WriteString("entry:\n")
 
 	c := &funcCtx{
-		e:       e,
-		symbols: make(map[string]symbol),
-		retType: retType,
-		isMain:  isMain,
+		e:         e,
+		symbols:   make(map[string]symbol),
+		retType:   retType,
+		isMain:    isMain,
+		usedAddrs: make(map[string]int),
 	}
 
 	for _, p := range allParams {
 		pt := e.llvmType(p.Type)
 		ptr := fmt.Sprintf("%%%s.addr", p.Name)
+		c.usedAddrs[p.Name+".addr"] = 1
 		fmt.Fprintf(&c.body, "  %s = alloca %s\n", ptr, pt)
 		fmt.Fprintf(&c.body, "  store %s %%%s, ptr %s\n", pt, p.Name, ptr)
 		c.symbols[p.Name] = symbol{
@@ -423,6 +534,11 @@ type funcCtx struct {
 	drops      []dropEntry
 	scopeDepth int         // 0 = function body, +1 per nested block
 	loops      []loopFrame // innermost last
+	// LLVM-level alloca names already used in this function — keyed by
+	// the desired raw name (e.g. "i.addr"). emitVar consults this to
+	// uniquify when the same source identifier is declared more than
+	// once in the same function (e.g. two sequential `for i := 0` loops).
+	usedAddrs map[string]int
 }
 
 type loopFrame struct {
@@ -686,11 +802,13 @@ func aggregateType(fieldTypes []string) string {
 	return sb.String()
 }
 
-// emitRun lowers `run f(...)` (0..4 args) to volt_spawn(@f, a1, a2, a3,
-// a4). The runtime spawn primitive (start_*.s) accepts a fixed 4
-// arg-slots; unused tail slots are passed as null. For >4 args, pack
-// into a struct and pass a single ptr.
-const spawnMaxArgs = 4
+// emitRun lowers `run f(...)` (0..6 args) to
+// volt_spawn(@f, a1, a2, a3, a4, a5, a6). The runtime spawn primitive
+// (start_*.s) accepts a fixed 6 arg-slots — matching the SysV
+// register-arg ceiling for the receiving function on amd64 — and
+// passes null for any unused tail slot. For >6 args, pack into a
+// struct and pass a single ptr.
+const spawnMaxArgs = 6
 
 func (c *funcCtx) emitRun(s *ast.RunStmt) error {
 	id, ok := s.Call.Fun.(*ast.IdentExpr)
@@ -713,30 +831,47 @@ func (c *funcCtx) emitRun(s *ast.RunStmt) error {
 	for i := range args {
 		args[i] = "null"
 	}
-	// All spawn slots are typed `ptr` in the ABI. Non-ptr scalar args
-	// (e.g. an int passed as a worker config value) get inttoptr'd into
-	// place — the receiver picks them up as integer-sized registers and
-	// the volt callee's signature reinterprets them as the original
-	// scalar type. Ptr-typed args pass through unchanged.
+	// Spawn slots are ptr-typed. Most volt scalar args fit in one slot
+	// and ride through via inttoptr. A function-value arg (`%fn_value`)
+	// is a 16-byte {fn, env} aggregate — SysV passes it in TWO GPRs, so
+	// it consumes TWO spawn slots. The receiver's LLVM signature still
+	// declares the param as %fn_value and the calling convention
+	// reassembles it from rdi+rsi (or the next pair of arg-passing regs).
+	slot := 0
 	for i, expr := range s.Call.Args {
 		v, err := c.emitCallArg(expr, sig.Params[i].Type)
 		if err != nil {
 			return err
 		}
+		if v.Type == "%fn_value" {
+			if slot+1 >= spawnMaxArgs {
+				return fmt.Errorf("%s: closure args consume 2 spawn slots; this run exceeds the %d-slot limit",
+					s.Pos(), spawnMaxArgs)
+			}
+			fnP := c.newTemp()
+			envP := c.newTemp()
+			fmt.Fprintf(&c.body, "  %s = extractvalue %%fn_value %s, 0\n", fnP, v.Name)
+			fmt.Fprintf(&c.body, "  %s = extractvalue %%fn_value %s, 1\n", envP, v.Name)
+			args[slot] = fnP
+			args[slot+1] = envP
+			slot += 2
+			continue
+		}
 		if v.Type == "ptr" {
-			args[i] = v.Name
+			args[slot] = v.Name
+			slot++
 			continue
 		}
 		conv := c.newTemp()
-		// Widen to i64 first if narrower, then inttoptr.
 		widened := c.convertInt(v, "i64")
 		fmt.Fprintf(&c.body, "  %s = inttoptr i64 %s to ptr\n", conv, widened.Name)
-		args[i] = conv
+		args[slot] = conv
+		slot++
 	}
 	mangled := SymbolName(c.e.pkg, id.Name)
-	c.e.ensureDeclare("declare void @volt_spawn(ptr, ptr, ptr, ptr, ptr)")
-	fmt.Fprintf(&c.body, "  call void @volt_spawn(ptr @%s, ptr %s, ptr %s, ptr %s, ptr %s)\n",
-		mangled, args[0], args[1], args[2], args[3])
+	c.e.ensureDeclare("declare void @volt_spawn(ptr, ptr, ptr, ptr, ptr, ptr, ptr)")
+	fmt.Fprintf(&c.body, "  call void @volt_spawn(ptr @%s, ptr %s, ptr %s, ptr %s, ptr %s, ptr %s, ptr %s)\n",
+		mangled, args[0], args[1], args[2], args[3], args[4], args[5])
 	return nil
 }
 
@@ -847,19 +982,22 @@ func (c *funcCtx) emitSelect(s *ast.SelectStmt) error {
 	// Emit each body block.
 	for i, cs := range channelCases {
 		c.startBlock(bodyLbls[i])
-		// Bind recv names if any.
+		// Bind recv names if any. Each case is a fresh scope, so we
+		// disambiguate the alloca pointer with the case index — two
+		// cases binding `v := read(a)` and `v := read(b)` won't collide
+		// at the LLVM level.
 		if cs.SendValue == nil && len(cs.RecvNames) > 0 {
 			agg := recvAggs[i]
 			vTmp := c.newTemp()
 			fmt.Fprintf(&c.body, "  %s = extractvalue {i64, i64} %s, 0\n", vTmp, agg)
-			ptr := fmt.Sprintf("%%%s.addr", cs.RecvNames[0])
+			ptr := fmt.Sprintf("%%%s.case%d.addr", cs.RecvNames[0], i)
 			fmt.Fprintf(&c.body, "  %s = alloca i64\n", ptr)
 			fmt.Fprintf(&c.body, "  store i64 %s, ptr %s\n", vTmp, ptr)
 			c.symbols[cs.RecvNames[0]] = symbol{Ptr: ptr, Type: "i64"}
 			if len(cs.RecvNames) == 2 {
 				okTmp := c.newTemp()
 				fmt.Fprintf(&c.body, "  %s = extractvalue {i64, i64} %s, 1\n", okTmp, agg)
-				okPtr := fmt.Sprintf("%%%s.addr", cs.RecvNames[1])
+				okPtr := fmt.Sprintf("%%%s.case%d.addr", cs.RecvNames[1], i)
 				fmt.Fprintf(&c.body, "  %s = alloca i64\n", okPtr)
 				fmt.Fprintf(&c.body, "  store i64 %s, ptr %s\n", okTmp, okPtr)
 				c.symbols[cs.RecvNames[1]] = symbol{Ptr: okPtr, Type: "i64"}
@@ -1043,15 +1181,8 @@ func (c *funcCtx) classifyGuardCall(expr ast.Expr) (guardCall, bool) {
 	}
 	switch t := sym.AstType.(type) {
 	case *ast.MutexType:
-		switch sel.Sel {
-		case "Lock":
+		if sel.Sel == "Lock" {
 			return guardCall{lockFn: "volt_mutex_lock", unlockFn: "volt_mutex_unlock", elem: t.Elem}, true
-		case "LockRead":
-			// Same lock acquisition as Lock — `mutex T` has no separate read
-			// path — but the resulting guard is read-only, so field writes
-			// become compile errors. Useful when the critical section only
-			// observes and you want the compiler to enforce it.
-			return guardCall{lockFn: "volt_mutex_lock", unlockFn: "volt_mutex_unlock", readOnly: true, elem: t.Elem}, true
 		}
 	case *ast.RwMutexType:
 		switch sel.Sel {
@@ -1136,6 +1267,191 @@ func (c *funcCtx) emitGuardVar(s *ast.VarStmt) error {
 	return nil
 }
 
+// isErrorType reports whether `t` is the built-in `error` interface
+// (a `NamedType` literally named "error").
+func isErrorType(t ast.Type) bool {
+	nt, ok := t.(*ast.NamedType)
+	return ok && nt.Name == "error"
+}
+
+// isAnyType reports whether `t` is the built-in `any` interface — the
+// type-erased empty interface. v0.7: stores any value heap-allocated
+// behind a single ptr; no method dispatch (no methods to dispatch),
+// no type recovery (no type tag yet — that's a future addition).
+func isAnyType(t ast.Type) bool {
+	nt, ok := t.(*ast.NamedType)
+	return ok && nt.Name == "any"
+}
+
+// emitAnyBox heap-allocates a copy of `val` and returns the data ptr.
+// Used when assigning any concrete value to an `any`-typed variable.
+// No vtable, no fat pointer — `any` has no methods to dispatch and no
+// type tag to read back, so storing the data ptr is sufficient.
+func (c *funcCtx) emitAnyBox(_ lex.Pos, val Value) (Value, error) {
+	szPtr := c.newTemp()
+	szInt := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = getelementptr %s, ptr null, i32 1\n", szPtr, val.Type)
+	fmt.Fprintf(&c.body, "  %s = ptrtoint ptr %s to i64\n", szInt, szPtr)
+	c.e.ensureDeclare("declare ptr @volt_alloc(i64)")
+	dataPtr := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = call ptr @volt_alloc(i64 %s)\n", dataPtr, szInt)
+	fmt.Fprintf(&c.body, "  store %s %s, ptr %s\n", val.Type, val.Name, dataPtr)
+	return Value{Name: dataPtr, Type: "ptr"}, nil
+}
+
+// userInterfaceName returns the interface name if `t` refers to a
+// user-declared interface type (and not the built-in `error`/`any`).
+func (c *funcCtx) userInterfaceName(t ast.Type) string {
+	nt, ok := t.(*ast.NamedType)
+	if !ok {
+		return ""
+	}
+	if _, ok := c.e.interfaceDecls[nt.Name]; ok {
+		return nt.Name
+	}
+	return ""
+}
+
+// emitIfaceBox lowers `var v Iface = X{...}` (where X is a concrete
+// type that implements Iface) into a heap-boxed fat pointer pointing
+// at the right vtable. Mirrors emitErrorBox but with a vtable pointer
+// in the second slot instead of a single fn pointer.
+func (c *funcCtx) emitIfaceBox(pos lex.Pos, val Value, ifaceName string) (Value, error) {
+	typeName := strings.TrimPrefix(val.Type, "%")
+	if !c.e.ifaceImpls[typeName][ifaceName] {
+		return Value{}, fmt.Errorf("%s: type %s does not implement interface %s (missing one of its methods)",
+			pos, typeName, ifaceName)
+	}
+	// Allocate space for the concrete value and store the SSA value.
+	szPtr := c.newTemp()
+	szInt := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = getelementptr %s, ptr null, i32 1\n", szPtr, val.Type)
+	fmt.Fprintf(&c.body, "  %s = ptrtoint ptr %s to i64\n", szInt, szPtr)
+	c.e.ensureDeclare("declare ptr @volt_alloc(i64)")
+	dataPtr := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = call ptr @volt_alloc(i64 %s)\n", dataPtr, szInt)
+	fmt.Fprintf(&c.body, "  store %s %s, ptr %s\n", val.Type, val.Name, dataPtr)
+
+	// Allocate the 16-byte fat pointer box {ptr data, ptr vtable}.
+	// We reuse %error_box's layout (same shape — the second slot is
+	// just opaque; error stores a fn ptr, user-iface stores a vtable
+	// ptr; the dispatch path knows which kind it has).
+	boxPtr := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = call ptr @volt_alloc(i64 16)\n", boxPtr)
+	vtableSym := fmt.Sprintf("%s_%s_vtable", typeName, ifaceName)
+	gepData := c.newTemp()
+	gepVT := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = getelementptr %%error_box, ptr %s, i32 0, i32 0\n", gepData, boxPtr)
+	fmt.Fprintf(&c.body, "  store ptr %s, ptr %s\n", dataPtr, gepData)
+	fmt.Fprintf(&c.body, "  %s = getelementptr %%error_box, ptr %s, i32 0, i32 1\n", gepVT, boxPtr)
+	fmt.Fprintf(&c.body, "  store ptr @%s, ptr %s\n", vtableSym, gepVT)
+	return Value{Name: boxPtr, Type: "ptr"}, nil
+}
+
+// emitIfaceMethod dispatches a method call whose receiver is a user-
+// declared interface type. Looks up the method's index in the
+// interface declaration (declaration order = vtable order), loads the
+// fn pointer from vtable[index], indirect-calls with data ptr as the
+// hidden first arg ("this").
+func (c *funcCtx) emitIfaceMethod(call *ast.CallExpr, recvSym symbol, ifaceName, method string) (Value, error) {
+	iface := c.e.interfaceDecls[ifaceName]
+	if iface == nil {
+		return Value{}, fmt.Errorf("%s: unknown interface %s", call.Pos(), ifaceName)
+	}
+	methodIdx := -1
+	var methodFt *ast.FuncType
+	for i, m := range iface.Methods {
+		if m.Name == method {
+			methodIdx = i
+			methodFt, _ = m.Type.(*ast.FuncType)
+			break
+		}
+	}
+	if methodIdx < 0 {
+		return Value{}, fmt.Errorf("%s: interface %s has no method %q", call.Pos(), ifaceName, method)
+	}
+	if methodFt == nil {
+		return Value{}, fmt.Errorf("%s: interface %s method %s lost its signature", call.Pos(), ifaceName, method)
+	}
+	if len(call.Args) != len(methodFt.Params) {
+		return Value{}, fmt.Errorf("%s: %s.%s takes %d arg(s), got %d",
+			call.Pos(), ifaceName, method, len(methodFt.Params), len(call.Args))
+	}
+
+	box := c.newTemp()
+	dataGep := c.newTemp()
+	dataPtr := c.newTemp()
+	vtGep := c.newTemp()
+	vtPtr := c.newTemp()
+	fnGep := c.newTemp()
+	fnPtr := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = load ptr, ptr %s\n", box, recvSym.Ptr)
+	fmt.Fprintf(&c.body, "  %s = getelementptr %%error_box, ptr %s, i32 0, i32 0\n", dataGep, box)
+	fmt.Fprintf(&c.body, "  %s = load ptr, ptr %s\n", dataPtr, dataGep)
+	fmt.Fprintf(&c.body, "  %s = getelementptr %%error_box, ptr %s, i32 0, i32 1\n", vtGep, box)
+	fmt.Fprintf(&c.body, "  %s = load ptr, ptr %s\n", vtPtr, vtGep)
+	// GEP into the vtable array at this method's index.
+	fmt.Fprintf(&c.body, "  %s = getelementptr ptr, ptr %s, i32 %d\n", fnGep, vtPtr, methodIdx)
+	fmt.Fprintf(&c.body, "  %s = load ptr, ptr %s\n", fnPtr, fnGep)
+
+	retT := "void"
+	if len(methodFt.Results) > 0 {
+		retT = c.e.llvmType(methodFt.Results[0])
+	}
+	argStrs := []string{"ptr " + dataPtr}
+	for i, arg := range call.Args {
+		v, err := c.emitCallArg(arg, methodFt.Params[i].Type)
+		if err != nil {
+			return Value{}, err
+		}
+		paramT := c.e.llvmType(methodFt.Params[i].Type)
+		argStrs = append(argStrs, paramT+" "+v.Name)
+	}
+	if retT == "void" {
+		fmt.Fprintf(&c.body, "  call void %s(%s)\n", fnPtr, strings.Join(argStrs, ", "))
+		return Value{Name: "", Type: "void"}, nil
+	}
+	result := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = call %s %s(%s)\n", result, retT, fnPtr, strings.Join(argStrs, ", "))
+	return Value{Name: result, Type: retT}, nil
+}
+
+// emitErrorBox boxes a concrete struct value into an `%error_box`. The
+// returned value is a `ptr` (LLVM-level alias for an `error` value).
+// The caller (typically emitVar) replaces the original RHS with this
+// boxed pointer. Both the data box and the box-struct itself are
+// heap-allocated via volt_alloc; ownership is shared (no auto-free
+// today, same as channels).
+func (c *funcCtx) emitErrorBox(pos lex.Pos, val Value) (Value, error) {
+	typeName := strings.TrimPrefix(val.Type, "%")
+	if !c.e.errorImpls[typeName] {
+		return Value{}, fmt.Errorf("%s: type %s does not implement `error` (needs `fun (r *%s) Error() string`)",
+			pos, typeName, typeName)
+	}
+
+	// Allocate space for the concrete value and store the SSA value.
+	szPtr := c.newTemp()
+	szInt := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = getelementptr %s, ptr null, i32 1\n", szPtr, val.Type)
+	fmt.Fprintf(&c.body, "  %s = ptrtoint ptr %s to i64\n", szInt, szPtr)
+	c.e.ensureDeclare("declare ptr @volt_alloc(i64)")
+	dataPtr := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = call ptr @volt_alloc(i64 %s)\n", dataPtr, szInt)
+	fmt.Fprintf(&c.body, "  store %s %s, ptr %s\n", val.Type, val.Name, dataPtr)
+
+	// Allocate the fat-pointer box and populate {data_ptr, error_fn}.
+	boxPtr := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = call ptr @volt_alloc(i64 16)\n", boxPtr)
+	fnSym := methodSymbol(c.e.pkg, typeName, "Error")
+	gepData := c.newTemp()
+	gepFn := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = getelementptr %%error_box, ptr %s, i32 0, i32 0\n", gepData, boxPtr)
+	fmt.Fprintf(&c.body, "  store ptr %s, ptr %s\n", dataPtr, gepData)
+	fmt.Fprintf(&c.body, "  %s = getelementptr %%error_box, ptr %s, i32 0, i32 1\n", gepFn, boxPtr)
+	fmt.Fprintf(&c.body, "  store ptr @%s, ptr %s\n", fnSym, gepFn)
+	return Value{Name: boxPtr, Type: "ptr"}, nil
+}
+
 func (c *funcCtx) emitVar(s *ast.VarStmt) error {
 	// Type-hint passthrough: `var x T = new(...)` / `new{...}` short
 	// forms have no type on the `new` expression itself — pull it from
@@ -1167,6 +1483,41 @@ func (c *funcCtx) emitVar(s *ast.VarStmt) error {
 	} else if s.Value != nil {
 		typeStr = val.Type
 	}
+
+	// Implicit conversion: assigning a concrete struct value to an
+	// `error`-typed variable boxes the struct and stores its Error
+	// method pointer alongside. The resulting value is a `ptr` to an
+	// `%error_box`. Codegen for `e.Error()` reads the box and dispatches.
+	if s.Value != nil && isErrorType(s.Type) && strings.HasPrefix(val.Type, "%") && val.Type != "%string" && val.Type != "%slice" && val.Type != "%error_box" {
+		boxed, berr := c.emitErrorBox(s.Pos(), val)
+		if berr != nil {
+			return berr
+		}
+		val = boxed
+	}
+	// Same shape for user-declared interfaces: concrete struct value
+	// → fat pointer pointing at the matching (T, Iface) vtable.
+	if s.Value != nil && strings.HasPrefix(val.Type, "%") && val.Type != "%string" && val.Type != "%slice" {
+		if iname := c.userInterfaceName(s.Type); iname != "" {
+			boxed, berr := c.emitIfaceBox(s.Pos(), val, iname)
+			if berr != nil {
+				return berr
+			}
+			val = boxed
+		}
+	}
+	// `any` storage box: heap-copy the concrete value, store the ptr.
+	// Works for any non-ptr concrete type (struct, primitive, etc.).
+	// No type tag yet — values stuffed into `any` can be passed around
+	// and compared to nil, but can't be unboxed back to their original
+	// type (that needs a type-assertion mechanism, future work).
+	if s.Value != nil && isAnyType(s.Type) && val.Type != "ptr" {
+		boxed, berr := c.emitAnyBox(s.Pos(), val)
+		if berr != nil {
+			return berr
+		}
+		val = boxed
+	}
 	var elem, sliceElem string
 	if s.Type != nil {
 		elem = c.e.elemType(s.Type)
@@ -1174,7 +1525,7 @@ func (c *funcCtx) emitVar(s *ast.VarStmt) error {
 	} else if s.Value != nil {
 		sliceElem = val.SliceElem
 	}
-	ptr := fmt.Sprintf("%%%s.addr", s.Name)
+	ptr := "%" + c.allocaName(s.Name)
 	fmt.Fprintf(&c.body, "  %s = alloca %s\n", ptr, typeStr)
 	if s.Value != nil {
 		val = c.convertInt(val, typeStr)
@@ -1186,22 +1537,90 @@ func (c *funcCtx) emitVar(s *ast.VarStmt) error {
 	}
 	c.symbols[s.Name] = symbol{Ptr: ptr, Type: typeStr, Elem: elem, SliceElem: sliceElem, IsMap: isMap, AstType: s.Type}
 
-	// If the variable is an owned struct value AND its type has a Drop()
-	// method, register an automatic drop at scope exit.
+	// If the variable is an owned struct value AND its type (or any
+	// transitively-owned struct field) has a Drop() method, register
+	// the chain of drops at scope exit. Field drops run AFTER the
+	// parent's own Drop, in reverse declaration order — matching
+	// C++/Rust destruction semantics.
 	if len(typeStr) > 1 && typeStr[0] == '%' && typeStr != "%string" && typeStr != "%slice" {
 		typeName := strings.TrimPrefix(typeStr, "%")
-		if c.e.methods[typeName] != nil {
-			if _, ok := c.e.methods[typeName]["Drop"]; ok {
-				c.drops = append(c.drops, dropEntry{
-					kind:     dropKindStruct,
-					depth:    c.scopeDepth,
-					ptr:      ptr,
-					typeName: typeName,
-				})
+		c.registerStructDrops(ptr, typeName, c.scopeDepth, make(map[string]bool))
+	}
+	return nil
+}
+
+// registerStructDrops walks a struct type and registers Drop calls for
+// the struct itself and recursively for every field whose type has a
+// Drop method. Registration order is:
+//   1. each Drop-bearing field, in declaration order (recurses first)
+//   2. the parent's own Drop (last, so it pops FIRST under LIFO)
+//
+// With LIFO emission, that yields: parent.Drop runs, then fields run
+// in REVERSE declaration order, then nested-field drops, and so on.
+// `visiting` guards against pathological cyclic struct definitions.
+func (c *funcCtx) registerStructDrops(ptr, typeName string, depth int, visiting map[string]bool) {
+	if visiting[typeName] {
+		return
+	}
+	visiting[typeName] = true
+	defer delete(visiting, typeName)
+
+	info := c.e.structs[typeName]
+	if info == nil {
+		return
+	}
+	// Field drops first.
+	for i, f := range info.Fields {
+		nt, ok := f.Type.(*ast.NamedType)
+		if !ok {
+			continue
+		}
+		if !c.structHasDrop(nt.Name, make(map[string]bool)) {
+			continue
+		}
+		fp := c.newTemp()
+		fmt.Fprintf(&c.body, "  %s = getelementptr %%%s, ptr %s, i32 0, i32 %d\n",
+			fp, typeName, ptr, i)
+		c.registerStructDrops(fp, nt.Name, depth, visiting)
+	}
+	// Parent's own Drop last.
+	if c.e.methods[typeName] != nil {
+		if _, ok := c.e.methods[typeName]["Drop"]; ok {
+			c.drops = append(c.drops, dropEntry{
+				kind:     dropKindStruct,
+				depth:    depth,
+				ptr:      ptr,
+				typeName: typeName,
+			})
+		}
+	}
+}
+
+// structHasDrop reports whether the named struct type owns any Drop
+// behavior — either its own Drop method, or a Drop-bearing struct
+// field (transitively).
+func (c *funcCtx) structHasDrop(typeName string, visiting map[string]bool) bool {
+	if visiting[typeName] {
+		return false
+	}
+	visiting[typeName] = true
+	if c.e.methods[typeName] != nil {
+		if _, ok := c.e.methods[typeName]["Drop"]; ok {
+			return true
+		}
+	}
+	info := c.e.structs[typeName]
+	if info == nil {
+		return false
+	}
+	for _, f := range info.Fields {
+		if nt, ok := f.Type.(*ast.NamedType); ok {
+			if c.structHasDrop(nt.Name, visiting) {
+				return true
 			}
 		}
 	}
-	return nil
+	return false
 }
 
 // pushScope opens a new block scope. Drops registered while this scope
@@ -1474,6 +1893,16 @@ func parseAggregateFields(t string) []string {
 }
 
 func (c *funcCtx) emitIf(s *ast.IfStmt) error {
+	// Optional init clause: scope its bindings to the whole if/else chain.
+	// We push an outer scope, emit the init, then pop after the chain so
+	// any drops fire at the join point.
+	hasInit := s.Init != nil
+	if hasInit {
+		c.pushScope()
+		if err := c.emitStmt(s.Init); err != nil {
+			return err
+		}
+	}
 	condVal, err := c.emitExpr(s.Cond)
 	if err != nil {
 		return err
@@ -1538,10 +1967,248 @@ func (c *funcCtx) emitIf(s *ast.IfStmt) error {
 	if endReachable {
 		c.startBlock(endLbl)
 	}
+	if hasInit {
+		// Pop the init scope. If end is reachable, drops fire here; if
+		// every branch terminated, the scope is gone and pending drops
+		// were already discarded above.
+		if endReachable {
+			c.popScope()
+		} else {
+			c.scopeDepth--
+			c.discardDropsAbove(c.scopeDepth)
+		}
+	}
 	return nil
 }
 
+// emitRangeFor lowers `for i [, v] := range EXPR { body }` to a normal
+// index-driven loop. Supported sources:
+//   slice []T   → i = index (int), v = element of type T
+//   string      → i = byte index (int), v = byte (i8)
+//   map[K]V     → DEFERRED (needs runtime iterator)
+//
+// We synthesize an `i` counter and (if v is bound) load the element
+// from the source on each iteration. Bindings are added to c.symbols
+// and removed implicitly via block-scoped Drop machinery.
+func (c *funcCtx) emitRangeFor(s *ast.ForStmt) error {
+	src, err := c.emitExpr(s.RangeOver)
+	if err != nil {
+		return err
+	}
+	switch src.Type {
+	case "%slice":
+		return c.emitRangeOverSlice(s, src)
+	case "%string":
+		return c.emitRangeOverString(s, src)
+	case "ptr":
+		// Likely a map handle. Detect via the source identifier's symbol.
+		if id, ok := s.RangeOver.(*ast.IdentExpr); ok {
+			if sym, ok := c.symbols[id.Name]; ok && sym.IsMap {
+				return fmt.Errorf("%s: range over map is not yet supported — index map values manually for now", s.Pos())
+			}
+		}
+		return fmt.Errorf("%s: cannot range over value of type %s", s.Pos(), src.Type)
+	}
+	return fmt.Errorf("%s: cannot range over value of type %s — supported: slice, string", s.Pos(), src.Type)
+}
+
+func (c *funcCtx) emitRangeOverSlice(s *ast.ForStmt, src Value) error {
+	// Element LLVM type — needed both to GEP into the backing buffer
+	// and to declare the value binding. SliceElem on the Value carries
+	// this from emitNewSlice / emitSliceLit; if missing, we can't iterate.
+	elemLL := src.SliceElem
+	if elemLL == "" {
+		return fmt.Errorf("%s: range over slice: element type unknown (assign to a typed variable first)", s.Pos())
+	}
+
+	// Extract data ptr + len from the slice header into stable scratch
+	// slots (the slice value itself is SSA-only; we re-load each iter).
+	dataPtr := c.newTemp()
+	lenVal := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = extractvalue %%slice %s, 0\n", dataPtr, src.Name)
+	fmt.Fprintf(&c.body, "  %s = extractvalue %%slice %s, 1\n", lenVal, src.Name)
+
+	// Index binding `i` — i64. Always allocated; the user may or may
+	// not actually reference it but we need it for the loop counter.
+	iName := s.RangeI
+	if iName == "" || iName == "_" {
+		iName = c.uniqueLocal("_range_i")
+	}
+	// Unique alloca name so multiple range loops with the same binding
+	// name (e.g., two `for i, v := range x` loops in one function)
+	// don't collide at the LLVM level.
+	iPtr := "%" + c.uniqueLocal(iName) + ".addr"
+	fmt.Fprintf(&c.body, "  %s = alloca i64\n", iPtr)
+	fmt.Fprintf(&c.body, "  store i64 0, ptr %s\n", iPtr)
+	c.symbols[iName] = symbol{Ptr: iPtr, Type: "i64", AstType: &ast.NamedType{Name: "int"}}
+
+	// Value binding `v` (optional) — typed to the slice element.
+	if s.RangeV != "" && s.RangeV != "_" {
+		vPtr := "%" + c.uniqueLocal(s.RangeV) + ".addr"
+		fmt.Fprintf(&c.body, "  %s = alloca %s\n", vPtr, elemLL)
+		c.symbols[s.RangeV] = symbol{Ptr: vPtr, Type: elemLL}
+	}
+
+	condLbl := c.newLabel("range.cond")
+	bodyLbl := c.newLabel("range.body")
+	postLbl := c.newLabel("range.post")
+	endLbl := c.newLabel("range.end")
+	c.loops = append(c.loops, loopFrame{breakLbl: endLbl, continueLbl: postLbl, scopeDepth: c.scopeDepth})
+	defer func() { c.loops = c.loops[:len(c.loops)-1] }()
+
+	fmt.Fprintf(&c.body, "  br label %%%s\n", condLbl)
+	c.terminated = true
+	c.startBlock(condLbl)
+	iCur := c.newTemp()
+	cmp := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = load i64, ptr %s\n", iCur, iPtr)
+	fmt.Fprintf(&c.body, "  %s = icmp slt i64 %s, %s\n", cmp, iCur, lenVal)
+	fmt.Fprintf(&c.body, "  br i1 %s, label %%%s, label %%%s\n", cmp, bodyLbl, endLbl)
+	c.terminated = true
+
+	c.startBlock(bodyLbl)
+	c.pushScope()
+	// Load v = data[i] when the user bound it.
+	if s.RangeV != "" && s.RangeV != "_" {
+		gep := c.newTemp()
+		ld := c.newTemp()
+		fmt.Fprintf(&c.body, "  %s = getelementptr %s, ptr %s, i64 %s\n", gep, elemLL, dataPtr, iCur)
+		fmt.Fprintf(&c.body, "  %s = load %s, ptr %s\n", ld, elemLL, gep)
+		fmt.Fprintf(&c.body, "  store %s %s, ptr %s\n", elemLL, ld, c.symbols[s.RangeV].Ptr)
+	}
+	for _, stmt := range s.Body.Stmts {
+		if err := c.emitStmt(stmt); err != nil {
+			return err
+		}
+	}
+	if !c.terminated {
+		c.popScope()
+		fmt.Fprintf(&c.body, "  br label %%%s\n", postLbl)
+		c.terminated = true
+	} else {
+		c.scopeDepth--
+		c.discardDropsAbove(c.scopeDepth)
+	}
+
+	c.startBlock(postLbl)
+	iNew := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = load i64, ptr %s\n", iNew, iPtr)
+	iInc := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = add i64 %s, 1\n", iInc, iNew)
+	fmt.Fprintf(&c.body, "  store i64 %s, ptr %s\n", iInc, iPtr)
+	fmt.Fprintf(&c.body, "  br label %%%s\n", condLbl)
+	c.terminated = true
+
+	c.startBlock(endLbl)
+	return nil
+}
+
+func (c *funcCtx) emitRangeOverString(s *ast.ForStmt, src Value) error {
+	// %string = {ptr data, i64 len}. Same shape as slice-over-i8.
+	dataPtr := c.newTemp()
+	lenVal := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = extractvalue %%string %s, 0\n", dataPtr, src.Name)
+	fmt.Fprintf(&c.body, "  %s = extractvalue %%string %s, 1\n", lenVal, src.Name)
+
+	iName := s.RangeI
+	if iName == "" || iName == "_" {
+		iName = c.uniqueLocal("_range_i")
+	}
+	// Unique alloca name so multiple range loops with the same binding
+	// name (e.g., two `for i, v := range x` loops in one function)
+	// don't collide at the LLVM level.
+	iPtr := "%" + c.uniqueLocal(iName) + ".addr"
+	fmt.Fprintf(&c.body, "  %s = alloca i64\n", iPtr)
+	fmt.Fprintf(&c.body, "  store i64 0, ptr %s\n", iPtr)
+	c.symbols[iName] = symbol{Ptr: iPtr, Type: "i64", AstType: &ast.NamedType{Name: "int"}}
+
+	if s.RangeV != "" && s.RangeV != "_" {
+		vPtr := "%" + c.uniqueLocal(s.RangeV) + ".addr"
+		fmt.Fprintf(&c.body, "  %s = alloca i8\n", vPtr)
+		c.symbols[s.RangeV] = symbol{Ptr: vPtr, Type: "i8", AstType: &ast.NamedType{Name: "byte"}}
+	}
+
+	condLbl := c.newLabel("range.cond")
+	bodyLbl := c.newLabel("range.body")
+	postLbl := c.newLabel("range.post")
+	endLbl := c.newLabel("range.end")
+	c.loops = append(c.loops, loopFrame{breakLbl: endLbl, continueLbl: postLbl, scopeDepth: c.scopeDepth})
+	defer func() { c.loops = c.loops[:len(c.loops)-1] }()
+
+	fmt.Fprintf(&c.body, "  br label %%%s\n", condLbl)
+	c.terminated = true
+	c.startBlock(condLbl)
+	iCur := c.newTemp()
+	cmp := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = load i64, ptr %s\n", iCur, iPtr)
+	fmt.Fprintf(&c.body, "  %s = icmp slt i64 %s, %s\n", cmp, iCur, lenVal)
+	fmt.Fprintf(&c.body, "  br i1 %s, label %%%s, label %%%s\n", cmp, bodyLbl, endLbl)
+	c.terminated = true
+
+	c.startBlock(bodyLbl)
+	c.pushScope()
+	if s.RangeV != "" && s.RangeV != "_" {
+		gep := c.newTemp()
+		ld := c.newTemp()
+		fmt.Fprintf(&c.body, "  %s = getelementptr i8, ptr %s, i64 %s\n", gep, dataPtr, iCur)
+		fmt.Fprintf(&c.body, "  %s = load i8, ptr %s\n", ld, gep)
+		fmt.Fprintf(&c.body, "  store i8 %s, ptr %s\n", ld, c.symbols[s.RangeV].Ptr)
+	}
+	for _, stmt := range s.Body.Stmts {
+		if err := c.emitStmt(stmt); err != nil {
+			return err
+		}
+	}
+	if !c.terminated {
+		c.popScope()
+		fmt.Fprintf(&c.body, "  br label %%%s\n", postLbl)
+		c.terminated = true
+	} else {
+		c.scopeDepth--
+		c.discardDropsAbove(c.scopeDepth)
+	}
+
+	c.startBlock(postLbl)
+	iNew := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = load i64, ptr %s\n", iNew, iPtr)
+	iInc := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = add i64 %s, 1\n", iInc, iNew)
+	fmt.Fprintf(&c.body, "  store i64 %s, ptr %s\n", iInc, iPtr)
+	fmt.Fprintf(&c.body, "  br label %%%s\n", condLbl)
+	c.terminated = true
+
+	c.startBlock(endLbl)
+	return nil
+}
+
+// uniqueLocal returns a fresh local symbol name with the given prefix.
+func (c *funcCtx) uniqueLocal(prefix string) string {
+	n := c.nextTmp
+	c.nextTmp++
+	return fmt.Sprintf("%s.%d", prefix, n)
+}
+
+// allocaName picks an LLVM-level alloca name for a source identifier,
+// uniquifying if the same name was already used in this function (e.g.
+// two sequential `for i := 0; i < N; i++` loops in the same body would
+// both want `%i.addr`).
+func (c *funcCtx) allocaName(srcName string) string {
+	base := srcName + ".addr"
+	if c.usedAddrs == nil {
+		c.usedAddrs = make(map[string]int)
+	}
+	n := c.usedAddrs[base]
+	c.usedAddrs[base] = n + 1
+	if n == 0 {
+		return base
+	}
+	return fmt.Sprintf("%s.%d", base, n)
+}
+
 func (c *funcCtx) emitFor(s *ast.ForStmt) error {
+	if s.RangeOver != nil {
+		return c.emitRangeFor(s)
+	}
 	if s.Init != nil {
 		if err := c.emitStmt(s.Init); err != nil {
 			return err
@@ -1627,6 +2294,12 @@ func (c *funcCtx) emitExpr(e ast.Expr) (Value, error) {
 	switch ex := e.(type) {
 	case *ast.IntLit:
 		return Value{Name: fmt.Sprintf("%d", ex.Value), Type: "i64"}, nil
+	case *ast.FloatLit:
+		// LLVM accepts decimal float literals directly. The type is
+		// inferred at the assignment / call site via convertInt — for now
+		// default to `double` (LLVM's 64-bit float, matching volt's
+		// `float` / `float64`).
+		return Value{Name: ex.Text, Type: "double"}, nil
 	case *ast.BoolLit:
 		if ex.Value {
 			return Value{Name: "1", Type: "i1"}, nil
@@ -1652,6 +2325,8 @@ func (c *funcCtx) emitExpr(e ast.Expr) (Value, error) {
 		return c.emitSliceLit(ex)
 	case *ast.IndexExpr:
 		return c.emitIndex(ex)
+	case *ast.FuncLit:
+		return c.emitFuncLit(ex)
 	}
 	return Value{}, fmt.Errorf("%s: unsupported expression %T", e.Pos(), e)
 }
@@ -1674,9 +2349,11 @@ func (c *funcCtx) emitSliceLit(ex *ast.SliceLit) (Value, error) {
 	}
 	t1 := c.newTemp()
 	t2 := c.newTemp()
+	t3 := c.newTemp()
 	fmt.Fprintf(&c.body, "  %s = insertvalue %%slice zeroinitializer, ptr %s, 0\n", t1, arr)
 	fmt.Fprintf(&c.body, "  %s = insertvalue %%slice %s, i64 %d, 1\n", t2, t1, n)
-	return Value{Name: t2, Type: "%slice", SliceElem: elemT}, nil
+	fmt.Fprintf(&c.body, "  %s = insertvalue %%slice %s, i64 %d, 2\n", t3, t2, n)
+	return Value{Name: t3, Type: "%slice", SliceElem: elemT}, nil
 }
 
 func (c *funcCtx) emitIndex(ex *ast.IndexExpr) (Value, error) {
@@ -1903,14 +2580,24 @@ func (c *funcCtx) emitNewSyncInline(ex *ast.NewExpr, elem ast.Type, ctor string)
 // function-name suffix and the LLVM scalar used to carry the value
 // across the ABI. Returns ok=false for unsupported widths.
 //
-// Supported: int / int64 (i64, no suffix), int32 (i32), ptr.
-// int8/int16/bool deferred (alignment + atomicity-on-i1 nuance).
+// Supported: int / int64 (i64, no suffix), int32 (i32), int16 (i16),
+// int8 / byte (i8), bool (carried as i8 — atomicity on i1 is fiddly
+// and most hardware treats single-bit atomics as a byte op anyway),
+// and ptr (no Add).
 func atomicSuffix(elemT string) (suffix, llT string, ok bool) {
 	switch elemT {
 	case "i64":
 		return "", "i64", true
 	case "i32":
 		return "_i32", "i32", true
+	case "i16":
+		return "_i16", "i16", true
+	case "i8":
+		return "_i8", "i8", true
+	case "i1":
+		// bool atomics carry over the ABI as i8 (truncate/extend at the
+		// boundaries) — the runtime function name is _bool.
+		return "_bool", "i8", true
 	case "ptr":
 		return "_ptr", "ptr", true
 	}
@@ -2104,12 +2791,15 @@ func (c *funcCtx) emitNewSlice(ex *ast.NewExpr, st *ast.SliceType) (Value, error
 		fmt.Fprintf(&c.body, "  store %s %s, ptr %s\n", elemLL, v.Name, gepTmp)
 	}
 
-	// Build the {ptr, len} slice value.
+	// Build the {ptr, len, cap} slice value. cap == len at construction;
+	// append() grows it when more elements are added later.
 	s1 := c.newTemp()
 	s2 := c.newTemp()
+	s3 := c.newTemp()
 	fmt.Fprintf(&c.body, "  %s = insertvalue %%slice zeroinitializer, ptr %s, 0\n", s1, dataTmp)
 	fmt.Fprintf(&c.body, "  %s = insertvalue %%slice %s, i64 %s, 1\n", s2, s1, lenVal.Name)
-	return Value{Name: s2, Type: "%slice", SliceElem: elemLL}, nil
+	fmt.Fprintf(&c.body, "  %s = insertvalue %%slice %s, i64 %s, 2\n", s3, s2, lenVal.Name)
+	return Value{Name: s3, Type: "%slice", SliceElem: elemLL}, nil
 }
 
 // emitNewStruct lowers `new T{field: value, ...}` or `new T{}` for a
@@ -2216,6 +2906,16 @@ func (c *funcCtx) convertInt(v Value, targetType string) Value {
 	if v.Type == targetType {
 		return v
 	}
+	// Float-to-float — LLVM requires fpext/fptrunc when widths differ.
+	if isFloatLLVM(v.Type) && isFloatLLVM(targetType) {
+		t := c.newTemp()
+		op := "fpext"
+		if floatBitSize(v.Type) > floatBitSize(targetType) {
+			op = "fptrunc"
+		}
+		fmt.Fprintf(&c.body, "  %s = %s %s %s to %s\n", t, op, v.Type, v.Name, targetType)
+		return Value{Name: t, Type: targetType}
+	}
 	src := intBitSize(v.Type)
 	dst := intBitSize(targetType)
 	if src == 0 || dst == 0 {
@@ -2237,6 +2937,20 @@ func (c *funcCtx) convertInt(v Value, targetType string) Value {
 	return Value{Name: t, Type: targetType}
 }
 
+func isFloatLLVM(t string) bool {
+	return t == "float" || t == "double"
+}
+
+func floatBitSize(t string) int {
+	switch t {
+	case "float":
+		return 32
+	case "double":
+		return 64
+	}
+	return 0
+}
+
 func (c *funcCtx) emitStringLit(ex *ast.StringLit) (Value, error) {
 	gname, glen := c.e.internString(ex.Text)
 	t1 := c.newTemp()
@@ -2246,10 +2960,457 @@ func (c *funcCtx) emitStringLit(ex *ast.StringLit) (Value, error) {
 	return Value{Name: t2, Type: "%string"}, nil
 }
 
+// emitFuncLit lowers a `fun(params) result { body }` expression to a
+// %fn_value. Walks the body for free identifiers that resolve to
+// enclosing-scope locals — those become captures, copied into a
+// heap-allocated env struct. Bodies without captures get a null env.
+//
+// Captures move ownership: a non-Copy captured value is consumed at
+// the literal site (subsequent use in the enclosing scope is a
+// compile error). Capture of borrows (&T / *T) is rejected — the
+// closure could outlive the borrowed storage.
+func (c *funcCtx) emitFuncLit(ex *ast.FuncLit) (Value, error) {
+	captures := c.collectCaptures(ex)
+	ex.Captures = captures
+
+	id := c.e.closureLitID
+	c.e.closureLitID++
+	bodySym := fmt.Sprintf("%s_$lit_%d", c.e.pkg, id)
+	envTy := ""
+	if len(captures) > 0 {
+		envTy = fmt.Sprintf("%%env_$%d", id)
+	}
+
+	// Reject borrow captures up front (clearer error than a downstream
+	// LLVM mismatch).
+	for _, name := range captures {
+		sym := c.symbols[name]
+		if isBorrowOrPointerLLVM(sym) {
+			return Value{}, fmt.Errorf("%s: closure cannot capture borrow / pointer variable %q — borrows are scope-bound and the closure may outlive them",
+				ex.Pos(), name)
+		}
+	}
+
+	// Emit the synthesized body function and (if non-empty) the env
+	// struct type.
+	if err := c.emitClosureBody(ex, bodySym, envTy, captures); err != nil {
+		return Value{}, err
+	}
+
+	// At the literal site: build the env (heap-allocated if any
+	// captures), then assemble the %fn_value.
+	envPtr := "null"
+	if envTy != "" {
+		ep, err := c.emitEnvInit(ex.Pos(), envTy, captures)
+		if err != nil {
+			return Value{}, err
+		}
+		envPtr = ep
+	}
+
+	// Mark non-Copy captures as moved at the literal site.
+	for _, name := range captures {
+		sym := c.symbols[name]
+		if !isLLVMTypeCopy(sym.Type) {
+			// (Move tracking lives in the checker; codegen just records
+			// the consumption by leaving the variable's storage intact.
+			// The checker has already flagged subsequent uses for us.)
+			_ = sym
+		}
+	}
+
+	t1 := c.newTemp()
+	t2 := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = insertvalue %%fn_value zeroinitializer, ptr @%s, 0\n", t1, bodySym)
+	fmt.Fprintf(&c.body, "  %s = insertvalue %%fn_value %s, ptr %s, 1\n", t2, t1, envPtr)
+	return Value{Name: t2, Type: "%fn_value"}, nil
+}
+
+// collectCaptures walks the literal's body and returns the names of
+// free identifiers that resolve to locals of the enclosing function.
+// Names declared inside the literal (its own params + locals) shadow
+// outer bindings and are NOT captured.
+//
+// Result is in encounter order (stable across compilations) so the
+// env struct layout matches the body's load order.
+func (c *funcCtx) collectCaptures(ex *ast.FuncLit) []string {
+	visible := make(map[string]bool, len(ex.Params))
+	for _, p := range ex.Params {
+		visible[p.Name] = true
+	}
+	seen := make(map[string]bool)
+	var order []string
+	add := func(name string) {
+		if seen[name] {
+			return
+		}
+		// Top-level functions/consts aren't captures — they're symbols
+		// at link time. Top-level funcs aren't in c.symbols; consts
+		// aren't either. Only outer-scope locals appear in c.symbols.
+		if _, ok := c.symbols[name]; !ok {
+			return
+		}
+		seen[name] = true
+		order = append(order, name)
+	}
+	var walkE func(ast.Expr)
+	var walkS func(ast.Stmt)
+	walkE = func(e ast.Expr) {
+		if e == nil {
+			return
+		}
+		switch n := e.(type) {
+		case *ast.IdentExpr:
+			if !visible[n.Name] {
+				add(n.Name)
+			}
+		case *ast.CallExpr:
+			walkE(n.Fun)
+			for _, a := range n.Args {
+				walkE(a)
+			}
+		case *ast.BinaryExpr:
+			walkE(n.X)
+			walkE(n.Y)
+		case *ast.UnaryExpr:
+			walkE(n.X)
+		case *ast.SelectorExpr:
+			walkE(n.X)
+		case *ast.IndexExpr:
+			walkE(n.X)
+			walkE(n.Index)
+		case *ast.NewExpr:
+			for _, a := range n.SizeArgs {
+				walkE(a)
+			}
+			for _, kv := range n.Pairs {
+				walkE(kv.Value)
+			}
+			for _, el := range n.SliceElems {
+				walkE(el)
+			}
+			for _, me := range n.MapEntries {
+				walkE(me.Key)
+				walkE(me.Value)
+			}
+		case *ast.SliceLit:
+			for _, el := range n.Elems {
+				walkE(el)
+			}
+		case *ast.FuncLit:
+			// Nested literal: anything it captures comes from OUR scope
+			// (or further out). Recurse — but bindings declared inside
+			// it shadow OUR visible set the same way.
+			//
+			// For correctness, we want: a name referenced inside the
+			// nested literal that resolves to OUR outer scope should
+			// count as captured by US too (because we need to capture
+			// it to pass it down to the nested closure).
+			inner := c.collectCaptures(n)
+			for _, name := range inner {
+				if !visible[name] {
+					add(name)
+				}
+			}
+		}
+	}
+	walkS = func(s ast.Stmt) {
+		if s == nil {
+			return
+		}
+		switch n := s.(type) {
+		case *ast.VarStmt:
+			walkE(n.Value)
+			visible[n.Name] = true
+		case *ast.MultiVarStmt:
+			walkE(n.RHS)
+			for _, nm := range n.Names {
+				visible[nm] = true
+			}
+		case *ast.AssignStmt:
+			walkE(n.LHS)
+			walkE(n.RHS)
+		case *ast.MultiAssignStmt:
+			walkE(n.RHS)
+			for _, lhs := range n.LHS {
+				walkE(lhs)
+			}
+		case *ast.ExprStmt:
+			walkE(n.Expr)
+		case *ast.RetStmt:
+			for _, v := range n.Values {
+				walkE(v)
+			}
+		case *ast.IfStmt:
+			if n.Init != nil {
+				walkS(n.Init)
+			}
+			walkE(n.Cond)
+			if n.Then != nil {
+				for _, ss := range n.Then.Stmts {
+					walkS(ss)
+				}
+			}
+			if n.Else != nil {
+				walkS(n.Else)
+			}
+		case *ast.ForStmt:
+			if n.Init != nil {
+				walkS(n.Init)
+			}
+			walkE(n.Cond)
+			if n.Post != nil {
+				walkS(n.Post)
+			}
+			if n.Body != nil {
+				for _, ss := range n.Body.Stmts {
+					walkS(ss)
+				}
+			}
+		case *ast.Block:
+			for _, ss := range n.Stmts {
+				walkS(ss)
+			}
+		case *ast.SendStmt:
+			walkE(n.Channel)
+			walkE(n.Value)
+		case *ast.RunStmt:
+			if n.Call != nil {
+				walkE(n.Call)
+			}
+		case *ast.SelectStmt:
+			for _, cs := range n.Cases {
+				if cs == nil {
+					continue
+				}
+				walkE(cs.Channel)
+				walkE(cs.SendValue)
+				for _, nm := range cs.RecvNames {
+					visible[nm] = true
+				}
+				for _, ss := range cs.Body {
+					walkS(ss)
+				}
+			}
+		case *ast.DeferStmt:
+			if n.Call != nil {
+				walkE(n.Call)
+			}
+		}
+	}
+	if ex.Body != nil {
+		for _, s := range ex.Body.Stmts {
+			walkS(s)
+		}
+	}
+	return order
+}
+
+// emitClosureBody emits the LLVM definition for a synthesized closure
+// body. Signature: `(ptr env, params...) -> result`. The body loads
+// captures from env via GEP at entry, then runs the literal's body.
+// If captures is non-empty, also emits the env struct type definition
+// into the header.
+func (c *funcCtx) emitClosureBody(ex *ast.FuncLit, bodySym, envTy string, captures []string) error {
+	if envTy != "" {
+		var fields []string
+		for _, name := range captures {
+			fields = append(fields, c.symbols[name].Type)
+		}
+		fmt.Fprintf(&c.e.header, "%s = type { %s }\n", envTy, strings.Join(fields, ", "))
+	}
+
+	// Build a child funcCtx that emits into trampolineDefs.
+	child := &funcCtx{
+		e:         c.e,
+		symbols:   make(map[string]symbol),
+		retType:   "void",
+		isMain:    false,
+		usedAddrs: make(map[string]int),
+	}
+	if len(ex.Results) > 0 {
+		child.retType = c.e.llvmType(ex.Results[0])
+	}
+
+	// Function header.
+	fmt.Fprintf(&child.body, "define internal %s @%s(ptr %%_env", child.retType, bodySym)
+	for _, p := range ex.Params {
+		pt := c.e.llvmType(p.Type)
+		fmt.Fprintf(&child.body, ", %s %%%s", pt, p.Name)
+	}
+	child.body.WriteString(") {\nentry:\n")
+
+	// Spill params into alloca slots so the existing emit paths work.
+	for _, p := range ex.Params {
+		pt := c.e.llvmType(p.Type)
+		ptr := "%" + p.Name + ".addr"
+		fmt.Fprintf(&child.body, "  %s = alloca %s\n", ptr, pt)
+		fmt.Fprintf(&child.body, "  store %s %%%s, ptr %s\n", pt, p.Name, ptr)
+		child.symbols[p.Name] = symbol{
+			Ptr:       ptr,
+			Type:      pt,
+			Elem:      c.e.elemType(p.Type),
+			SliceElem: c.e.sliceElemLLVM(p.Type),
+			IsMap:     isMapType(p.Type),
+			AstType:   p.Type,
+		}
+	}
+	// Load captures from env into alloca slots that look like locals.
+	for i, name := range captures {
+		src := c.symbols[name]
+		ptr := "%" + name + ".addr"
+		fmt.Fprintf(&child.body, "  %s = alloca %s\n", ptr, src.Type)
+		gp := child.newTemp()
+		ld := child.newTemp()
+		fmt.Fprintf(&child.body, "  %s = getelementptr %s, ptr %%_env, i32 0, i32 %d\n", gp, envTy, i)
+		fmt.Fprintf(&child.body, "  %s = load %s, ptr %s\n", ld, src.Type, gp)
+		fmt.Fprintf(&child.body, "  store %s %s, ptr %s\n", src.Type, ld, ptr)
+		child.symbols[name] = symbol{
+			Ptr:       ptr,
+			Type:      src.Type,
+			Elem:      src.Elem,
+			SliceElem: src.SliceElem,
+			IsMap:     src.IsMap,
+			AstType:   src.AstType,
+		}
+	}
+
+	if ex.Body != nil {
+		for _, s := range ex.Body.Stmts {
+			if err := child.emitStmt(s); err != nil {
+				return err
+			}
+		}
+	}
+	if !child.terminated {
+		switch child.retType {
+		case "void":
+			child.body.WriteString("  ret void\n")
+		case "ptr":
+			child.body.WriteString("  ret ptr null\n")
+		default:
+			fmt.Fprintf(&child.body, "  ret %s 0\n", child.retType)
+		}
+	}
+	child.body.WriteString("}\n\n")
+	c.e.trampolineDefs.WriteString(child.body.String())
+	return nil
+}
+
+// emitEnvInit allocates the env struct on the heap and stores each
+// captured value into the matching slot. Returns the env pointer
+// (already typed as ptr).
+func (c *funcCtx) emitEnvInit(_ lex.Pos, envTy string, captures []string) (string, error) {
+	szPtr := c.newTemp()
+	szInt := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = getelementptr %s, ptr null, i32 1\n", szPtr, envTy)
+	fmt.Fprintf(&c.body, "  %s = ptrtoint ptr %s to i64\n", szInt, szPtr)
+	c.e.ensureDeclare("declare ptr @volt_alloc(i64)")
+	env := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = call ptr @volt_alloc(i64 %s)\n", env, szInt)
+	for i, name := range captures {
+		src := c.symbols[name]
+		gp := c.newTemp()
+		ld := c.newTemp()
+		fmt.Fprintf(&c.body, "  %s = getelementptr %s, ptr %s, i32 0, i32 %d\n", gp, envTy, env, i)
+		fmt.Fprintf(&c.body, "  %s = load %s, ptr %s\n", ld, src.Type, src.Ptr)
+		fmt.Fprintf(&c.body, "  store %s %s, ptr %s\n", src.Type, ld, gp)
+	}
+	return env, nil
+}
+
+// isBorrowOrPointerLLVM reports whether the symbol's declared AST type
+// is &T or *T (used to reject capturing borrows).
+func isBorrowOrPointerLLVM(sym symbol) bool {
+	if sym.AstType == nil {
+		return false
+	}
+	_, b := sym.AstType.(*ast.BorrowType)
+	_, p := sym.AstType.(*ast.PointerType)
+	return b || p
+}
+
+// isLLVMTypeCopy reports whether the given LLVM type is Copy
+// (primitive integer/float/bool). Strings, slices, maps, ptrs, and
+// named struct types are non-Copy at the volt level.
+func isLLVMTypeCopy(t string) bool {
+	switch t {
+	case "i1", "i8", "i16", "i32", "i64", "float", "double":
+		return true
+	}
+	return false
+}
+
+// emitFuncRefAsValue builds a %fn_value SSA referring to a top-level
+// function. The function's bare-ABI signature `(args) -> ret` doesn't
+// match the closure ABI `(env, args) -> ret`, so we synthesize a
+// trampoline @<sym>_$fn that ignores env and tail-calls the real one.
+// One trampoline per uniquely-referenced function — cached in
+// c.e.fnTrampolines.
+func (c *funcCtx) emitFuncRefAsValue(name string, fd *ast.FuncDecl) (Value, error) {
+	mangled := SymbolName(c.e.pkg, name)
+	tramp, cached := c.e.fnTrampolines[mangled]
+	if !cached {
+		tramp = mangled + "_$fn"
+		c.e.fnTrampolines[mangled] = tramp
+		c.emitFuncTrampoline(tramp, mangled, fd)
+	}
+	// Build the %fn_value { ptr trampoline, ptr null } SSA.
+	t1 := c.newTemp()
+	t2 := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = insertvalue %%fn_value zeroinitializer, ptr @%s, 0\n", t1, tramp)
+	fmt.Fprintf(&c.body, "  %s = insertvalue %%fn_value %s, ptr null, 1\n", t2, t1)
+	return Value{Name: t2, Type: "%fn_value"}, nil
+}
+
+// emitFuncTrampoline writes the synthesized adapter IR. The signature
+// is `(ptr _env, <fd params>) -> <fd result>` and the body just forwards
+// to the bare function with env discarded.
+func (c *funcCtx) emitFuncTrampoline(tramp, target string, fd *ast.FuncDecl) {
+	var paramTypes []string
+	var paramNames []string
+	for _, p := range fd.Params {
+		pt := c.e.llvmType(p.Type)
+		paramTypes = append(paramTypes, pt)
+		paramNames = append(paramNames, "%a"+fmt.Sprint(len(paramNames)))
+	}
+	retT := "void"
+	if len(fd.Results) > 0 {
+		retT = c.e.llvmType(fd.Results[0])
+	}
+	// Function header.
+	fmt.Fprintf(&c.e.trampolineDefs, "define internal %s @%s(ptr %%_env", retT, tramp)
+	for i, pt := range paramTypes {
+		fmt.Fprintf(&c.e.trampolineDefs, ", %s %s", pt, paramNames[i])
+	}
+	c.e.trampolineDefs.WriteString(") {\nentry:\n")
+	// Forward call.
+	var callArgs []string
+	for i, pt := range paramTypes {
+		callArgs = append(callArgs, pt+" "+paramNames[i])
+	}
+	if retT == "void" {
+		fmt.Fprintf(&c.e.trampolineDefs, "  call void @%s(%s)\n", target, strings.Join(callArgs, ", "))
+		c.e.trampolineDefs.WriteString("  ret void\n")
+	} else {
+		fmt.Fprintf(&c.e.trampolineDefs, "  %%r = call %s @%s(%s)\n", retT, target, strings.Join(callArgs, ", "))
+		fmt.Fprintf(&c.e.trampolineDefs, "  ret %s %%r\n", retT)
+	}
+	c.e.trampolineDefs.WriteString("}\n\n")
+}
+
 func (c *funcCtx) emitIdent(ex *ast.IdentExpr) (Value, error) {
 	// Top-level const? Substitute its value expression.
 	if cv, ok := c.e.consts[ex.Name]; ok {
 		return c.emitExpr(cv)
+	}
+	// Top-level function name used as a value (not a call). Emit/cache
+	// a trampoline that adapts the bare-fn ABI to the closure ABI and
+	// build a %fn_value with null env.
+	if fd, ok := c.e.funcs[ex.Name]; ok {
+		if _, isVar := c.symbols[ex.Name]; !isVar {
+			return c.emitFuncRefAsValue(ex.Name, fd)
+		}
 	}
 	sym, ok := c.symbols[ex.Name]
 	if !ok {
@@ -2300,10 +3461,42 @@ func (c *funcCtx) emitBinary(ex *ast.BinaryExpr) (Value, error) {
 	if err != nil {
 		return Value{}, err
 	}
-	// Harmonize integer types: if x is i32 and y is i64 (or vice versa),
-	// widen the smaller one. (Both literals or both same type: pass-through.)
+	// Harmonize types: floats win over integer literals (a literal `3`
+	// promotes to `3.0` when the other operand is a float); when both
+	// integers, widen the smaller. Same-typed-floats pass through.
 	opT := x.Type
-	if intBitSize(x.Type) > 0 && intBitSize(y.Type) > 0 {
+	floatX := isFloatLLVM(x.Type)
+	floatY := isFloatLLVM(y.Type)
+	switch {
+	case floatX && floatY:
+		// Widen the narrower one. Use convertInt's float branch.
+		if floatBitSize(x.Type) >= floatBitSize(y.Type) {
+			y = c.convertInt(y, x.Type)
+			opT = x.Type
+		} else {
+			x = c.convertInt(x, y.Type)
+			opT = y.Type
+		}
+	case floatX && intBitSize(y.Type) > 0:
+		// Integer literal/value alongside a float — promote int → float.
+		if isLiteral(y.Name) {
+			y = Value{Name: y.Name + ".0", Type: x.Type}
+		} else {
+			t := c.newTemp()
+			fmt.Fprintf(&c.body, "  %s = sitofp %s %s to %s\n", t, y.Type, y.Name, x.Type)
+			y = Value{Name: t, Type: x.Type}
+		}
+		opT = x.Type
+	case floatY && intBitSize(x.Type) > 0:
+		if isLiteral(x.Name) {
+			x = Value{Name: x.Name + ".0", Type: y.Type}
+		} else {
+			t := c.newTemp()
+			fmt.Fprintf(&c.body, "  %s = sitofp %s %s to %s\n", t, x.Type, x.Name, y.Type)
+			x = Value{Name: t, Type: y.Type}
+		}
+		opT = y.Type
+	case intBitSize(x.Type) > 0 && intBitSize(y.Type) > 0:
 		if intBitSize(x.Type) >= intBitSize(y.Type) {
 			y = c.convertInt(y, x.Type)
 			opT = x.Type
@@ -2312,30 +3505,60 @@ func (c *funcCtx) emitBinary(ex *ast.BinaryExpr) (Value, error) {
 			opT = y.Type
 		}
 	}
+	isFloat := isFloatLLVM(opT)
 	t := c.newTemp()
 	switch ex.Op {
 	case "+":
-		fmt.Fprintf(&c.body, "  %s = add %s %s, %s\n", t, opT, x.Name, y.Name)
+		op := "add"
+		if isFloat {
+			op = "fadd"
+		}
+		fmt.Fprintf(&c.body, "  %s = %s %s %s, %s\n", t, op, opT, x.Name, y.Name)
 		return Value{Name: t, Type: opT}, nil
 	case "-":
-		fmt.Fprintf(&c.body, "  %s = sub %s %s, %s\n", t, opT, x.Name, y.Name)
+		op := "sub"
+		if isFloat {
+			op = "fsub"
+		}
+		fmt.Fprintf(&c.body, "  %s = %s %s %s, %s\n", t, op, opT, x.Name, y.Name)
 		return Value{Name: t, Type: opT}, nil
 	case "*":
-		fmt.Fprintf(&c.body, "  %s = mul %s %s, %s\n", t, opT, x.Name, y.Name)
+		op := "mul"
+		if isFloat {
+			op = "fmul"
+		}
+		fmt.Fprintf(&c.body, "  %s = %s %s %s, %s\n", t, op, opT, x.Name, y.Name)
 		return Value{Name: t, Type: opT}, nil
 	case "/":
-		fmt.Fprintf(&c.body, "  %s = sdiv %s %s, %s\n", t, opT, x.Name, y.Name)
+		op := "sdiv"
+		if isFloat {
+			op = "fdiv"
+		}
+		fmt.Fprintf(&c.body, "  %s = %s %s %s, %s\n", t, op, opT, x.Name, y.Name)
 		return Value{Name: t, Type: opT}, nil
 	case "%":
-		fmt.Fprintf(&c.body, "  %s = srem %s %s, %s\n", t, opT, x.Name, y.Name)
+		op := "srem"
+		if isFloat {
+			op = "frem"
+		}
+		fmt.Fprintf(&c.body, "  %s = %s %s %s, %s\n", t, op, opT, x.Name, y.Name)
 		return Value{Name: t, Type: opT}, nil
 	case "==", "!=", "<", "<=", ">", ">=":
-		pred := map[string]string{
-			"==": "eq", "!=": "ne",
-			"<": "slt", "<=": "sle",
-			">": "sgt", ">=": "sge",
-		}[ex.Op]
-		fmt.Fprintf(&c.body, "  %s = icmp %s %s %s, %s\n", t, pred, opT, x.Name, y.Name)
+		if isFloat {
+			pred := map[string]string{
+				"==": "oeq", "!=": "one",
+				"<": "olt", "<=": "ole",
+				">": "ogt", ">=": "oge",
+			}[ex.Op]
+			fmt.Fprintf(&c.body, "  %s = fcmp %s %s %s, %s\n", t, pred, opT, x.Name, y.Name)
+		} else {
+			pred := map[string]string{
+				"==": "eq", "!=": "ne",
+				"<": "slt", "<=": "sle",
+				">": "sgt", ">=": "sge",
+			}[ex.Op]
+			fmt.Fprintf(&c.body, "  %s = icmp %s %s %s, %s\n", t, pred, opT, x.Name, y.Name)
+		}
 		return Value{Name: t, Type: "i1"}, nil
 	case "&&":
 		fmt.Fprintf(&c.body, "  %s = and i1 %s, %s\n", t, x.Name, y.Name)
@@ -2356,6 +3579,10 @@ func (c *funcCtx) emitCall(call *ast.CallExpr) (Value, error) {
 		switch fn.Name {
 		case "len":
 			return c.emitBuiltinLen(call)
+		case "cap":
+			return c.emitBuiltinCap(call)
+		case "append":
+			return c.emitBuiltinAppend(call)
 		case "close":
 			return c.emitBuiltinClose(call)
 		case "read":
@@ -2373,9 +3600,30 @@ func (c *funcCtx) emitCall(call *ast.CallExpr) (Value, error) {
 // emitBuiltinRead lowers `read(ch)` to volt_chan_recv(ch).
 // The two-value form `v, ok := read(ch)` is handled via tryRecv2 in
 // emitMultiVar — this single-value path returns only the received value.
+// chanDirOf returns the declared direction of the channel argument
+// `arg`, looked up via the symbol table. Bare expressions (not a
+// variable) default to `ChanBoth` — there's no type info to consult.
+func (c *funcCtx) chanDirOf(arg ast.Expr) ast.ChanDir {
+	id, ok := arg.(*ast.IdentExpr)
+	if !ok {
+		return ast.ChanBoth
+	}
+	sym, ok := c.symbols[id.Name]
+	if !ok {
+		return ast.ChanBoth
+	}
+	if ct, ok := sym.AstType.(*ast.ChanType); ok {
+		return ct.Dir
+	}
+	return ast.ChanBoth
+}
+
 func (c *funcCtx) emitBuiltinRead(call *ast.CallExpr) (Value, error) {
 	if len(call.Args) != 1 {
 		return Value{}, fmt.Errorf("%s: read takes exactly 1 argument", call.Pos())
+	}
+	if c.chanDirOf(call.Args[0]) == ast.ChanWrite {
+		return Value{}, fmt.Errorf("%s: cannot read from a write-only channel (declared `chan write T`)", call.Pos())
 	}
 	ch, err := c.emitExpr(call.Args[0])
 	if err != nil {
@@ -2396,6 +3644,9 @@ func (c *funcCtx) emitBuiltinRead(call *ast.CallExpr) (Value, error) {
 func (c *funcCtx) emitBuiltinWrite(call *ast.CallExpr) (Value, error) {
 	if len(call.Args) != 2 {
 		return Value{}, fmt.Errorf("%s: write takes exactly 2 arguments: write(ch, value)", call.Pos())
+	}
+	if c.chanDirOf(call.Args[0]) == ast.ChanRead {
+		return Value{}, fmt.Errorf("%s: cannot write to a read-only channel (declared `chan read T`)", call.Pos())
 	}
 	ch, err := c.emitExpr(call.Args[0])
 	if err != nil {
@@ -2420,9 +3671,9 @@ func (c *funcCtx) emitBuiltinWrite(call *ast.CallExpr) (Value, error) {
 // Method calls intercept here from emitMethodCall and lower to direct
 // runtime function calls — no user-defined methods table involved.
 
-// emitAtomicMethod handles a.Load(), a.Store(v), a.Add(d),
-// a.CompareAndSwap(old, new). Dispatches to the per-width runtime
-// entry point based on the atomic's element type. Add is rejected on
+// emitAtomicMethod handles a.Read(), a.Write(v), a.Add(d),
+// a.CompSwap(old, new). Dispatches to the per-width runtime entry
+// point based on the atomic's element type. Add is rejected on
 // ptr-typed atomics (no natural pointer addition).
 func (c *funcCtx) emitAtomicMethod(call *ast.CallExpr, recvSym symbol, method string) (Value, error) {
 	at, ok := recvSym.AstType.(*ast.AtomicType)
@@ -2446,9 +3697,9 @@ func (c *funcCtx) emitAtomicMethod(call *ast.CallExpr, recvSym symbol, method st
 	}
 
 	switch method {
-	case "Load":
+	case "Read":
 		if len(call.Args) != 0 {
-			return Value{}, fmt.Errorf("%s: atomic.Load takes no arguments", call.Pos())
+			return Value{}, fmt.Errorf("%s: atomic.Read takes no arguments", call.Pos())
 		}
 		fn := "volt_atomic_load" + suffix
 		c.e.ensureDeclare(fmt.Sprintf("declare %s @%s(ptr)", llT, fn))
@@ -2456,9 +3707,9 @@ func (c *funcCtx) emitAtomicMethod(call *ast.CallExpr, recvSym symbol, method st
 		fmt.Fprintf(&c.body, "  %s = call %s @%s(ptr %s)\n", t, llT, fn, handle)
 		return Value{Name: t, Type: llT}, nil
 
-	case "Store":
+	case "Write":
 		if len(call.Args) != 1 {
-			return Value{}, fmt.Errorf("%s: atomic.Store takes exactly 1 argument", call.Pos())
+			return Value{}, fmt.Errorf("%s: atomic.Write takes exactly 1 argument", call.Pos())
 		}
 		v, err := c.emitExpr(call.Args[0])
 		if err != nil {
@@ -2474,6 +3725,9 @@ func (c *funcCtx) emitAtomicMethod(call *ast.CallExpr, recvSym symbol, method st
 		if llT == "ptr" {
 			return Value{}, fmt.Errorf("%s: atomic.Add is not defined for ptr-typed atomics", call.Pos())
 		}
+		if suffix == "_bool" {
+			return Value{}, fmt.Errorf("%s: atomic.Add is not defined for bool atomics — use Write/CompSwap", call.Pos())
+		}
 		if len(call.Args) != 1 {
 			return Value{}, fmt.Errorf("%s: atomic.Add takes exactly 1 argument", call.Pos())
 		}
@@ -2488,9 +3742,9 @@ func (c *funcCtx) emitAtomicMethod(call *ast.CallExpr, recvSym symbol, method st
 		fmt.Fprintf(&c.body, "  %s = call %s @%s(ptr %s, %s %s)\n", t, llT, fn, handle, llT, v.Name)
 		return Value{Name: t, Type: llT}, nil
 
-	case "CompareAndSwap":
+	case "CompSwap":
 		if len(call.Args) != 2 {
-			return Value{}, fmt.Errorf("%s: atomic.CompareAndSwap takes exactly 2 arguments", call.Pos())
+			return Value{}, fmt.Errorf("%s: atomic.CompSwap takes exactly 2 arguments (old, new)", call.Pos())
 		}
 		oldV, err := c.emitExpr(call.Args[0])
 		if err != nil {
@@ -2504,31 +3758,35 @@ func (c *funcCtx) emitAtomicMethod(call *ast.CallExpr, recvSym symbol, method st
 		newV = convArg(newV)
 		fn := "volt_atomic_cas" + suffix
 		c.e.ensureDeclare(fmt.Sprintf("declare i64 @%s(ptr, %s, %s)", fn, llT, llT))
-		t := c.newTemp()
+		raw := c.newTemp()
 		fmt.Fprintf(&c.body, "  %s = call i64 @%s(ptr %s, %s %s, %s %s)\n",
-			t, fn, handle, llT, oldV.Name, llT, newV.Name)
-		return Value{Name: t, Type: "i64"}, nil
+			raw, fn, handle, llT, oldV.Name, llT, newV.Name)
+		// The runtime returns 1/0; surface as bool. The icmp folds into
+		// the cmpxchg's zero flag at -O — no extra instruction at runtime.
+		t := c.newTemp()
+		fmt.Fprintf(&c.body, "  %s = icmp ne i64 %s, 0\n", t, raw)
+		return Value{Name: t, Type: "i1"}, nil
 	}
-	return Value{}, fmt.Errorf("%s: atomic has no method %q (expected Load, Store, Add, CompareAndSwap)",
+	return Value{}, fmt.Errorf("%s: atomic has no method %q (expected Read, Write, Add, CompSwap)",
 		call.Pos(), method)
 }
 
-// emitMutexMethod handles m.Lock() / m.LockRead(). Both return guards
-// that are only legal as the RHS of a `var v T = m.Lock()` /
-// `m.LockRead()` declaration — that path is special-cased in emitVar
-// (emitGuardVar). Direct calls in any other context are rejected.
-// Unlock is gone: release happens automatically when the guard variable
-// goes out of scope.
+// emitMutexMethod handles m.Lock(). Lock returns a guard that is only
+// legal as the RHS of `var v T = m.Lock()` — that path is special-cased
+// in emitVar (emitGuardVar). Direct calls in any other context are
+// rejected. Unlock is gone: release happens automatically when the
+// guard variable goes out of scope. There is no LockRead on mutex —
+// reach for rwmutex T when you need a read-only / parallel-reader path.
 func (c *funcCtx) emitMutexMethod(call *ast.CallExpr, _ symbol, method string) (Value, error) {
 	switch method {
 	case "Lock":
 		return Value{}, fmt.Errorf("%s: mutex.Lock() can only appear as the RHS of `var x T = m.Lock()` — the guard must bind to a variable so it can be auto-released at scope end", call.Pos())
 	case "LockRead":
-		return Value{}, fmt.Errorf("%s: mutex.LockRead() can only appear as the RHS of `var x T = m.LockRead()` — the guard must bind to a variable so it can be auto-released at scope end", call.Pos())
+		return Value{}, fmt.Errorf("%s: mutex has no LockRead — it serializes all access. For parallel readers + read-only enforcement use `rwmutex T` and call .LockRead() on that", call.Pos())
 	case "Unlock":
 		return Value{}, fmt.Errorf("%s: mutex.Unlock no longer exists — the lock releases automatically when the guard variable from `var x T = m.Lock()` goes out of scope", call.Pos())
 	}
-	return Value{}, fmt.Errorf("%s: mutex has no method %q (only Lock and LockRead are exposed; release is automatic)",
+	return Value{}, fmt.Errorf("%s: mutex has no method %q (only Lock is exposed; release is automatic)",
 		call.Pos(), method)
 }
 
@@ -2548,6 +3806,35 @@ func (c *funcCtx) emitRwMutexMethod(call *ast.CallExpr, _ symbol, method string)
 	}
 	return Value{}, fmt.Errorf("%s: rwmutex has no method %q (only Lock and LockRead are exposed; release is automatic)",
 		call.Pos(), method)
+}
+
+// emitErrorMethod dispatches a method call whose receiver is `error`-
+// typed. The receiver var holds a ptr to an `%error_box` (set up by
+// emitErrorBox at construction time). Box layout: { ptr data, ptr fn }.
+// Load both, call the stored fn with the data pointer as receiver.
+//
+// v0.7: only `Error() string` is dispatched. Future user-defined
+// interfaces will reuse this shape with a real vtable.
+func (c *funcCtx) emitErrorMethod(call *ast.CallExpr, recvSym symbol, method string) (Value, error) {
+	if method != "Error" {
+		return Value{}, fmt.Errorf("%s: error has no method %q (only Error() is defined)", call.Pos(), method)
+	}
+	if len(call.Args) != 0 {
+		return Value{}, fmt.Errorf("%s: error.Error takes no arguments", call.Pos())
+	}
+	box := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = load ptr, ptr %s\n", box, recvSym.Ptr)
+	dataGep := c.newTemp()
+	dataPtr := c.newTemp()
+	fnGep := c.newTemp()
+	fnPtr := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = getelementptr %%error_box, ptr %s, i32 0, i32 0\n", dataGep, box)
+	fmt.Fprintf(&c.body, "  %s = load ptr, ptr %s\n", dataPtr, dataGep)
+	fmt.Fprintf(&c.body, "  %s = getelementptr %%error_box, ptr %s, i32 0, i32 1\n", fnGep, box)
+	fmt.Fprintf(&c.body, "  %s = load ptr, ptr %s\n", fnPtr, fnGep)
+	result := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = call %%string %s(ptr %s)\n", result, fnPtr, dataPtr)
+	return Value{Name: result, Type: "%string"}, nil
 }
 
 // emitWaitgroupMethod handles wg.Add(n), wg.Done(), wg.Wait().
@@ -2592,34 +3879,43 @@ func (c *funcCtx) emitWaitgroupMethod(call *ast.CallExpr, recvSym symbol, method
 		call.Pos(), method)
 }
 
-// emitOnceMethod handles o.Begin() and o.Done().
-//   Begin()  — returns 1 on the FIRST caller (caller must Done() after init);
-//              blocks every subsequent caller until Done() is called, then returns 0
-//   Done()   — marks initialization complete; wakes everyone blocked in Begin()
+// emitOnceMethod handles o.Do(fn) — the only method exposed on `once`.
+// `Do(fn fun())` is the Go-style closure form: a single call that runs
+// `fn` exactly once across all callers; every caller blocks until that
+// run completes. Internally: extract (fn_ptr, env) from the fn_value,
+// hand them to volt_once_do which gates on once state and indirect-
+// calls fn(env) on the first arrival.
 func (c *funcCtx) emitOnceMethod(call *ast.CallExpr, recvSym symbol, method string) (Value, error) {
+	if method == "Do" {
+		return c.emitOnceDo(call, recvSym)
+	}
+	return Value{}, fmt.Errorf("%s: once has no method %q (only Do is exposed)", call.Pos(), method)
+}
+
+// emitOnceDo handles `o.Do(fn)` where fn is a `fun()` value. Extracts
+// the fn pointer and env from the closure value and hands them to the
+// runtime, which gates first-arriver semantics and indirect-calls
+// fn(env) exactly once.
+func (c *funcCtx) emitOnceDo(call *ast.CallExpr, recvSym symbol) (Value, error) {
+	if len(call.Args) != 1 {
+		return Value{}, fmt.Errorf("%s: once.Do takes exactly 1 argument (a `fun()` value)", call.Pos())
+	}
+	v, err := c.emitExpr(call.Args[0])
+	if err != nil {
+		return Value{}, err
+	}
+	if v.Type != "%fn_value" {
+		return Value{}, fmt.Errorf("%s: once.Do expects a `fun()` value, got %s", call.Pos(), v.Type)
+	}
 	handle := c.newTemp()
 	fmt.Fprintf(&c.body, "  %s = load ptr, ptr %s\n", handle, recvSym.Ptr)
-
-	switch method {
-	case "Begin":
-		if len(call.Args) != 0 {
-			return Value{}, fmt.Errorf("%s: once.Begin takes no arguments", call.Pos())
-		}
-		c.e.ensureDeclare("declare i64 @volt_once_begin(ptr)")
-		t := c.newTemp()
-		fmt.Fprintf(&c.body, "  %s = call i64 @volt_once_begin(ptr %s)\n", t, handle)
-		return Value{Name: t, Type: "i64"}, nil
-
-	case "Done":
-		if len(call.Args) != 0 {
-			return Value{}, fmt.Errorf("%s: once.Done takes no arguments", call.Pos())
-		}
-		c.e.ensureDeclare("declare void @volt_once_done(ptr)")
-		fmt.Fprintf(&c.body, "  call void @volt_once_done(ptr %s)\n", handle)
-		return Value{Name: "", Type: "void"}, nil
-	}
-	return Value{}, fmt.Errorf("%s: once has no method %q (expected Begin, Done)",
-		call.Pos(), method)
+	fnP := c.newTemp()
+	envP := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = extractvalue %%fn_value %s, 0\n", fnP, v.Name)
+	fmt.Fprintf(&c.body, "  %s = extractvalue %%fn_value %s, 1\n", envP, v.Name)
+	c.e.ensureDeclare("declare void @volt_once_do(ptr, ptr, ptr)")
+	fmt.Fprintf(&c.body, "  call void @volt_once_do(ptr %s, ptr %s, ptr %s)\n", handle, fnP, envP)
+	return Value{Name: "", Type: "void"}, nil
 }
 
 // emitBuiltinClone lowers `clone(x)` into a fresh owned value of x's type
@@ -2687,9 +3983,9 @@ func (c *funcCtx) cloneValue(pos lex.Pos, val Value, t ast.Type) (Value, error) 
 	case *ast.BorrowType, *ast.PointerType:
 		return Value{}, fmt.Errorf("%s: clone is not allowed on borrows (&T / *T) — they are not owned values", pos)
 	case *ast.SliceType:
-		return Value{}, fmt.Errorf("%s: clone of slices not yet implemented", pos)
+		return c.cloneSlice(val, c.e.llvmType(tt.Elem))
 	case *ast.MapType:
-		return Value{}, fmt.Errorf("%s: clone of maps not yet implemented", pos)
+		return c.cloneMap(val)
 	}
 	return Value{}, fmt.Errorf("%s: clone: unsupported type %T", pos, t)
 }
@@ -2711,6 +4007,45 @@ func (c *funcCtx) cloneString(val Value) (Value, error) {
 	fmt.Fprintf(&c.body, "  %s = insertvalue %%string zeroinitializer, ptr %s, 0\n", t1, np)
 	fmt.Fprintf(&c.body, "  %s = insertvalue %%string %s, i64 %s, 1\n", t2, t1, l)
 	return Value{Name: t2, Type: "%string"}, nil
+}
+
+// cloneSlice byte-copies the backing storage of a %slice and builds a
+// fresh header. Shallow w.r.t. element-level heap data — if elements
+// are themselves heap-bound (e.g. strings inside the slice), both
+// slices share the inner backing memory. Sufficient for primitive
+// element types; struct-element deep-clone is a future widening.
+func (c *funcCtx) cloneSlice(val Value, elemLL string) (Value, error) {
+	if val.Type != "%slice" {
+		return Value{}, fmt.Errorf("clone: expected %%slice, got %s", val.Type)
+	}
+	ptr := c.newTemp()
+	lenVal := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = extractvalue %%slice %s, 0\n", ptr, val.Name)
+	fmt.Fprintf(&c.body, "  %s = extractvalue %%slice %s, 1\n", lenVal, val.Name)
+	bytesTmp := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = mul i64 %s, %d\n", bytesTmp, lenVal, llvmTypeBytes(elemLL))
+	c.e.ensureDeclare("declare ptr @volt_buf_clone(ptr, i64)")
+	nptr := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = call ptr @volt_buf_clone(ptr %s, i64 %s)\n", nptr, ptr, bytesTmp)
+	s1 := c.newTemp()
+	s2 := c.newTemp()
+	s3 := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = insertvalue %%slice zeroinitializer, ptr %s, 0\n", s1, nptr)
+	fmt.Fprintf(&c.body, "  %s = insertvalue %%slice %s, i64 %s, 1\n", s2, s1, lenVal)
+	// cap == len for the clone: we copied exactly `len` bytes.
+	fmt.Fprintf(&c.body, "  %s = insertvalue %%slice %s, i64 %s, 2\n", s3, s2, lenVal)
+	return Value{Name: s3, Type: "%slice", SliceElem: elemLL}, nil
+}
+
+// cloneMap calls the runtime's volt_map_clone, which allocates a new
+// map table and copies every (key, value) entry. Like cloneSlice, this
+// is shallow at the value level — pointer-valued maps share whatever
+// the values point at.
+func (c *funcCtx) cloneMap(val Value) (Value, error) {
+	c.e.ensureDeclare("declare ptr @volt_map_clone(ptr)")
+	t := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = call ptr @volt_map_clone(ptr %s)\n", t, val.Name)
+	return Value{Name: t, Type: "ptr"}, nil
 }
 
 // cloneStruct builds a new struct value by extracting each field of `val`
@@ -2756,7 +4091,10 @@ func (c *funcCtx) emitBuiltinClose(call *ast.CallExpr) (Value, error) {
 	}
 
 	// Case 1: channel.
-	if _, isChan := sym.AstType.(*ast.ChanType); isChan {
+	if ct, isChan := sym.AstType.(*ast.ChanType); isChan {
+		if ct.Dir == ast.ChanRead {
+			return Value{}, fmt.Errorf("%s: cannot close a read-only channel (declared `chan read T`) — only the sender side closes", call.Pos())
+		}
 		t := c.newTemp()
 		fmt.Fprintf(&c.body, "  %s = load ptr, ptr %s\n", t, sym.Ptr)
 		c.e.ensureDeclare("declare void @volt_chan_close(ptr)")
@@ -2777,6 +4115,78 @@ func (c *funcCtx) emitBuiltinClose(call *ast.CallExpr) (Value, error) {
 	}
 
 	return Value{}, fmt.Errorf("%s: close(%s): only channels and types with a Close() method are supported", call.Pos(), id.Name)
+}
+
+// emitBuiltinCap lowers `cap(x)` for a slice. Strings and maps don't
+// have a separate capacity in this v0.7 model. Returns the third field
+// of the %slice header.
+func (c *funcCtx) emitBuiltinCap(call *ast.CallExpr) (Value, error) {
+	if len(call.Args) != 1 {
+		return Value{}, fmt.Errorf("%s: cap takes exactly 1 argument", call.Pos())
+	}
+	arg, err := c.emitExpr(call.Args[0])
+	if err != nil {
+		return Value{}, err
+	}
+	if arg.Type != "%slice" {
+		return Value{}, fmt.Errorf("%s: cap() requires a slice, got %s", call.Pos(), arg.Type)
+	}
+	t := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = extractvalue %s %s, 2\n", t, arg.Type, arg.Name)
+	return Value{Name: t, Type: "i64"}, nil
+}
+
+// emitBuiltinAppend lowers `append(s, v)` for a slice s and a single
+// element v. Returns the (possibly grown) slice value — the caller
+// must assign the result back, Go-style: `s = append(s, v)`. v0.7
+// supports a single trailing element; variadic append comes later.
+//
+// Implementation: route to the runtime's volt_slice_grow, which
+// reallocates when len == cap. The compiler stack-allocates a scratch
+// header (modified in place) and a scratch element slot.
+func (c *funcCtx) emitBuiltinAppend(call *ast.CallExpr) (Value, error) {
+	if len(call.Args) != 2 {
+		return Value{}, fmt.Errorf("%s: append takes exactly 2 arguments (slice, element)", call.Pos())
+	}
+	slice, err := c.emitExpr(call.Args[0])
+	if err != nil {
+		return Value{}, err
+	}
+	if slice.Type != "%slice" {
+		return Value{}, fmt.Errorf("%s: append's first arg must be a slice, got %s", call.Pos(), slice.Type)
+	}
+	elemT := slice.SliceElem
+	if elemT == "" {
+		return Value{}, fmt.Errorf("%s: append: slice element type unknown — assign to a typed variable first", call.Pos())
+	}
+	elem, err := c.emitExpr(call.Args[1])
+	if err != nil {
+		return Value{}, err
+	}
+	elem = c.convertInt(elem, elemT)
+
+	// Stack scratch for the slice header (the runtime modifies it in
+	// place) and for the new element (the runtime memcpy's its bytes).
+	sliceSlot := c.newTemp()
+	elemSlot := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = alloca %%slice\n", sliceSlot)
+	fmt.Fprintf(&c.body, "  %s = alloca %s\n", elemSlot, elemT)
+	fmt.Fprintf(&c.body, "  store %%slice %s, ptr %s\n", slice.Name, sliceSlot)
+	fmt.Fprintf(&c.body, "  store %s %s, ptr %s\n", elemT, elem.Name, elemSlot)
+
+	// sizeof(elemT) via the GEP-null trick.
+	szPtr := c.newTemp()
+	szInt := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = getelementptr %s, ptr null, i32 1\n", szPtr, elemT)
+	fmt.Fprintf(&c.body, "  %s = ptrtoint ptr %s to i64\n", szInt, szPtr)
+
+	c.e.ensureDeclare("declare void @volt_slice_grow(ptr, i64, ptr)")
+	fmt.Fprintf(&c.body, "  call void @volt_slice_grow(ptr %s, i64 %s, ptr %s)\n",
+		sliceSlot, szInt, elemSlot)
+
+	result := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = load %%slice, ptr %s\n", result, sliceSlot)
+	return Value{Name: result, Type: "%slice", SliceElem: elemT}, nil
 }
 
 // emitBuiltinLen lowers `len(x)` where x is a slice, string, or map.
@@ -2871,7 +4281,10 @@ func (c *funcCtx) emitQualifiedCall(call *ast.CallExpr, sel *ast.SelectorExpr) (
 	switch full {
 	case "syscall.Write":
 		return c.emitSyscallWrite(call)
-	case "syscall.Exit":
+	case "syscall.Exit", "os.Exit":
+		// `os.Exit(code)` is the ergonomic name; both lower to the same
+		// volt_exit syscall stub. The `os.Exit` form is preferred in
+		// user code; `syscall.Exit` is the raw form kept for stdlib use.
 		return c.emitSyscallExit(call)
 	case "syscall.Nanosleep":
 		return c.emitSyscallNanosleep(call)
@@ -2914,6 +4327,16 @@ func (c *funcCtx) emitMethodCall(call *ast.CallExpr, sel *ast.SelectorExpr) (Val
 		case *ast.OnceType:
 			return c.emitOnceMethod(call, recvSym, sel.Sel)
 		}
+	}
+
+	// Interface dispatch: `e.Error()` on an error-typed variable. The
+	// receiver holds an `%error_box` ptr; load the data pointer and the
+	// stored Error fn pointer, then indirect-call.
+	if isErrorType(recvSym.AstType) {
+		return c.emitErrorMethod(call, recvSym, sel.Sel)
+	}
+	if iname := c.userInterfaceName(recvSym.AstType); iname != "" {
+		return c.emitIfaceMethod(call, recvSym, iname, sel.Sel)
 	}
 
 	// Determine the bare struct type name.
@@ -2991,7 +4414,56 @@ func (c *funcCtx) emitForeignCall(call *ast.CallExpr, symbol string) (Value, err
 	return Value{Name: "", Type: "void"}, nil
 }
 
+// emitIndirectCall lowers `f(args...)` where `f` is a fn-typed local.
+// Loads the %fn_value, extracts the fn pointer and env pointer, then
+// calls fn(env, args...). The function pointer is opaque (`ptr`) at the
+// LLVM level; the signature for the indirect call is reconstructed from
+// the variable's declared FuncType.
+func (c *funcCtx) emitIndirectCall(call *ast.CallExpr, sym symbol, ft *ast.FuncType) (Value, error) {
+	if len(call.Args) != len(ft.Params) {
+		return Value{}, fmt.Errorf("%s: function value takes %d arg(s), got %d",
+			call.Pos(), len(ft.Params), len(call.Args))
+	}
+	fv := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = load %%fn_value, ptr %s\n", fv, sym.Ptr)
+	fnP := c.newTemp()
+	envP := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = extractvalue %%fn_value %s, 0\n", fnP, fv)
+	fmt.Fprintf(&c.body, "  %s = extractvalue %%fn_value %s, 1\n", envP, fv)
+
+	retT := "void"
+	if len(ft.Results) > 0 {
+		retT = c.e.llvmType(ft.Results[0])
+	}
+
+	argStrs := []string{"ptr " + envP}
+	for i, arg := range call.Args {
+		v, err := c.emitCallArg(arg, ft.Params[i].Type)
+		if err != nil {
+			return Value{}, err
+		}
+		paramT := c.e.llvmType(ft.Params[i].Type)
+		argStrs = append(argStrs, paramT+" "+v.Name)
+	}
+
+	if retT == "void" {
+		fmt.Fprintf(&c.body, "  call void %s(%s)\n", fnP, strings.Join(argStrs, ", "))
+		return Value{Name: "", Type: "void"}, nil
+	}
+	r := c.newTemp()
+	fmt.Fprintf(&c.body, "  %s = call %s %s(%s)\n", r, retT, fnP, strings.Join(argStrs, ", "))
+	return Value{Name: r, Type: retT}, nil
+}
+
 func (c *funcCtx) emitUnqualifiedCall(call *ast.CallExpr, fn *ast.IdentExpr) (Value, error) {
+	// Indirect call: the identifier resolves to a fn-typed local
+	// (parameter, var, or `var = fun(...){ ... }` literal). Load the
+	// %fn_value, extract fn+env, indirect-call with env as first arg.
+	if sym, ok := c.symbols[fn.Name]; ok {
+		if ft, ok := sym.AstType.(*ast.FuncType); ok {
+			return c.emitIndirectCall(call, sym, ft)
+		}
+	}
 	sig, ok := c.e.funcs[fn.Name]
 	if !ok {
 		return Value{}, fmt.Errorf("%s: undefined function %q", call.Pos(), fn.Name)

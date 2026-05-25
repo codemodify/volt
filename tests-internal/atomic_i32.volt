@@ -4,22 +4,20 @@
 package main
 
 fun bumper(a atomic int32, done chan int) {
-    var i int = 0
-    for i < 1000 {
+    for i := 0; i < 1000; i++ {
         a.Add(1)
-        i = i + 1
     }
     write(done, 1)
 }
 
 fun main() int {
-    var a atomic int32 = new{}
+    var a atomic int32 = new {}
     var done chan int = new(2) chan int
     run bumper(a, done)
     run bumper(a, done)
     read(done)
     read(done)
-    var n int32 = a.Load()
+    var n int32 = a.Read()
     if n == 2000 {
         ret 42
     }

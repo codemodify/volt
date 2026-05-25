@@ -6,3 +6,6 @@
 # Intermediate compiler artifacts that may briefly land at the root.
 /*.ll
 /*.o
+volt
+showcase
+producer-consumer

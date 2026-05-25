@@ -6,11 +6,9 @@
 package main
 
 fun worker(jobs chan int, results chan int, scale int, done chan int) {
-    var i int = 0
-    for i < 6 {
+    for i := 0; i < 6; i++ {
         var v int = read(jobs)
         write(results, v * scale)
-        i = i + 1
     }
     write(done, 1)
 }
@@ -20,20 +18,16 @@ fun main() int {
     var results chan int = new(8) chan int
     var done    chan int = new(1) chan int
 
-    var i int = 1
-    for i <= 6 {
+    for i := 1; i <= 6; i++ {
         write(jobs, i)
-        i = i + 1
     }
 
     run worker(jobs, results, 2, done)
     read(done)
 
     var sum int = 0
-    var j int = 0
-    for j < 6 {
+    for j := 0; j < 6; j++ {
         sum = sum + read(results)
-        j = j + 1
     }
     ret sum
 }

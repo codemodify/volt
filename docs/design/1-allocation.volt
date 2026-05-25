@@ -13,10 +13,10 @@
 // SHORT FORM — the type is omitted when the LHS of the same `=` supplies
 // it via an explicit type annotation:
 //
-//   var c Counter         = new{value: 10}
+//   var c Counter         = new {value: 10}
 //   var ch chan int       = new(4)
-//   var m map[string]int  = new{}
-//   var s []int           = new(8){1, 2, 3}
+//   var m map[string]int  = new {}
+//   var s []int           = new(8) {1, 2, 3}
 //
 // Short form is allowed ONLY on a `var x T = new...` declaration. For
 // `x = new...`, `x := new...`, return, function args, or slice/map

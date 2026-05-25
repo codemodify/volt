@@ -5,7 +5,7 @@ single concept. Read the header comment of each for the design notes,
 then run it directly:
 
 ```sh
-volt run docs/design/primitives.volt
+volt run docs/design/0-primitives.volt
 ```
 
 Suggested reading order — earlier files lay the groundwork for later
@@ -13,14 +13,15 @@ ones, but each is independently runnable:
 
 | File | What it shows |
 |---|---|
-| `primitives.volt`    | Every built-in primitive: int{8,16,32,64}, uint{8,16,32,64}, byte, bool, string, slice, map, empty struct |
-| `ownership.volt`     | The three forms of a value: `T` (owned), `&T` (read access — many readers OK), `*T` (write access — exclusive). Method dispatch on each. |
-| `allocation.volt`    | The `new` keyword: `new T{…}` / `new T{}` for structs, `new(cap) chan T` for channels, `new(cap) map[K]V{…}` for maps, `new(N) []T{…}` for slices. Size always comes immediately after `new`, before the type. Short form `new(…)` / `new{…}` allowed when LHS provides the type. |
+| `0-intent.volt`      | One-page schematic of every type and concurrency primitive — the language's "what fits where" overview. |
+| `0-primitives.volt`  | Every built-in primitive: int{8,16,32,64}, uint{8,16,32,64}, byte, bool, string, slice, map, empty struct |
+| `1-allocation.volt`  | The `new` keyword: `new T {…}` / `new T {}` for structs, `new(cap) chan T` for channels, `new(cap) map[K]V {…}` for maps, `new(N) []T {…}` for slices. Size always comes immediately after `new`, before the type. Short form `new(…)` / `new {…}` allowed when LHS provides the type. |
+| `2-ownership.volt`   | The three forms of a value: `T` (owned), `&T` (read access — many readers OK), `*T` (write access — exclusive). Method dispatch on each. |
+| `3-concurrency.volt` | `run f()` launches a real OS thread; channels (unbuffered by default), direction (`chan read T` / `chan write T`), multiplicity contracts (`chan11`/`chan1N`/`chanN1`/`chanNN`), `select`, `mutex T`, `rwmutex T`, `atomic T`, `waitgroup`, `once`. |
 | `multi-return.volt`  | Multi-value return + `a, b := f()` short decl. The `(T, bool)` "maybe-absent" pattern that replaces `Option<T>`. |
 | `move.volt`          | Move semantics: passing `T` consumes it; use-after-move is a compile error. Read access (`&T`) or write access (`*T`) avoids the move. |
 | `errors.volt`        | The `(T, error)` pattern — multi-return; caller checks `err != nil` first, reads the value only when error is nil. |
 | `interfaces.volt`    | Structural interfaces — any type with matching methods satisfies. No `impl` keyword. |
-| `concurrency.volt`   | `run f()` launches a real OS thread; bounded channels + `close` + two-value receive synchronize them. |
 | `timers.volt`        | `time.Sleep(ns int)` and the duration unit constants `time.{Nanosecond, Microsecond, Millisecond, Second}` (compile-time integers). |
 | `defer.volt`         | `def` — registers cleanup that fires at function exit in LIFO order. No exceptions; no auto-destructors. |
 

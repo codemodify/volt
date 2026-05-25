@@ -32,27 +32,30 @@ volt_exit:
     svc     #0
     // not reached
 
-// volt_spawn(fn, arg1, arg2, arg3, arg4): clone a new thread that runs
-// fn(arg1, arg2, arg3, arg4) then sys_exits this thread.
+// volt_spawn(fn, arg1..arg6): clone a new thread that runs
+// fn(arg1, arg2, arg3, arg4, arg5, arg6) then sys_exits this thread.
 //
-// Same stack-staging pattern as amd64: mmap a 1 MB stack, push
-// (arg4, arg3, arg2, arg1, fn) so the child can pop fn first then
-// args into x0..x3.
+// arm64 AAPCS: x0..x7 hold the first 8 register args. fn is in x0;
+// args1..6 in x1..x6. All 7 values fit in registers; no stack
+// argument fixup needed (unlike amd64's 7th positional).
 .global volt_spawn
 volt_spawn:
     // Frame
     stp     x29, x30, [sp, #-16]!
     mov     x29, sp
-    // Caller-saved across syscalls — save fn/arg1..arg4 in callee-saved regs.
+    // Caller-saved across syscalls — save fn/arg1..arg6 in callee-saved regs.
     stp     x19, x20, [sp, #-16]!
     stp     x21, x22, [sp, #-16]!
     stp     x23, x24, [sp, #-16]!
+    stp     x25, x26, [sp, #-16]!
 
     mov     x19, x0             // fn
     mov     x20, x1             // arg1
     mov     x21, x2             // arg2
     mov     x22, x3             // arg3
     mov     x23, x4             // arg4
+    mov     x24, x5             // arg5
+    mov     x25, x6             // arg6
 
     // mmap(NULL, 1MB, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
     mov     x0,  #0
@@ -66,7 +69,11 @@ volt_spawn:
     // x0 = mmap base. Top = base + 1MB.
     add     x0,  x0,  #0x100000
 
-    // Push (arg4, arg3, arg2, arg1, fn) — fn ends up on top.
+    // Push (arg6, arg5, arg4, arg3, arg2, arg1, fn) — fn ends up on top.
+    sub     x0,  x0,  #8
+    str     x25, [x0]           // arg6
+    sub     x0,  x0,  #8
+    str     x24, [x0]           // arg5
     sub     x0,  x0,  #8
     str     x23, [x0]           // arg4
     sub     x0,  x0,  #8
@@ -91,6 +98,7 @@ volt_spawn:
     cbz     x0,  .Lvolt_spawn_child
 
     // Parent: restore and return.
+    ldp     x25, x26, [sp], #16
     ldp     x23, x24, [sp], #16
     ldp     x21, x22, [sp], #16
     ldp     x19, x20, [sp], #16
@@ -98,12 +106,14 @@ volt_spawn:
     ret
 
 .Lvolt_spawn_child:
-    // Pop fn → x9, arg1..arg4 → x0..x3
+    // Pop fn → x9, arg1..arg6 → x0..x5
     ldr     x9,  [sp], #8
     ldr     x0,  [sp], #8
     ldr     x1,  [sp], #8
     ldr     x2,  [sp], #8
     ldr     x3,  [sp], #8
+    ldr     x4,  [sp], #8
+    ldr     x5,  [sp], #8
     blr     x9
     mov     x0,  #0
     mov     x8,  #93            // sys_exit (this thread only)

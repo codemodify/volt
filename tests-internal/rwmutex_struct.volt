@@ -12,29 +12,25 @@ type Snapshot struct {
 }
 
 fun writer(s rwmutex Snapshot, done chan int) {
-    var i int = 0
-    for i < 100 {
+    for i := 0; i < 100; i++ {
         var v Snapshot = s.Lock()       // writer guard
         v.version = v.version + 1
         v.payload = v.version * 2
-        i = i + 1
     }
     write(done, 1)
 }
 
 fun reader(s rwmutex Snapshot, done chan int) {
-    var i int = 0
     var sum int = 0
-    for i < 1000 {
+    for i := 0; i < 1000; i++ {
         var v Snapshot = s.LockRead()   // reader guard — fields are read-only
         sum = sum + v.version + v.payload
-        i = i + 1
     }
     write(done, 1)
 }
 
 fun main() int {
-    var s rwmutex Snapshot = new{version: 0, payload: 0}
+    var s rwmutex Snapshot = new {version: 0, payload: 0}
     var done chan int = new(3) chan int
     run writer(s, done)
     run reader(s, done)

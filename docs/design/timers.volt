@@ -1,7 +1,7 @@
 // =====================================================================
 // timers.volt — time.Sleep and duration units
 // =====================================================================
-// `time.Sleep(ns int)` blocks the calling goroutine for at least n
+// `time.Sleep(ns int)` blocks the calling thread for at least n
 // nanoseconds. The runtime lowers it to a `sys_nanosleep` syscall —
 // no libc involved.
 //

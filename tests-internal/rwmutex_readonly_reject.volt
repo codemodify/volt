@@ -12,7 +12,7 @@ type S struct {
 }
 
 fun main() int {
-    var r rwmutex S = new{n: 0}
+    var r rwmutex S = new {n: 0}
     var v S = r.LockRead()
     v.n = 1                       // expected: compile error — read-only guard
     ret 0

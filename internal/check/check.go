@@ -87,6 +87,8 @@ type state struct {
 	movable bool
 	moved   ast.Node // nil if alive; otherwise the statement that moved it
 	isParam bool     // true if this symbol is a function parameter
+	used    bool     // any read (including field/index receiver) sets this
+	decl    ast.Node // declaration site, for the "declared but not used" diagnostic
 	typ     ast.Type // declared type of this symbol (when known)
 }
 
@@ -102,11 +104,18 @@ func cloneSyms(in map[string]*state) map[string]*state {
 
 // mergeSyms unions branch states back into `dst`. A variable is considered
 // moved post-branches if it was moved in any branch — conservative,
-// catches "moved in some path" use-after-move bugs.
+// catches "moved in some path" use-after-move bugs. Used-flag propagates
+// the same way: a read in either branch counts as a read.
 func mergeSyms(dst, a, b map[string]*state) {
 	for k, ds := range dst {
 		as, aOK := a[k]
 		bs, bOK := b[k]
+		if aOK && as.used {
+			ds.used = true
+		}
+		if bOK && bs.used {
+			ds.used = true
+		}
 		if aOK && as.moved != nil {
 			ds.moved = as.moved
 			continue
@@ -133,13 +142,53 @@ func (c *Checker) checkFunc(fd *ast.FuncDecl) {
 	// borrow-of-local escapes.
 	c.curResults = fd.Results
 	defer func() { c.curResults = nil }()
+	// checkBlock walks the body and reports any newly-declared
+	// unused locals — covers both top-level and branch scopes.
 	c.checkBlock(fd.Body, syms)
+	// Channel multiplicity contracts (chanOROW / chanORMW / chanMROW /
+	// chanMRMW) — counted at the declaring scope by walking endpoints.
+	c.checkChanContracts(fd)
 }
 
+// reportUnusedSince flags every variable that was declared inside the
+// current block (i.e., added to `syms` since `entry` was snapshotted)
+// but never read. Mirrors Go's "declared and not used" rule. Skips
+// function parameters and `_`-prefixed names.
+func (c *Checker) reportUnusedSince(syms map[string]*state, entry map[string]bool) {
+	for name, st := range syms {
+		if entry[name] {
+			continue // existed before the block — not its responsibility
+		}
+		if st == nil || st.isParam || st.used || st.decl == nil {
+			continue
+		}
+		if strings.HasPrefix(name, "_") {
+			continue
+		}
+		c.errs = append(c.errs, fmt.Sprintf("%s: %q declared but not used", st.decl.Pos(), name))
+	}
+}
+
+// snapshotNames returns the set of names currently in syms — used to
+// distinguish "declared in this block" from "inherited from outside."
+func snapshotNames(syms map[string]*state) map[string]bool {
+	out := make(map[string]bool, len(syms))
+	for name := range syms {
+		out[name] = true
+	}
+	return out
+}
+
+// checkBlock walks every statement, then reports any newly-declared
+// local that was never read. Works for both top-level function bodies
+// and branch bodies (if/else/for/select case) — `entry` distinguishes
+// what was already in scope.
 func (c *Checker) checkBlock(b *ast.Block, syms map[string]*state) {
+	entry := snapshotNames(syms)
 	for _, s := range b.Stmts {
 		c.checkStmt(s, syms)
 	}
+	c.reportUnusedSince(syms, entry)
 }
 
 func (c *Checker) checkStmt(s ast.Stmt, syms map[string]*state) {
@@ -147,12 +196,20 @@ func (c *Checker) checkStmt(s ast.Stmt, syms map[string]*state) {
 	case *ast.VarStmt:
 		c.checkExprUse(s.Value, syms)
 		c.maybeMoveBareIdent(s.Value, s, syms)
-		syms[s.Name] = &state{movable: isMovableType(s.Type), typ: s.Type}
+		syms[s.Name] = &state{movable: isMovableType(s.Type), typ: s.Type, decl: s}
 	case *ast.AssignStmt:
 		c.checkExprUse(s.RHS, syms)
 		c.maybeMoveBareIdent(s.RHS, s, syms)
 		// Reject writes through a shared borrow (&T).
 		c.checkBorrowWrite(s.LHS, syms)
+		// Field/index writes (x.f = ..., m[k] = ...) read x — count as a use.
+		switch lhs := s.LHS.(type) {
+		case *ast.SelectorExpr:
+			c.checkExprUse(lhs.X, syms)
+		case *ast.IndexExpr:
+			c.checkExprUse(lhs.X, syms)
+			c.checkExprUse(lhs.Index, syms)
+		}
 		if id, ok := s.LHS.(*ast.IdentExpr); ok {
 			if st, ok := syms[id.Name]; ok {
 				st.moved = nil // reassigned, revived
@@ -192,8 +249,16 @@ func (c *Checker) checkStmt(s ast.Stmt, syms map[string]*state) {
 			c.checkCallMoves(call, syms)
 		}
 	case *ast.IfStmt:
+		// Init clause runs once, before Cond. Its bindings are scoped to
+		// the entire if/else chain — visible in Cond, Then, and Else
+		// (and any else-if Cond). Snapshot pre-init state so we can drop
+		// the bindings when leaving the if.
+		preInit := snapshotNames(syms)
+		if s.Init != nil {
+			c.checkStmt(s.Init, syms)
+		}
 		c.checkExprUse(s.Cond, syms)
-		// Branch-join: each branch sees a clone of the pre-if state;
+		// Branch-join: each branch sees a clone of the post-init state;
 		// after the if, a variable is considered moved if it was moved
 		// in *any* branch we could have taken (conservative — over-rejects
 		// rather than miss bugs).
@@ -206,16 +271,37 @@ func (c *Checker) checkStmt(s ast.Stmt, syms map[string]*state) {
 			c.checkStmt(s.Else, elseSyms)
 		}
 		mergeSyms(syms, thenSyms, elseSyms)
+		// Init-bound names go out of scope at the end of the if/else.
+		if s.Init != nil {
+			for name := range syms {
+				if !preInit[name] {
+					delete(syms, name)
+				}
+			}
+		}
 	case *ast.ForStmt:
 		// Loop body executes 0+ times. Treat as a branch: clone state,
 		// check the body, then merge back. A move inside the loop must
 		// taint the post-loop state. (We also run the body once for the
 		// "ran at least once" path — that's what the merge captures.)
+		if s.RangeOver != nil {
+			// Range form: the source is read (marks it used in outer
+			// syms), and the bindings enter scope inside the loop.
+			c.checkExprUse(s.RangeOver, syms)
+		}
 		if s.Init != nil {
 			c.checkStmt(s.Init, syms)
 		}
 		c.checkExprUse(s.Cond, syms)
 		loopSyms := cloneSyms(syms)
+		if s.RangeOver != nil {
+			if s.RangeI != "" && s.RangeI != "_" {
+				loopSyms[s.RangeI] = &state{movable: false, decl: s}
+			}
+			if s.RangeV != "" && s.RangeV != "_" {
+				loopSyms[s.RangeV] = &state{movable: false, decl: s}
+			}
+		}
 		if s.Body != nil {
 			c.checkBlock(s.Body, loopSyms)
 		}
@@ -226,6 +312,96 @@ func (c *Checker) checkStmt(s ast.Stmt, syms map[string]*state) {
 		mergeSyms(syms, cloneSyms(syms), loopSyms)
 	case *ast.Block:
 		c.checkBlock(s, syms)
+	case *ast.RunStmt:
+		// `run f(args)` — walk args so identifiers count as used and
+		// move tracking sees them. Borrow-arg rejection lives in checkRun.
+		if s.Call != nil {
+			c.checkExprUse(s.Call, syms)
+			c.checkRun(s, syms)
+		}
+	case *ast.SendStmt:
+		c.checkExprUse(s.Channel, syms)
+		c.checkExprUse(s.Value, syms)
+		c.maybeMoveBareIdent(s.Value, s, syms)
+	case *ast.SelectStmt:
+		for _, cs := range s.Cases {
+			if cs == nil {
+				continue
+			}
+			if cs.IsDefault {
+				for _, st := range cs.Body {
+					c.checkStmt(st, syms)
+				}
+				continue
+			}
+			c.checkExprUse(cs.Channel, syms)
+			c.checkExprUse(cs.SendValue, syms)
+			// recv-bound names enter scope for the case body
+			caseSyms := cloneSyms(syms)
+			for _, n := range cs.RecvNames {
+				caseSyms[n] = &state{movable: false, decl: cs}
+			}
+			for _, st := range cs.Body {
+				c.checkStmt(st, caseSyms)
+			}
+		}
+	case *ast.MultiVarStmt:
+		c.checkExprUse(s.RHS, syms)
+		for _, n := range s.Names {
+			syms[n] = &state{movable: false, decl: s}
+		}
+	case *ast.MultiAssignStmt:
+		c.checkExprUse(s.RHS, syms)
+		for _, lhs := range s.LHS {
+			switch l := lhs.(type) {
+			case *ast.SelectorExpr:
+				c.checkExprUse(l.X, syms)
+			case *ast.IndexExpr:
+				c.checkExprUse(l.X, syms)
+				c.checkExprUse(l.Index, syms)
+			case *ast.IdentExpr:
+				if st, ok := syms[l.Name]; ok {
+					st.moved = nil
+				}
+			}
+		}
+	case *ast.DeferStmt:
+		if s.Call != nil {
+			c.checkExprUse(s.Call, syms)
+		}
+	}
+}
+
+// checkRun rejects borrow / pointer arguments to a spawned function.
+// Borrows are scope-bound (their lifetime is tied to the storage they
+// point at), and the spawned thread outlives the caller's scope, so a
+// borrow would dangle. The only safe way to share data with a spawned
+// thread is a reference-typed handle (chan / mutex / atomic / etc).
+func (c *Checker) checkRun(s *ast.RunStmt, _ map[string]*state) {
+	if s.Call == nil {
+		return
+	}
+	id, ok := s.Call.Fun.(*ast.IdentExpr)
+	if !ok {
+		return
+	}
+	sig := c.funcs[id.Name]
+	if sig == nil {
+		return
+	}
+	for i, arg := range s.Call.Args {
+		if i >= len(sig.Params) {
+			break
+		}
+		pt := sig.Params[i].Type
+		if !isBorrowOrPointer(pt) {
+			continue
+		}
+		// Borrow-typed param — the bare-name inference rule would
+		// materialize a borrow at the call site. Reject explicitly.
+		c.errs = append(c.errs, fmt.Sprintf(
+			"%s: cannot pass borrow / pointer argument to `run` — borrows can't cross thread boundaries (use a chan / mutex / atomic handle instead)",
+			arg.Pos()))
 	}
 }
 
@@ -236,10 +412,13 @@ func (c *Checker) checkExprUse(e ast.Expr, syms map[string]*state) {
 	}
 	switch ex := e.(type) {
 	case *ast.IdentExpr:
-		if st, ok := syms[ex.Name]; ok && st.moved != nil {
-			c.errs = append(c.errs, fmt.Sprintf(
-				"%s: use of moved value %q (moved at %s)",
-				ex.Pos(), ex.Name, st.moved.Pos()))
+		if st, ok := syms[ex.Name]; ok {
+			st.used = true
+			if st.moved != nil {
+				c.errs = append(c.errs, fmt.Sprintf(
+					"%s: use of moved value %q (moved at %s)",
+					ex.Pos(), ex.Name, st.moved.Pos()))
+			}
 		}
 	case *ast.CallExpr:
 		c.checkExprUse(ex.Fun, syms)
@@ -253,6 +432,43 @@ func (c *Checker) checkExprUse(e ast.Expr, syms map[string]*state) {
 		c.checkExprUse(ex.X, syms)
 	case *ast.SelectorExpr:
 		c.checkExprUse(ex.X, syms)
+	case *ast.IndexExpr:
+		c.checkExprUse(ex.X, syms)
+		c.checkExprUse(ex.Index, syms)
+	case *ast.NewExpr:
+		for _, a := range ex.SizeArgs {
+			c.checkExprUse(a, syms)
+		}
+		for _, p := range ex.Pairs {
+			c.checkExprUse(p.Value, syms)
+		}
+		for _, m := range ex.MapEntries {
+			c.checkExprUse(m.Key, syms)
+			c.checkExprUse(m.Value, syms)
+		}
+		for _, e := range ex.SliceElems {
+			c.checkExprUse(e, syms)
+		}
+	case *ast.FuncLit:
+		// Closure literal: walk the body in a child scope so that
+		// identifiers it references which resolve to OUR locals
+		// (captures) get marked as used in our syms. The literal's
+		// own params shadow outer names — we add them to a child syms
+		// so refs to them don't hit our outer entries.
+		child := cloneSyms(syms)
+		for _, p := range ex.Params {
+			child[p.Name] = &state{movable: isMovableType(p.Type), isParam: true, typ: p.Type}
+		}
+		if ex.Body != nil {
+			c.checkBlock(ex.Body, child)
+		}
+		// Propagate "used" marks from child back to syms for names that
+		// existed in syms (captures). Don't import new declarations.
+		for name, ds := range syms {
+			if cs, ok := child[name]; ok && cs.used {
+				ds.used = true
+			}
+		}
 	}
 }
 
@@ -303,6 +519,14 @@ func (c *Checker) checkCallMoves(call *ast.CallExpr, syms map[string]*state) {
 		case isMovableType(paramType) && isIdent:
 			if st, ok := syms[argId.Name]; ok && st.movable && st.moved == nil {
 				st.moved = call
+			}
+		case isMovableType(paramType):
+			// Field/index access argument: consume(p.a) / consume(s[i]).
+			// Mark the root container as moved (conservative).
+			if root, ok := rootIdent(arg); ok {
+				if st, ok := syms[root]; ok && st.movable && st.moved == nil {
+					st.moved = call
+				}
 			}
 		}
 	}
@@ -362,16 +586,35 @@ func (c *Checker) checkBorrowWrite(lhs ast.Expr, syms map[string]*state) {
 	}
 }
 
-// maybeMoveBareIdent: for `var x = y` and `x = y` patterns, mark y moved
-// if y is itself movable.
+// maybeMoveBareIdent: for `var x = y`, `x = y`, `var x = p.a`,
+// `x = p.a[i]` etc., mark the source (root variable) as moved if it
+// is movable. Field/index chains conservatively move the whole root
+// container — volt doesn't track partial moves at field granularity
+// today, so any structural-field read consumes the parent.
 func (c *Checker) maybeMoveBareIdent(rhs ast.Expr, at ast.Node, syms map[string]*state) {
-	id, ok := rhs.(*ast.IdentExpr)
-	if !ok {
-		return
+	switch rhs.(type) {
+	case *ast.IdentExpr, *ast.SelectorExpr, *ast.IndexExpr:
+		if root, ok := rootIdent(rhs); ok {
+			if st, ok := syms[root]; ok && st.movable && st.moved == nil {
+				st.moved = at
+			}
+		}
 	}
-	if st, ok := syms[id.Name]; ok && st.movable && st.moved == nil {
-		st.moved = at
+}
+
+// rootIdent walks a chain of selector/index expressions back to the
+// leftmost identifier — e.g. `p.a.b` → "p", `arr[i].x` → "arr".
+// Returns ok=false if the chain doesn't bottom out in an identifier.
+func rootIdent(e ast.Expr) (string, bool) {
+	switch x := e.(type) {
+	case *ast.IdentExpr:
+		return x.Name, true
+	case *ast.SelectorExpr:
+		return rootIdent(x.X)
+	case *ast.IndexExpr:
+		return rootIdent(x.X)
 	}
+	return "", false
 }
 
 // ---------------------------------------------------------------------

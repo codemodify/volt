@@ -11,18 +11,16 @@ fun worker(wg waitgroup, sum atomic int) {
 
 fun main() int {
     var wg waitgroup = new()
-    var sum atomic int = new{}
+    var sum atomic int = new {}
 
-    var i int = 0
-    for i < 100 {
+    for i := 0; i < 100; i++ {
         wg.Add(1)
         run worker(wg, sum)
-        i = i + 1
     }
 
     wg.Wait()                    // block until all 100 Done()s have happened
 
-    if sum.Load() == 100 {
+    if sum.Read() == 100 {
         ret 42
     }
     ret 0

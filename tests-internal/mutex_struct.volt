@@ -3,7 +3,7 @@
 // Exit 42 = success.
 //
 // Tests:
-//   - var c mutex Counter = new{value: 0}  (struct-payload init via braces)
+//   - var c mutex Counter = new {value: 0}  (struct-payload init via braces)
 //   - var v Counter = c.Lock()             (guard binding)
 //   - v.value = v.value + 1                (field write through guard)
 //   - guard auto-releases at end of loop iteration (no Unlock call)
@@ -15,17 +15,15 @@ type Counter struct {
 }
 
 fun bumper(c mutex Counter, done chan int) {
-    var i int = 0
-    for i < 1000 {
+    for i := 0; i < 1000; i++ {
         var v Counter = c.Lock()
         v.value = v.value + 1
-        i = i + 1
     }
     write(done, 1)
 }
 
 fun main() int {
-    var c mutex Counter = new{value: 0}
+    var c mutex Counter = new {value: 0}
     var done chan int = new(2) chan int
     run bumper(c, done)
     run bumper(c, done)

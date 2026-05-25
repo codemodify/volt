@@ -33,6 +33,10 @@ const (
 	KwBreak
 	KwCase
 	KwChan
+	KwChan11
+	KwChan1N
+	KwChanN1
+	KwChanNN
 	KwConst
 	KwContinue
 	KwDef
@@ -124,6 +128,10 @@ var kindNames = [...]string{
 	KwBreak:       "break",
 	KwCase:        "case",
 	KwChan:        "chan",
+	KwChan11:      "chan11",
+	KwChan1N:      "chan1N",
+	KwChanN1:      "chanN1",
+	KwChanNN:      "chanNN",
 	KwConst:       "const",
 	KwContinue:    "continue",
 	KwDef:         "def",
@@ -210,6 +218,10 @@ var keywords = map[string]Kind{
 	"break":     KwBreak,
 	"case":      KwCase,
 	"chan":      KwChan,
+	"chan11":    KwChan11,
+	"chan1N":    KwChan1N,
+	"chanN1":    KwChanN1,
+	"chanNN":    KwChanNN,
 	"const":     KwConst,
 	"continue":  KwContinue,
 	"def":       KwDef,

@@ -4,7 +4,7 @@
 package main
 
 fun main() int {
-    var m map[string]int = new{}
+    var m map[string]int = new {}
     m["alpha"] = 10
     m["bravo"] = 17
     m["zulu"]  = 12

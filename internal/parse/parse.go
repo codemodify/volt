@@ -21,7 +21,8 @@ import (
 // Parser produces an AST from a token stream.
 type Parser struct {
 	lexer *lex.Lexer
-	tok   lex.Token // current
+	tok   lex.Token   // current
+	peek  []lex.Token // arbitrary-length lookahead buffer (lazily populated)
 	errs  []string
 }
 
@@ -185,57 +186,10 @@ func (p *Parser) parseFuncDecl() *ast.FuncDecl {
 	name := p.tok.Text
 	p.advance()
 
-	if !p.expect(lex.LParen) {
+	params, results, ok := p.parseFuncSignature()
+	if !ok {
 		return nil
 	}
-	var params []*ast.Param
-	for p.tok.Kind != lex.RParen && p.tok.Kind != lex.EOF {
-		if p.tok.Kind != lex.Ident {
-			p.errorf("expected parameter name, got %s", p.tok.Kind)
-			break
-		}
-		pName := p.tok.Text
-		pPos := p.tok.Pos
-		p.advance()
-		t := p.parseType()
-		if t == nil {
-			return nil
-		}
-		params = append(params, &ast.Param{P: pPos, Name: pName, Type: t})
-		if p.tok.Kind == lex.Comma {
-			p.advance()
-			continue
-		}
-		break
-	}
-	if !p.expect(lex.RParen) {
-		return nil
-	}
-
-	// Optional return type: single `T` or `(T1, T2, ...)`.
-	var results []ast.Type
-	switch {
-	case p.tok.Kind == lex.LBrace:
-		// no return type
-	case p.tok.Kind == lex.LParen:
-		p.advance()
-		for p.tok.Kind != lex.RParen && p.tok.Kind != lex.EOF {
-			t := p.parseType()
-			if t != nil {
-				results = append(results, t)
-			}
-			if p.tok.Kind == lex.Comma {
-				p.advance()
-			}
-		}
-		p.expect(lex.RParen)
-	default:
-		t := p.parseType()
-		if t != nil {
-			results = append(results, t)
-		}
-	}
-
 	body := p.parseBlock()
 	return &ast.FuncDecl{P: start, Receiver: receiver, Name: name, Params: params, Results: results, Body: body}
 }
@@ -266,14 +220,40 @@ func (p *Parser) parseType() ast.Type {
 			return nil
 		}
 		return &ast.SliceType{P: pos, Elem: inner}
-	case lex.KwChan:
+	case lex.KwChan, lex.KwChan11, lex.KwChan1N, lex.KwChanN1, lex.KwChanNN:
 		pos := p.tok.Pos
+		multi := ast.ChanMultiNone
+		switch p.tok.Kind {
+		case lex.KwChan11:
+			multi = ast.ChanMulti11
+		case lex.KwChan1N:
+			multi = ast.ChanMulti1N
+		case lex.KwChanN1:
+			multi = ast.ChanMultiN1
+		case lex.KwChanNN:
+			multi = ast.ChanMultiNN
+		}
 		p.advance()
+		// Optional direction modifier: `chan read T` / `chan write T`.
+		// `read` and `write` aren't reserved keywords (they're builtin
+		// function names matched at codegen), so we peek the identifier
+		// text. Plain `chan T` is bidirectional. Multiplicity-contracted
+		// forms accept the same direction modifier (the contract is on
+		// the channel value; direction narrows a handle of it).
+		dir := ast.ChanBoth
+		if p.tok.Kind == lex.Ident && (p.tok.Text == "read" || p.tok.Text == "write") {
+			if p.tok.Text == "read" {
+				dir = ast.ChanRead
+			} else {
+				dir = ast.ChanWrite
+			}
+			p.advance()
+		}
 		elem := p.parseType()
 		if elem == nil {
 			return nil
 		}
-		return &ast.ChanType{P: pos, Elem: elem}
+		return &ast.ChanType{P: pos, Elem: elem, Dir: dir, Multi: multi}
 	case lex.KwAtomic:
 		pos := p.tok.Pos
 		p.advance()
@@ -333,9 +313,133 @@ func (p *Parser) parseType() ast.Type {
 		name := p.tok.Text
 		p.advance()
 		return &ast.NamedType{P: pos, Name: name}
+	case lex.KwFun:
+		return p.parseFuncType()
 	}
 	p.errorf("expected type, got %s", p.tok.Kind)
 	return nil
+}
+
+// parseFuncType parses `fun(T, ...) R` (unnamed-param form, allowed
+// only in type position) or `fun(name T, ...) R` (named-param form) as
+// a TYPE expression. One-token lookahead disambiguates: if the first
+// param token is an Ident followed by `,` or `)`, it's a bare type;
+// otherwise it's `name type`. Distinguished from FuncLit by the
+// absence of a trailing `{` body.
+func (p *Parser) parseFuncType() ast.Type {
+	start := p.tok.Pos
+	p.advance() // consume `fun`
+	if !p.expect(lex.LParen) {
+		return nil
+	}
+	var params []*ast.Param
+	for p.tok.Kind != lex.RParen && p.tok.Kind != lex.EOF {
+		pPos := p.tok.Pos
+		var pName string
+		// "name type" if Ident followed by something that can start a
+		// type AND isn't `,` or `)`. Otherwise treat as bare type.
+		if p.tok.Kind == lex.Ident {
+			pk := p.peekKind()
+			if pk != lex.Comma && pk != lex.RParen && canStartType(pk) {
+				pName = p.tok.Text
+				p.advance()
+			}
+		}
+		t := p.parseType()
+		if t == nil {
+			return nil
+		}
+		params = append(params, &ast.Param{P: pPos, Name: pName, Type: t})
+		if p.tok.Kind == lex.Comma {
+			p.advance()
+			continue
+		}
+		break
+	}
+	if !p.expect(lex.RParen) {
+		return nil
+	}
+	var results []ast.Type
+	switch {
+	case p.tok.Kind == lex.LBrace, p.tok.Kind == lex.Semi:
+		// no return type
+	case p.tok.Kind == lex.LParen:
+		p.advance()
+		for p.tok.Kind != lex.RParen && p.tok.Kind != lex.EOF {
+			t := p.parseType()
+			if t != nil {
+				results = append(results, t)
+			}
+			if p.tok.Kind == lex.Comma {
+				p.advance()
+			}
+		}
+		p.expect(lex.RParen)
+	default:
+		if canStartType(p.tok.Kind) {
+			t := p.parseType()
+			if t != nil {
+				results = append(results, t)
+			}
+		}
+	}
+	return &ast.FuncType{P: start, Params: params, Results: results}
+}
+
+// parseFuncSignature parses `(name T, ...) R | (R1, R2)` — the param
+// list followed by an optional return-type list. Used by FuncDecl,
+// FuncType, and FuncLit. All three follow the same grammar; the
+// caller adds the body / name / etc. around it.
+func (p *Parser) parseFuncSignature() (params []*ast.Param, results []ast.Type, ok bool) {
+	if !p.expect(lex.LParen) {
+		return nil, nil, false
+	}
+	for p.tok.Kind != lex.RParen && p.tok.Kind != lex.EOF {
+		if p.tok.Kind != lex.Ident {
+			p.errorf("expected parameter name, got %s", p.tok.Kind)
+			return nil, nil, false
+		}
+		pName := p.tok.Text
+		pPos := p.tok.Pos
+		p.advance()
+		t := p.parseType()
+		if t == nil {
+			return nil, nil, false
+		}
+		params = append(params, &ast.Param{P: pPos, Name: pName, Type: t})
+		if p.tok.Kind == lex.Comma {
+			p.advance()
+			continue
+		}
+		break
+	}
+	if !p.expect(lex.RParen) {
+		return nil, nil, false
+	}
+	switch {
+	case p.tok.Kind == lex.LBrace, p.tok.Kind == lex.Semi:
+		// no return type
+	case p.tok.Kind == lex.LParen:
+		p.advance()
+		for p.tok.Kind != lex.RParen && p.tok.Kind != lex.EOF {
+			t := p.parseType()
+			if t != nil {
+				results = append(results, t)
+			}
+			if p.tok.Kind == lex.Comma {
+				p.advance()
+			}
+		}
+		p.expect(lex.RParen)
+	default:
+		if canStartType(p.tok.Kind) {
+			t := p.parseType()
+			if t != nil {
+				results = append(results, t)
+			}
+		}
+	}
+	return params, results, true
 }
 
 // parseNewExpr parses the full `new` expression grammar:
@@ -388,14 +492,18 @@ func (p *Parser) parseNewExpr() ast.Expr {
 }
 
 // canStartType reports whether tok could begin a volt type — Ident,
-// `&T`, `*T`, `[]T`, `chan T`, `map[K]V`, `interface{...}`,
+// `&T`, `*T`, `[]T`, `chan T` (or contract-typed `chan11 T`,
+// `chan1N T`, `chanN1 T`, `chanNN T`), `map[K]V`, `interface{...}`,
 // `atomic T`, `mutex T`, `rwmutex T`, `waitgroup`, `once`.
 func canStartType(k lex.Kind) bool {
 	switch k {
 	case lex.Ident, lex.Amp, lex.Star, lex.LBrack,
-		lex.KwChan, lex.KwMap, lex.KwInterface,
+		lex.KwChan, lex.KwChan11, lex.KwChan1N,
+		lex.KwChanN1, lex.KwChanNN,
+		lex.KwMap, lex.KwInterface,
 		lex.KwAtomic, lex.KwMutex, lex.KwRwMutex,
-		lex.KwWaitgroup, lex.KwOnce:
+		lex.KwWaitgroup, lex.KwOnce,
+		lex.KwFun:
 		return true
 	}
 	return false
@@ -503,9 +611,10 @@ func (p *Parser) parseSliceLit() ast.Expr {
 	return lit
 }
 
-// parseInterfaceType parses `interface { Name(args) result; ... }`.
-// v0.7 records the methods but doesn't enforce satisfaction or do
-// dynamic dispatch.
+// parseInterfaceType parses `interface { Name(params) result; ... }`.
+// Each method's signature is captured as a `*ast.FuncType` stored in
+// the Field's Type, so codegen can dispatch with the right LLVM
+// signature at call sites.
 func (p *Parser) parseInterfaceType() *ast.InterfaceType {
 	start := p.tok.Pos
 	p.advance() // consume `interface`
@@ -515,7 +624,6 @@ func (p *Parser) parseInterfaceType() *ast.InterfaceType {
 	it := &ast.InterfaceType{P: start}
 	p.skipSemis()
 	for p.tok.Kind != lex.RBrace && p.tok.Kind != lex.EOF {
-		// Method spec: Name(params) result
 		if p.tok.Kind != lex.Ident {
 			p.errorf("expected method name, got %s", p.tok.Kind)
 			break
@@ -523,30 +631,12 @@ func (p *Parser) parseInterfaceType() *ast.InterfaceType {
 		mPos := p.tok.Pos
 		mName := p.tok.Text
 		p.advance()
-		// Skip the signature opaquely — we just need to consume tokens.
-		// (Real codegen for interfaces would record this; v0.7 doesn't.)
-		if p.tok.Kind == lex.LParen {
-			depth := 0
-			for {
-				if p.tok.Kind == lex.LParen {
-					depth++
-				} else if p.tok.Kind == lex.RParen {
-					depth--
-					if depth == 0 {
-						p.advance()
-						break
-					}
-				} else if p.tok.Kind == lex.EOF {
-					break
-				}
-				p.advance()
-			}
-			// Optional return type or list (also consumed opaquely up to ;/}).
-			for p.tok.Kind != lex.Semi && p.tok.Kind != lex.RBrace && p.tok.Kind != lex.EOF {
-				p.advance()
-			}
+		params, results, ok := p.parseFuncSignature()
+		if !ok {
+			return nil
 		}
-		it.Methods = append(it.Methods, &ast.Field{P: mPos, Name: mName})
+		ft := &ast.FuncType{P: mPos, Params: params, Results: results}
+		it.Methods = append(it.Methods, &ast.Field{P: mPos, Name: mName, Type: ft})
 		p.expect(lex.Semi)
 		p.skipSemis()
 	}
@@ -911,6 +1001,22 @@ func (p *Parser) parseSimpleStmt() ast.Stmt {
 			p.advance()
 			rhs := p.parseExpr()
 			return &ast.VarStmt{P: id.P, Name: id.Name, Type: nil, Value: rhs}
+		case lex.Inc, lex.Dec:
+			// `x++` / `x--` desugar to `x = x + 1` / `x = x - 1`.
+			// Body of for-loop post-statement uses this all the time;
+			// also legal as a standalone statement.
+			op := "+"
+			if p.tok.Kind == lex.Dec {
+				op = "-"
+			}
+			pos := p.tok.Pos
+			p.advance()
+			one := &ast.IntLit{P: pos, Value: 1, Text: "1"}
+			return &ast.AssignStmt{
+				P:   pos,
+				LHS: first,
+				RHS: &ast.BinaryExpr{P: pos, Op: op, X: first, Y: one},
+			}
 		case lex.Arrow:
 			p.errorf("`ch <- value` send form removed; use `write(ch, value)` instead")
 			p.advance()
@@ -959,25 +1065,27 @@ func (p *Parser) parseForStmt() *ast.ForStmt {
 		return &ast.ForStmt{P: start, Body: p.parseBlock()}
 	}
 
+	// Range form: `for i := range EXPR { ... }` or
+	//             `for i, v := range EXPR { ... }`.
+	// Detect by peeking ahead — if the first token is an Ident
+	// followed by either ":=" or "," <Ident> ":= range", we're in the
+	// range form. Bail out via a dedicated path.
+	if p.tok.Kind == lex.Ident && p.isRangeForm() {
+		return p.parseRangeFor(start)
+	}
+
 	// Otherwise: parse a leading clause. Either:
 	//   `for cond { ... }`           (Cond only)
 	// or
 	//   `for init; cond; post { ... }`  (Init + Cond + Post)
-	//
-	// Strategy: speculatively parse a simple statement. If the next
-	// token is `;`, it was Init; consume the semi and continue.
-	// Otherwise, that simple statement IS the condition (and must
-	// have been an expression-statement).
-
 	var init ast.Stmt
 	var cond ast.Expr
 	var post ast.Stmt
 
 	first := p.parseSimpleStmt()
 	if p.tok.Kind == lex.Semi {
-		// First chunk was Init; need Cond and Post.
 		init = first
-		p.advance() // consume ';'
+		p.advance()
 		if p.tok.Kind != lex.Semi && p.tok.Kind != lex.LBrace {
 			cond = p.parseExpr()
 		}
@@ -988,7 +1096,6 @@ func (p *Parser) parseForStmt() *ast.ForStmt {
 			}
 		}
 	} else {
-		// First chunk was the condition. It must be an expression statement.
 		if es, ok := first.(*ast.ExprStmt); ok {
 			cond = es.Expr
 		} else {
@@ -1000,13 +1107,92 @@ func (p *Parser) parseForStmt() *ast.ForStmt {
 	return &ast.ForStmt{P: start, Init: init, Cond: cond, Post: post, Body: body}
 }
 
+// isRangeForm peeks ahead to decide whether what follows `for` is the
+// range form. Positioned on the first Ident. Range form looks like:
+//   for IDENT := range EXPR              → IDENT `:=` `range`
+//   for IDENT , IDENT := range EXPR      → IDENT `,` IDENT `:=` `range`
+// The distinguishing token is `range` — the comma alone is enough on
+// its own (no other for-statement starts with `IDENT ,`).
+func (p *Parser) isRangeForm() bool {
+	pk := p.peekKind()
+	if pk == lex.Comma {
+		return true
+	}
+	if pk == lex.ColonAssign {
+		// `IDENT :=` could be a C-style init (`i := 0`) or a range
+		// (`i := range s`). Disambiguate by looking 2 tokens ahead.
+		return p.peekKindN(2) == lex.KwRange
+	}
+	return false
+}
+
+// parseRangeFor consumes `IDENT [, IDENT] := range EXPR { BODY }`.
+// Called with `p.tok` on the first identifier.
+func (p *Parser) parseRangeFor(start lex.Pos) *ast.ForStmt {
+	iName := p.tok.Text
+	p.advance()
+	var vName string
+	if p.tok.Kind == lex.Comma {
+		p.advance()
+		if p.tok.Kind != lex.Ident {
+			p.errorf("expected value name after `,` in range, got %s", p.tok.Kind)
+			return nil
+		}
+		vName = p.tok.Text
+		p.advance()
+	}
+	if !p.expect(lex.ColonAssign) {
+		return nil
+	}
+	if p.tok.Kind != lex.KwRange {
+		p.errorf("expected `range`, got %s", p.tok.Kind)
+		return nil
+	}
+	p.advance() // consume `range`
+	over := p.parseExpr()
+	if over == nil {
+		return nil
+	}
+	body := p.parseBlock()
+	return &ast.ForStmt{
+		P:         start,
+		Body:      body,
+		RangeI:    iName,
+		RangeV:    vName,
+		RangeOver: over,
+	}
+}
+
 func (p *Parser) parseIfStmt() *ast.IfStmt {
 	start := p.tok.Pos
 	p.advance() // consume `if`
-	cond := p.parseExpr()
+
+	// Optional init clause: `if STMT; COND { ... }`. The STMT is a
+	// SimpleStmt (var decl, multi-var decl, assignment, expression).
+	// We detect this by parsing greedily and checking for a `;` before
+	// the block-opening `{`. If we hit `{` first, the parsed thing is
+	// just the condition.
+	var initStmt ast.Stmt
+	first := p.parseSimpleStmt()
+	var cond ast.Expr
+	if p.tok.Kind == lex.Semi {
+		// Confirmed init clause — first was the init statement; parse cond next.
+		initStmt = first
+		p.advance() // consume `;`
+		cond = p.parseExpr()
+	} else {
+		// No semicolon — `first` must have been an ExprStmt; pull its expr out.
+		es, ok := first.(*ast.ExprStmt)
+		if !ok {
+			p.errorf("expected expression as if-condition, got statement")
+			return nil
+		}
+		cond = es.Expr
+	}
 	if cond == nil {
 		return nil
 	}
+
 	then := p.parseBlock()
 	if then == nil {
 		return nil
@@ -1024,7 +1210,7 @@ func (p *Parser) parseIfStmt() *ast.IfStmt {
 			p.errorf("expected 'if' or '{' after else, got %s", p.tok.Kind)
 		}
 	}
-	return &ast.IfStmt{P: start, Cond: cond, Then: then, Else: elseStmt}
+	return &ast.IfStmt{P: start, Init: initStmt, Cond: cond, Then: then, Else: elseStmt}
 }
 
 func (p *Parser) parseVarStmt() *ast.VarStmt {
@@ -1134,6 +1320,12 @@ func (p *Parser) parsePrimary() ast.Expr {
 		}
 		x = &ast.IntLit{P: p.tok.Pos, Value: n, Text: p.tok.Text}
 		p.advance()
+	case lex.Float:
+		// Strip `_` digit separators; LLVM's float literal grammar
+		// doesn't accept them.
+		text := strings.ReplaceAll(p.tok.Text, "_", "")
+		x = &ast.FloatLit{P: p.tok.Pos, Text: text}
+		p.advance()
 	case lex.KwTrue:
 		x = &ast.BoolLit{P: p.tok.Pos, Value: true}
 		p.advance()
@@ -1143,6 +1335,19 @@ func (p *Parser) parsePrimary() ast.Expr {
 	case lex.KwNil:
 		x = &ast.NilLit{P: p.tok.Pos}
 		p.advance()
+	case lex.KwFun:
+		// Anonymous function literal: `fun(name T, ...) R { body }`.
+		// Distinguished from a top-level `fun NAME(...)` declaration by
+		// the absence of an Ident after `fun` — here we're in expression
+		// position, so the parens come straight after.
+		start := p.tok.Pos
+		p.advance() // consume `fun`
+		params, results, ok := p.parseFuncSignature()
+		if !ok {
+			return nil
+		}
+		body := p.parseBlock()
+		x = &ast.FuncLit{P: start, Params: params, Results: results, Body: body}
 	case lex.KwNew:
 		x = p.parseNewExpr()
 	case lex.LBrack:
@@ -1251,7 +1456,31 @@ func binaryOp(k lex.Kind) (string, int) {
 
 // ---------- helpers ----------
 
-func (p *Parser) advance() { p.tok = p.lexer.Next() }
+func (p *Parser) advance() {
+	if len(p.peek) > 0 {
+		p.tok = p.peek[0]
+		p.peek = p.peek[1:]
+		return
+	}
+	p.tok = p.lexer.Next()
+}
+
+// peekKind returns the kind of the token AFTER the current one. Equivalent
+// to peekKindN(1). Used for short-range disambiguation (e.g. fn-type vs
+// fn-decl param shape).
+func (p *Parser) peekKind() lex.Kind {
+	return p.peekKindN(1)
+}
+
+// peekKindN returns the kind of the n-th token AFTER the current one
+// (1-indexed). Used by the for-loop parser to distinguish range-form
+// (`IDENT := range ...`) from C-style (`IDENT := EXPR ; ...`).
+func (p *Parser) peekKindN(n int) lex.Kind {
+	for len(p.peek) < n {
+		p.peek = append(p.peek, p.lexer.Next())
+	}
+	return p.peek[n-1].Kind
+}
 
 func (p *Parser) expect(k lex.Kind) bool {
 	if p.tok.Kind == k {

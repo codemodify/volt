@@ -30,6 +30,33 @@
         "scopeName": "source.volt",
         "path": "./syntaxes/volt.tmLanguage.json"
       }
-    ]
+    ],
+    "configurationDefaults": {
+      "[volt]": {
+        "editor.tokenColorCustomizations": {
+          "textMateRules": [
+            {
+              "scope": "keyword.control.type.volt",
+              "settings": { "foreground": "#FF79C6" }
+            },
+            {
+              "scope": [
+                "keyword.control.volt",
+                "keyword.control.concurrency.volt",
+                "keyword.operator.new.volt",
+                "keyword.declaration.volt",
+                "keyword.declaration.variable.volt",
+                "keyword.declaration.type.volt",
+                "keyword.declaration.function.volt",
+                "keyword.other.package.volt",
+                "keyword.other.import.volt",
+                "storage.type.volt"
+              ],
+              "settings": { "foreground": "#569CD6" }
+            }
+          ]
+        }
+      }
+    }
   }
 }
