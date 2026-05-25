@@ -33,13 +33,13 @@ func buildCompiler(t *testing.T) string {
 	return out
 }
 
-// runCase compiles testdata/<name>.volt and runs the resulting binary,
+// runCase compiles tests-internal/<name>.volt and runs the resulting binary,
 // returning its exit code, stdout, and stderr.
 func runCase(t *testing.T, volt, name string) (exit int, stdout, stderr string) {
 	t.Helper()
 	root := projectRoot(t)
 	dir := t.TempDir()
-	src := filepath.Join(root, "testdata", name+".volt")
+	src := filepath.Join(root, "tests-internal", name+".volt")
 
 	build := exec.Command(volt, "build", src)
 	build.Dir = dir
@@ -114,6 +114,15 @@ func TestExitCodes(t *testing.T) {
 		{"run_sync", 42},     // run greet(): real-thread spawn; main returns 42
 		{"chan_basic", 42},   // push 1..6, drain+sum, *2
 		{"concurrent", 42},   // 2 OS threads + blocking chan + done signal
+		{"multireturn", 42},  // divmod(17,5) → q + r*20 - 1
+		{"breakcontinue", 42},// sum odd 1..15 with continue, break > 15
+		{"const_basic", 42},  // FORTY + TWO
+		{"maps", 42},         // map[string]int set/get/len
+		{"chan_close", 42},   // close() + v,ok recv
+		{"select_basic", 42}, // select picks ready case
+		{"select_default", 42}, // select with default
+		{"drop", 42},               // automatic Drop() at scope exit
+		{"return_param_borrow", 42}, // returning a borrow of a param is OK
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -143,7 +152,7 @@ func TestGreet(t *testing.T) {
 func TestBorrowCheckerRejects(t *testing.T) {
 	volt := buildCompiler(t)
 	root := projectRoot(t)
-	src := filepath.Join(root, "testdata", "use_after_move.volt")
+	src := filepath.Join(root, "tests-internal", "use_after_move.volt")
 	cmd := exec.Command(volt, "build", src)
 	cmd.Dir = t.TempDir()
 	var stderr bytes.Buffer
@@ -163,12 +172,12 @@ func TestBorrowCheckerNegatives(t *testing.T) {
 	cases := []struct {
 		name, expect string
 	}{
-		{"aliasing", "aliasing-XOR-mutation"},
+		{"aliasing", "multiple read/write accesses in the same call"},
 		{"move_xpkg", "use of moved value"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			src := filepath.Join(root, "testdata", c.name+".volt")
+			src := filepath.Join(root, "tests-internal", c.name+".volt")
 			cmd := exec.Command(volt, "build", src)
 			cmd.Dir = t.TempDir()
 			var stderr bytes.Buffer

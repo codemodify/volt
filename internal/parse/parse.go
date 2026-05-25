@@ -65,6 +65,7 @@ func (p *Parser) ParseFile() (*ast.File, error) {
 		p.skipSemis()
 	}
 
+	f.Comments = p.lexer.Comments()
 	return f, p.error()
 }
 
@@ -273,6 +274,38 @@ func (p *Parser) parseType() ast.Type {
 			return nil
 		}
 		return &ast.ChanType{P: pos, Elem: elem}
+	case lex.KwAtomic:
+		pos := p.tok.Pos
+		p.advance()
+		elem := p.parseType()
+		if elem == nil {
+			return nil
+		}
+		return &ast.AtomicType{P: pos, Elem: elem}
+	case lex.KwMutex:
+		pos := p.tok.Pos
+		p.advance()
+		elem := p.parseType()
+		if elem == nil {
+			return nil
+		}
+		return &ast.MutexType{P: pos, Elem: elem}
+	case lex.KwRwMutex:
+		pos := p.tok.Pos
+		p.advance()
+		elem := p.parseType()
+		if elem == nil {
+			return nil
+		}
+		return &ast.RwMutexType{P: pos, Elem: elem}
+	case lex.KwWaitgroup:
+		pos := p.tok.Pos
+		p.advance()
+		return &ast.WaitgroupType{P: pos}
+	case lex.KwOnce:
+		pos := p.tok.Pos
+		p.advance()
+		return &ast.OnceType{P: pos}
 	case lex.KwMap:
 		pos := p.tok.Pos
 		p.advance()
@@ -293,6 +326,8 @@ func (p *Parser) parseType() ast.Type {
 		return &ast.MapType{P: pos, Key: k, Value: v}
 	case lex.KwStruct:
 		return p.parseStructType()
+	case lex.KwInterface:
+		return p.parseInterfaceType()
 	case lex.Ident:
 		pos := p.tok.Pos
 		name := p.tok.Text
@@ -303,56 +338,141 @@ func (p *Parser) parseType() ast.Type {
 	return nil
 }
 
-// parseNewExpr parses `new T{...}` or `new T(args)`. v0.4 scope: only
-// the explicit-type forms; LHS-inferred `new(...)` is not yet supported
-// (would need expression-context type inference).
+// parseNewExpr parses the full `new` expression grammar:
+//
+//	new T              new(s) T         new T{i}         new(s) T{i}    // long form
+//	                   new(s)           new{i}           new(s){i}      // short form
+//
+// Size always comes immediately after `new` (between the `new` keyword
+// and the type). In the short form, the type is omitted and the LHS
+// of the same `=` must supply it (see emitVar in codegen).
 func (p *Parser) parseNewExpr() ast.Expr {
 	start := p.tok.Pos
 	p.advance() // consume `new`
 
-	t := p.parseType()
-	if t == nil {
-		return nil
-	}
+	expr := &ast.NewExpr{P: start}
 
-	expr := &ast.NewExpr{P: start, Type: t}
-	switch p.tok.Kind {
-	case lex.LBrace:
-		p.advance()
-		p.skipSemis()
-		for p.tok.Kind != lex.RBrace && p.tok.Kind != lex.EOF {
-			if p.tok.Kind != lex.Ident {
-				p.errorf("expected field name in composite literal, got %s", p.tok.Kind)
-				break
-			}
-			kvPos := p.tok.Pos
-			key := p.tok.Text
-			p.advance()
-			if !p.expect(lex.Colon) {
-				break
-			}
-			val := p.parseExpr()
-			expr.Pairs = append(expr.Pairs, &ast.KeyValuePair{P: kvPos, Key: key, Value: val})
-			if p.tok.Kind == lex.Comma {
-				p.advance()
-			}
-			p.skipSemis()
-		}
-		p.expect(lex.RBrace)
-	case lex.LParen:
+	// Optional `(sizeArgs)` — always comes immediately after `new`.
+	if p.tok.Kind == lex.LParen {
+		expr.HasParens = true
 		p.advance()
 		for p.tok.Kind != lex.RParen && p.tok.Kind != lex.EOF {
-			expr.Args = append(expr.Args, p.parseExpr())
+			expr.SizeArgs = append(expr.SizeArgs, p.parseExpr())
 			if p.tok.Kind == lex.Comma {
 				p.advance()
 			}
 		}
 		p.expect(lex.RParen)
-	default:
-		// Bare `new T` — default-construct (e.g. `new map[K]V`,
-		// `new chan T` for unbuffered). Args/Pairs stay nil.
 	}
+
+	// Optional type — present when the next token can start a type.
+	// `{` cannot start a type; that's the start of the init block.
+	if canStartType(p.tok.Kind) {
+		t := p.parseType()
+		if t == nil {
+			return nil
+		}
+		expr.Type = t
+	}
+
+	// Optional `{init}` part.
+	if p.tok.Kind == lex.LBrace {
+		expr.HasBraces = true
+		p.advance()
+		p.skipSemis()
+		p.parseNewBraceItems(expr)
+		p.expect(lex.RBrace)
+	}
+
 	return expr
+}
+
+// canStartType reports whether tok could begin a volt type — Ident,
+// `&T`, `*T`, `[]T`, `chan T`, `map[K]V`, `interface{...}`,
+// `atomic T`, `mutex T`, `rwmutex T`, `waitgroup`, `once`.
+func canStartType(k lex.Kind) bool {
+	switch k {
+	case lex.Ident, lex.Amp, lex.Star, lex.LBrack,
+		lex.KwChan, lex.KwMap, lex.KwInterface,
+		lex.KwAtomic, lex.KwMutex, lex.KwRwMutex,
+		lex.KwWaitgroup, lex.KwOnce:
+		return true
+	}
+	return false
+}
+
+// parseNewBraceItems classifies each `{...}` item by its leading token:
+//
+//	IDENT ':' expr   → struct field (Pairs)
+//	<expr> ':' expr  → map entry    (MapEntries)
+//	<expr>           → slice elem   (SliceElems)
+//
+// Mixing kinds within one literal is an error, but we capture them
+// separately rather than failing here — the checker can produce a
+// better message with the LHS type in hand.
+func (p *Parser) parseNewBraceItems(expr *ast.NewExpr) {
+	for p.tok.Kind != lex.RBrace && p.tok.Kind != lex.EOF {
+		itemPos := p.tok.Pos
+
+		// Struct field shortcut: IDENT directly followed by `:`.
+		if p.tok.Kind == lex.Ident {
+			name := p.tok.Text
+			save := p.tok
+			p.advance()
+			if p.tok.Kind == lex.Colon {
+				p.advance()
+				val := p.parseExpr()
+				expr.Pairs = append(expr.Pairs, &ast.KeyValuePair{P: itemPos, Key: name, Value: val})
+				if p.tok.Kind == lex.Comma {
+					p.advance()
+				}
+				p.skipSemis()
+				continue
+			}
+			// IDENT but no `:` — re-interpret as the start of an expression.
+			// Re-wind: emit an IdentExpr from the saved token and continue
+			// parsing the rest of the expression around it.
+			ident := &ast.IdentExpr{P: save.Pos, Name: name}
+			e := p.continueExprFrom(ident)
+			if p.tok.Kind == lex.Colon {
+				p.advance()
+				val := p.parseExpr()
+				expr.MapEntries = append(expr.MapEntries, &ast.MapEntry{P: itemPos, Key: e, Value: val})
+			} else {
+				expr.SliceElems = append(expr.SliceElems, e)
+			}
+			if p.tok.Kind == lex.Comma {
+				p.advance()
+			}
+			p.skipSemis()
+			continue
+		}
+
+		// Anything else: parse a full expression, then check for `:`.
+		e := p.parseExpr()
+		if p.tok.Kind == lex.Colon {
+			p.advance()
+			val := p.parseExpr()
+			expr.MapEntries = append(expr.MapEntries, &ast.MapEntry{P: itemPos, Key: e, Value: val})
+		} else {
+			expr.SliceElems = append(expr.SliceElems, e)
+		}
+		if p.tok.Kind == lex.Comma {
+			p.advance()
+		}
+		p.skipSemis()
+	}
+}
+
+// continueExprFrom takes a partially-parsed primary expression and
+// continues parsing any suffixes (call, index, selector) plus any
+// trailing binary operators at default precedence.
+//
+// In v0.5 we only need a minimal version: return the primary as-is.
+// Future: support `a.b`, `a[i]`, `a + b` here so map keys can be
+// arbitrary expressions starting with an Ident.
+func (p *Parser) continueExprFrom(prim ast.Expr) ast.Expr {
+	return prim
 }
 
 // parseSliceLit parses `[]T{e1, e2, ...}` as an expression.
@@ -381,6 +501,57 @@ func (p *Parser) parseSliceLit() ast.Expr {
 	}
 	p.expect(lex.RBrace)
 	return lit
+}
+
+// parseInterfaceType parses `interface { Name(args) result; ... }`.
+// v0.7 records the methods but doesn't enforce satisfaction or do
+// dynamic dispatch.
+func (p *Parser) parseInterfaceType() *ast.InterfaceType {
+	start := p.tok.Pos
+	p.advance() // consume `interface`
+	if !p.expect(lex.LBrace) {
+		return nil
+	}
+	it := &ast.InterfaceType{P: start}
+	p.skipSemis()
+	for p.tok.Kind != lex.RBrace && p.tok.Kind != lex.EOF {
+		// Method spec: Name(params) result
+		if p.tok.Kind != lex.Ident {
+			p.errorf("expected method name, got %s", p.tok.Kind)
+			break
+		}
+		mPos := p.tok.Pos
+		mName := p.tok.Text
+		p.advance()
+		// Skip the signature opaquely — we just need to consume tokens.
+		// (Real codegen for interfaces would record this; v0.7 doesn't.)
+		if p.tok.Kind == lex.LParen {
+			depth := 0
+			for {
+				if p.tok.Kind == lex.LParen {
+					depth++
+				} else if p.tok.Kind == lex.RParen {
+					depth--
+					if depth == 0 {
+						p.advance()
+						break
+					}
+				} else if p.tok.Kind == lex.EOF {
+					break
+				}
+				p.advance()
+			}
+			// Optional return type or list (also consumed opaquely up to ;/}).
+			for p.tok.Kind != lex.Semi && p.tok.Kind != lex.RBrace && p.tok.Kind != lex.EOF {
+				p.advance()
+			}
+		}
+		it.Methods = append(it.Methods, &ast.Field{P: mPos, Name: mName})
+		p.expect(lex.Semi)
+		p.skipSemis()
+	}
+	p.expect(lex.RBrace)
+	return it
 }
 
 func (p *Parser) parseStructType() *ast.StructType {
@@ -453,6 +624,8 @@ func (p *Parser) parseStmt() ast.Stmt {
 		return p.parseRunStmt()
 	case lex.KwSwitch:
 		return p.parseSwitchStmt()
+	case lex.KwSelect:
+		return p.parseSelectStmt()
 	case lex.KwBreak:
 		s := &ast.BreakStmt{P: p.tok.Pos}
 		p.advance()
@@ -523,6 +696,172 @@ func (p *Parser) parseCaseClause() *ast.CaseClause {
 	return cc
 }
 
+// parseSelectStmt parses `select { case ...: ... }`. Each case is one of:
+//
+//	case read(ch):                   recv-discard
+//	case v := read(ch):              recv into v
+//	case v, ok := read(ch):          recv with ok
+//	case write(ch, value):           send
+//	default:
+func (p *Parser) parseSelectStmt() *ast.SelectStmt {
+	start := p.tok.Pos
+	p.advance() // consume `select`
+	if !p.expect(lex.LBrace) {
+		return nil
+	}
+	s := &ast.SelectStmt{P: start}
+	p.skipSemis()
+	for p.tok.Kind != lex.RBrace && p.tok.Kind != lex.EOF {
+		c := p.parseSelectCase()
+		if c != nil {
+			s.Cases = append(s.Cases, c)
+		}
+		p.skipSemis()
+	}
+	p.expect(lex.RBrace)
+	return s
+}
+
+func (p *Parser) parseSelectCase() *ast.SelectCase {
+	cs := &ast.SelectCase{P: p.tok.Pos}
+	switch p.tok.Kind {
+	case lex.KwDefault:
+		p.advance()
+		cs.IsDefault = true
+	case lex.KwCase:
+		p.advance()
+		if p.tok.Kind == lex.Arrow {
+			p.errorf("`<-ch` receive form removed in select; use `read(ch)`")
+			return nil
+		}
+		// Parse the first expression. Then dispatch on what follows.
+		{
+			first := p.parseExpr()
+			if first == nil {
+				return nil
+			}
+			switch p.tok.Kind {
+			case lex.Comma:
+				// `case v, ok := read(ch):` or legacy `v, ok := <-ch`
+				p.advance()
+				second := p.parseExpr()
+				id1, ok1 := first.(*ast.IdentExpr)
+				id2, ok2 := second.(*ast.IdentExpr)
+				if !ok1 || !ok2 {
+					p.errorf("%s: select case recv LHS must be identifiers", first.Pos())
+					return nil
+				}
+				if !p.expect(lex.ColonAssign) {
+					return nil
+				}
+				ch := p.parseSelectRecvSource()
+				if ch == nil {
+					return nil
+				}
+				cs.Channel = ch
+				cs.RecvNames = []string{id1.Name, id2.Name}
+			case lex.ColonAssign:
+				// `case v := read(ch):` or legacy `v := <-ch`
+				id, ok := first.(*ast.IdentExpr)
+				if !ok {
+					p.errorf("%s: select case recv LHS must be an identifier", first.Pos())
+					return nil
+				}
+				p.advance()
+				ch := p.parseSelectRecvSource()
+				if ch == nil {
+					return nil
+				}
+				cs.Channel = ch
+				cs.RecvNames = []string{id.Name}
+			case lex.Arrow:
+				p.errorf("`ch <- value` send form removed; use `case write(ch, value):` instead")
+				return nil
+			case lex.Colon:
+				// Either `case read(ch):` (recv-discard) or
+				// `case write(ch, v):` (send).
+				if ch := extractReadChannel(first); ch != nil {
+					cs.Channel = ch
+				} else if ch, v := extractWriteCall(first); ch != nil {
+					cs.Channel = ch
+					cs.SendValue = v
+				} else {
+					p.errorf("%s: select case must be `read(ch)`, `v := read(ch)`, `v, ok := read(ch)`, or `write(ch, v)`", first.Pos())
+					return nil
+				}
+			default:
+				p.errorf("%s: unexpected token %s in select case", p.tok.Pos, p.tok.Kind)
+				return nil
+			}
+		}
+	default:
+		p.errorf("expected 'case' or 'default' in select, got %s", p.tok.Kind)
+		return nil
+	}
+	if !p.expect(lex.Colon) {
+		return nil
+	}
+	p.skipSemis()
+	for p.tok.Kind != lex.KwCase && p.tok.Kind != lex.KwDefault &&
+		p.tok.Kind != lex.RBrace && p.tok.Kind != lex.EOF {
+		s := p.parseStmt()
+		if s != nil {
+			cs.Body = append(cs.Body, s)
+		}
+		if p.tok.Kind != lex.RBrace {
+			p.expect(lex.Semi)
+		}
+		p.skipSemis()
+	}
+	return cs
+}
+
+// parseSelectRecvSource parses the channel-source part of a select recv
+// case, after `:=`. The only accepted form is `read(ch)`.
+func (p *Parser) parseSelectRecvSource() ast.Expr {
+	if p.tok.Kind == lex.Arrow {
+		p.errorf("`<-ch` receive form removed; use `read(ch)`")
+		return nil
+	}
+	rhs := p.parseExpr()
+	if ch := extractReadChannel(rhs); ch != nil {
+		return ch
+	}
+	if rhs != nil {
+		p.errorf("%s: select case recv source must be `read(ch)`", rhs.Pos())
+	}
+	return nil
+}
+
+// extractReadChannel returns the channel expression inside a `read(ch)`
+// call, or nil if `e` is not a one-arg call to `read`.
+func extractReadChannel(e ast.Expr) ast.Expr {
+	call, ok := e.(*ast.CallExpr)
+	if !ok {
+		return nil
+	}
+	fn, ok := call.Fun.(*ast.IdentExpr)
+	if !ok || fn.Name != "read" || len(call.Args) != 1 {
+		return nil
+	}
+	return call.Args[0]
+}
+
+// extractWriteCall returns (channel, value) for a `write(ch, v)` call,
+// or (nil, nil) if `e` is not a two-arg call to `write`. Used by the
+// select-case parser to recognize the canonical send form.
+func extractWriteCall(e ast.Expr) (ast.Expr, ast.Expr) {
+	call, ok := e.(*ast.CallExpr)
+	if !ok {
+		return nil, nil
+	}
+	fn, ok := call.Fun.(*ast.IdentExpr)
+	if !ok || fn.Name != "write" || len(call.Args) != 2 {
+		return nil, nil
+	}
+	return call.Args[0], call.Args[1]
+}
+
 func (p *Parser) parseDeferStmt() *ast.DeferStmt {
 	start := p.tok.Pos
 	p.advance() // consume `def`
@@ -547,8 +886,9 @@ func (p *Parser) parseRunStmt() *ast.RunStmt {
 	return &ast.RunStmt{P: start, Call: call}
 }
 
-// parseSimpleStmt: expression, assignment, short var decl, send, or
+// parseSimpleStmt: expression, assignment, short var decl, or
 // multi-LHS variants (`a, b = foo()` / `a, b := foo()`).
+// Channel sends use the `write(ch, v)` built-in, not the `<-` operator.
 func (p *Parser) parseSimpleStmt() ast.Stmt {
 	first := p.parseExpr()
 	if first == nil {
@@ -572,10 +912,9 @@ func (p *Parser) parseSimpleStmt() ast.Stmt {
 			rhs := p.parseExpr()
 			return &ast.VarStmt{P: id.P, Name: id.Name, Type: nil, Value: rhs}
 		case lex.Arrow:
-			sendPos := p.tok.Pos
+			p.errorf("`ch <- value` send form removed; use `write(ch, value)` instead")
 			p.advance()
-			rhs := p.parseExpr()
-			return &ast.SendStmt{P: sendPos, Channel: first, Value: rhs}
+			return nil
 		}
 		return &ast.ExprStmt{P: first.Pos(), Expr: first}
 	}
@@ -771,11 +1110,10 @@ func (p *Parser) parseUnary() ast.Expr {
 		x := p.parseUnary()
 		return &ast.UnaryExpr{P: opPos, Op: "-", X: x}
 	case lex.Arrow:
-		// `<-ch` — channel receive.
-		opPos := p.tok.Pos
+		// `<-ch` as an expression is no longer accepted; use `read(ch)`.
+		p.errorf("`<-ch` receive form removed; use `read(ch)` instead")
 		p.advance()
-		x := p.parseUnary()
-		return &ast.UnaryExpr{P: opPos, Op: "<-", X: x}
+		return nil
 	}
 	return p.parsePrimary()
 }
@@ -850,6 +1188,21 @@ func (p *Parser) parsePrimary() ast.Expr {
 }
 
 func (p *Parser) parseCall(fun ast.Expr) ast.Expr {
+	if fun == nil {
+		// Recovery: the caller failed to produce a callee; bail without
+		// dereferencing nil. The caller has already recorded an error.
+		p.advance() // consume '('
+		for p.tok.Kind != lex.RParen && p.tok.Kind != lex.EOF {
+			p.parseExpr()
+			if p.tok.Kind == lex.Comma {
+				p.advance()
+				continue
+			}
+			break
+		}
+		p.expect(lex.RParen)
+		return nil
+	}
 	p.advance() // '('
 	var args []ast.Expr
 	for p.tok.Kind != lex.RParen && p.tok.Kind != lex.EOF {

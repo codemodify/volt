@@ -1,6 +1,8 @@
-# build artifacts
-/empty
-/hello
-/volt
+# Dev convention: binaries built during local development (tests,
+# validation, compiler builds, sample runs) live under .tempbins/ at
+# the repo root. Anything written there is throwaway.
+/.tempbins/
+
+# Intermediate compiler artifacts that may briefly land at the root.
 /*.ll
 /*.o

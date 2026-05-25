@@ -25,7 +25,7 @@
 # status
 - super early ALPHA as of 2026-05-22
 - what can be tried out
-	- language/keywords/syntax @ [testdata](./testdata)
+	- language/keywords/syntax @ [tests-internal](./tests-internal)
 	- concurrency
 	- safety
 	- memory semantics

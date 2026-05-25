@@ -1,6 +1,6 @@
 // Package printer walks a volt AST and emits canonical formatted
-// source. v0.4 covers the common shapes used in testdata; some edge
-// cases may format unconventionally and can be refined later.
+// source. Comments are preserved and interleaved by line position.
+// Blank lines collapse to at most one.
 //
 // Formatting conventions:
 //   - Tabs for indentation (gofmt-style).
@@ -15,18 +15,21 @@ import (
 	"strings"
 
 	"github.com/codemodify/volt/internal/ast"
+	"github.com/codemodify/volt/internal/lex"
 )
 
 // Format returns the canonical source for the given file.
 func Format(file *ast.File) string {
-	p := &printer{}
+	p := &printer{comments: file.Comments}
 	p.printFile(file)
 	return p.b.String()
 }
 
 type printer struct {
-	b      strings.Builder
-	indent int
+	b        strings.Builder
+	indent   int
+	comments []lex.Comment // remaining comments, sorted by source order
+	lastLine int           // last source line we emitted from (for blank-line preservation)
 }
 
 func (p *printer) writeIndent() {
@@ -35,14 +38,131 @@ func (p *printer) writeIndent() {
 	}
 }
 
+// line writes one logical line at the current indent. Tracks no source
+// position — used for printer-synthesized output (braces, separators).
 func (p *printer) line(s string) {
 	p.writeIndent()
 	p.b.WriteString(s)
 	p.b.WriteByte('\n')
 }
 
+// lineAt writes one logical line and attaches any pending comment whose
+// line number matches `srcLine` as a trailing same-line comment. Used
+// for source-derived statements so `var x = 1  // note` round-trips.
+func (p *printer) lineAt(s string, srcLine int) {
+	p.writeIndent()
+	p.b.WriteString(s)
+	if len(p.comments) > 0 && p.comments[0].Pos.Line == srcLine {
+		c := p.comments[0]
+		p.comments = p.comments[1:]
+		p.b.WriteString("  ")
+		p.b.WriteString(c.Text)
+	}
+	p.b.WriteByte('\n')
+	p.markLine(srcLine)
+}
+
 func (p *printer) raw(s string) {
 	p.b.WriteString(s)
+}
+
+// flushCommentsBefore emits any pending comments whose source line is
+// strictly before targetLine. If preserveBlank is true and there is a
+// blank line between the last emitted source line and the first pending
+// comment, one blank line is emitted before the comment.
+func (p *printer) flushCommentsBefore(targetLine int) {
+	for len(p.comments) > 0 && p.comments[0].Pos.Line < targetLine {
+		c := p.comments[0]
+		p.comments = p.comments[1:]
+		if p.lastLine > 0 && c.Pos.Line-p.lastLine > 1 {
+			p.b.WriteByte('\n')
+		}
+		p.writeIndent()
+		p.b.WriteString(c.Text)
+		p.b.WriteByte('\n')
+		p.lastLine = c.Pos.Line + strings.Count(c.Text, "\n")
+	}
+}
+
+// emitBlankIfGap writes a blank line if there's a source-line gap > 1
+// between p.lastLine and the next node's line. No-op for the first
+// emission (lastLine == 0).
+func (p *printer) emitBlankIfGap(nextLine int) {
+	if p.lastLine == 0 {
+		return
+	}
+	if nextLine-p.lastLine > 1 {
+		p.b.WriteByte('\n')
+	}
+}
+
+// markLine records that we just emitted output for source line n.
+func (p *printer) markLine(n int) {
+	if n > p.lastLine {
+		p.lastLine = n
+	}
+}
+
+// endLine returns the approximate last source line a statement occupies,
+// including its closing brace. Used to update lastLine after emitting
+// compound statements so blank-line preservation doesn't misfire.
+func endLine(s ast.Stmt) int {
+	if s == nil {
+		return 0
+	}
+	line := s.Pos().Line
+	walk := func(stmts []ast.Stmt) {
+		for _, ss := range stmts {
+			if l := endLine(ss); l > line {
+				line = l
+			}
+		}
+	}
+	switch s := s.(type) {
+	case *ast.Block:
+		walk(s.Stmts)
+		return line + 1
+	case *ast.IfStmt:
+		if s.Then != nil {
+			walk(s.Then.Stmts)
+		}
+		if s.Else != nil {
+			if l := endLine(s.Else); l > line {
+				line = l
+			}
+		}
+		return line + 1
+	case *ast.ForStmt:
+		if s.Body != nil {
+			walk(s.Body.Stmts)
+		}
+		return line + 1
+	case *ast.SwitchStmt:
+		for _, cc := range s.Cases {
+			walk(cc.Stmts)
+		}
+		return line + 1
+	case *ast.SelectStmt:
+		for _, cc := range s.Cases {
+			walk(cc.Body)
+		}
+		return line + 1
+	}
+	return line
+}
+
+// flushRemaining emits any leftover comments at file end.
+func (p *printer) flushRemaining() {
+	for _, c := range p.comments {
+		if p.lastLine > 0 && c.Pos.Line-p.lastLine > 1 {
+			p.b.WriteByte('\n')
+		}
+		p.writeIndent()
+		p.b.WriteString(c.Text)
+		p.b.WriteByte('\n')
+		p.lastLine = c.Pos.Line + strings.Count(c.Text, "\n")
+	}
+	p.comments = nil
 }
 
 // ---------------------------------------------------------------------
@@ -50,17 +170,28 @@ func (p *printer) raw(s string) {
 // ---------------------------------------------------------------------
 
 func (p *printer) printFile(f *ast.File) {
-	p.line("package " + f.Package)
+	// Leading comments before the package clause.
+	p.flushCommentsBefore(f.P.Line)
+	p.emitBlankIfGap(f.P.Line)
+
+	p.writeIndent()
+	p.raw("package " + f.Package + "\n")
+	p.markLine(f.P.Line)
 
 	if len(f.Imports) > 0 {
-		p.b.WriteByte('\n')
+		firstImpLine := f.Imports[0].P.Line
+		p.flushCommentsBefore(firstImpLine)
+		p.emitBlankIfGap(firstImpLine)
 		if len(f.Imports) == 1 {
 			p.line(`import "` + f.Imports[0].Path + `"`)
+			p.markLine(f.Imports[0].P.Line)
 		} else {
 			p.line("import (")
 			p.indent++
 			for _, im := range f.Imports {
+				p.flushCommentsBefore(im.P.Line)
 				p.line(`"` + im.Path + `"`)
+				p.markLine(im.P.Line)
 			}
 			p.indent--
 			p.line(")")
@@ -68,9 +199,22 @@ func (p *printer) printFile(f *ast.File) {
 	}
 
 	for _, d := range f.Decls {
-		p.b.WriteByte('\n')
+		dl := d.Pos().Line
+		p.flushCommentsBefore(dl)
+		p.emitBlankIfGap(dl)
+		// Ensure a blank line between top-level decls even when there's
+		// no source gap (rare, but keeps output uniform).
+		if p.lastLine > 0 && p.b.Len() > 0 {
+			tail := p.b.String()
+			// If the last char isn't already a blank-line boundary, add one.
+			if !strings.HasSuffix(tail, "\n\n") {
+				p.b.WriteByte('\n')
+			}
+		}
 		p.printDecl(d)
 	}
+
+	p.flushRemaining()
 }
 
 func (p *printer) printDecl(d ast.Decl) {
@@ -79,11 +223,18 @@ func (p *printer) printDecl(d ast.Decl) {
 		p.printTypeDecl(d)
 	case *ast.FuncDecl:
 		p.printFuncDecl(d)
+	case *ast.ConstDecl:
+		p.printConstDecl(d)
 	}
 }
 
 func (p *printer) printTypeDecl(d *ast.TypeDecl) {
+	p.markLine(d.P.Line)
 	if st, ok := d.Type.(*ast.StructType); ok {
+		if len(st.Fields) == 0 {
+			p.line("type " + d.Name + " struct {}")
+			return
+		}
 		p.line("type " + d.Name + " struct {")
 		p.indent++
 		// Align field types like gofmt.
@@ -94,7 +245,25 @@ func (p *printer) printTypeDecl(d *ast.TypeDecl) {
 			}
 		}
 		for _, f := range st.Fields {
+			p.flushCommentsBefore(f.P.Line)
 			p.line(fmt.Sprintf("%-*s %s", nameWidth, f.Name, p.formatType(f.Type)))
+			p.markLine(f.P.Line)
+		}
+		p.indent--
+		p.line("}")
+		return
+	}
+	if it, ok := d.Type.(*ast.InterfaceType); ok {
+		if len(it.Methods) == 0 {
+			p.line("type " + d.Name + " interface {}")
+			return
+		}
+		p.line("type " + d.Name + " interface {")
+		p.indent++
+		for _, m := range it.Methods {
+			p.flushCommentsBefore(m.P.Line)
+			p.line(m.Name + "()")
+			p.markLine(m.P.Line)
 		}
 		p.indent--
 		p.line("}")
@@ -103,7 +272,13 @@ func (p *printer) printTypeDecl(d *ast.TypeDecl) {
 	p.line("type " + d.Name + " " + p.formatType(d.Type))
 }
 
+func (p *printer) printConstDecl(d *ast.ConstDecl) {
+	p.markLine(d.P.Line)
+	p.line("const " + d.Name + " = " + p.formatExpr(d.Value))
+}
+
 func (p *printer) printFuncDecl(d *ast.FuncDecl) {
+	p.markLine(d.P.Line)
 	p.writeIndent()
 	p.raw("fun ")
 	if d.Receiver != nil {
@@ -117,8 +292,17 @@ func (p *printer) printFuncDecl(d *ast.FuncDecl) {
 		p.raw(param.Name + " " + p.formatType(param.Type))
 	}
 	p.raw(")")
-	if len(d.Results) > 0 {
+	switch len(d.Results) {
+	case 0:
+		// no results
+	case 1:
 		p.raw(" " + p.formatType(d.Results[0]))
+	default:
+		parts := make([]string, len(d.Results))
+		for i, r := range d.Results {
+			parts[i] = p.formatType(r)
+		}
+		p.raw(" (" + strings.Join(parts, ", ") + ")")
 	}
 	if d.Body != nil {
 		p.raw(" {\n")
@@ -126,6 +310,12 @@ func (p *printer) printFuncDecl(d *ast.FuncDecl) {
 		for _, s := range d.Body.Stmts {
 			p.printStmt(s)
 		}
+		// Flush any trailing comments inside the body.
+		closeLine := d.Body.Pos().Line
+		if closeLine < p.lastLine {
+			closeLine = p.lastLine
+		}
+		p.flushCommentsBefore(closeLine + 1000000) // drain everything before the next decl; safer to drain in-body comments here
 		p.indent--
 		p.line("}")
 	} else {
@@ -147,8 +337,29 @@ func (p *printer) formatType(t ast.Type) string {
 		return "*" + p.formatType(t.Elem)
 	case *ast.SliceType:
 		return "[]" + p.formatType(t.Elem)
+	case *ast.MapType:
+		return "map[" + p.formatType(t.Key) + "]" + p.formatType(t.Value)
+	case *ast.ChanType:
+		return "chan " + p.formatType(t.Elem)
+	case *ast.InterfaceType:
+		if len(t.Methods) == 0 {
+			return "interface{}"
+		}
+		var sb strings.Builder
+		sb.WriteString("interface { ")
+		for i, m := range t.Methods {
+			if i > 0 {
+				sb.WriteString("; ")
+			}
+			sb.WriteString(m.Name + "()")
+		}
+		sb.WriteString(" }")
+		return sb.String()
 	case *ast.StructType:
 		// Anonymous structs: rare in v0.4; emit single-line.
+		if len(t.Fields) == 0 {
+			return "struct{}"
+		}
 		var sb strings.Builder
 		sb.WriteString("struct {")
 		for i, f := range t.Fields {
@@ -170,36 +381,62 @@ func (p *printer) formatType(t ast.Type) string {
 // ---------------------------------------------------------------------
 
 func (p *printer) printStmt(s ast.Stmt) {
+	// Flush comments that come before this statement, and preserve any
+	// blank line in front of it.
+	sl := s.Pos().Line
+	p.flushCommentsBefore(sl)
+	p.emitBlankIfGap(sl)
+	p.markLine(sl)
+
 	switch s := s.(type) {
 	case *ast.ExprStmt:
-		p.line(p.formatExpr(s.Expr))
+		p.lineAt(p.formatExpr(s.Expr), sl)
 	case *ast.VarStmt:
-		p.printVarStmt(s)
+		p.printVarStmt(s, sl)
+	case *ast.MultiVarStmt:
+		p.printMultiVarStmt(s, sl)
 	case *ast.AssignStmt:
-		p.line(p.formatExpr(s.LHS) + " = " + p.formatExpr(s.RHS))
+		p.lineAt(p.formatExpr(s.LHS)+" = "+p.formatExpr(s.RHS), sl)
+	case *ast.MultiAssignStmt:
+		p.printMultiAssignStmt(s, sl)
+	case *ast.SendStmt:
+		// Render as the canonical write(ch, v) call. The SendStmt AST node
+		// is no longer produced by the parser (sends are CallExprs now) but
+		// any synthesized AST would round-trip parseably this way.
+		p.lineAt("write("+p.formatExpr(s.Channel)+", "+p.formatExpr(s.Value)+")", sl)
 	case *ast.RetStmt:
 		switch len(s.Values) {
 		case 0:
-			p.line("ret")
+			p.lineAt("ret", sl)
 		case 1:
-			p.line("ret " + p.formatExpr(s.Values[0]))
+			p.lineAt("ret "+p.formatExpr(s.Values[0]), sl)
 		default:
 			parts := make([]string, len(s.Values))
 			for i, v := range s.Values {
 				parts[i] = p.formatExpr(v)
 			}
-			p.line("ret " + strings.Join(parts, ", "))
+			p.lineAt("ret "+strings.Join(parts, ", "), sl)
 		}
+	case *ast.BreakStmt:
+		p.lineAt("break", sl)
+	case *ast.ContinueStmt:
+		p.lineAt("continue", sl)
 	case *ast.IfStmt:
 		p.printIfStmt(s, false)
+		p.markLine(endLine(s))
 	case *ast.ForStmt:
 		p.printForStmt(s)
+		p.markLine(endLine(s))
 	case *ast.SwitchStmt:
 		p.printSwitchStmt(s)
+		p.markLine(endLine(s))
+	case *ast.SelectStmt:
+		p.printSelectStmt(s)
+		p.markLine(endLine(s))
 	case *ast.DeferStmt:
-		p.line("def " + p.formatExpr(s.Call))
+		p.lineAt("def "+p.formatExpr(s.Call), sl)
 	case *ast.RunStmt:
-		p.line("run " + p.formatExpr(s.Call))
+		p.lineAt("run "+p.formatExpr(s.Call), sl)
 	case *ast.Block:
 		p.line("{")
 		p.indent++
@@ -211,9 +448,9 @@ func (p *printer) printStmt(s ast.Stmt) {
 	}
 }
 
-func (p *printer) printVarStmt(s *ast.VarStmt) {
+func (p *printer) printVarStmt(s *ast.VarStmt, srcLine int) {
 	if s.Type == nil && s.Value != nil {
-		p.line(s.Name + " := " + p.formatExpr(s.Value))
+		p.lineAt(s.Name+" := "+p.formatExpr(s.Value), srcLine)
 		return
 	}
 	out := "var " + s.Name
@@ -223,7 +460,20 @@ func (p *printer) printVarStmt(s *ast.VarStmt) {
 	if s.Value != nil {
 		out += " = " + p.formatExpr(s.Value)
 	}
-	p.line(out)
+	p.lineAt(out, srcLine)
+}
+
+func (p *printer) printMultiVarStmt(s *ast.MultiVarStmt, srcLine int) {
+	// MultiVarStmt is the `v, ok := read(ch)` / `a, b := f()` short form.
+	p.lineAt(strings.Join(s.Names, ", ")+" := "+p.formatExpr(s.RHS), srcLine)
+}
+
+func (p *printer) printMultiAssignStmt(s *ast.MultiAssignStmt, srcLine int) {
+	lhs := make([]string, len(s.LHS))
+	for i, e := range s.LHS {
+		lhs[i] = p.formatExpr(e)
+	}
+	p.lineAt(strings.Join(lhs, ", ")+" = "+p.formatExpr(s.RHS), srcLine)
 }
 
 func (p *printer) printIfStmt(s *ast.IfStmt, asElseIf bool) {
@@ -313,6 +563,30 @@ func (p *printer) printSwitchStmt(s *ast.SwitchStmt) {
 	p.line("}")
 }
 
+func (p *printer) printSelectStmt(s *ast.SelectStmt) {
+	p.writeIndent()
+	p.raw("select {\n")
+	for _, cs := range s.Cases {
+		p.writeIndent()
+		switch {
+		case cs.IsDefault:
+			p.raw("default:\n")
+		case len(cs.RecvNames) == 0 && cs.SendValue == nil:
+			p.raw("case read(" + p.formatExpr(cs.Channel) + "):\n")
+		case cs.SendValue != nil:
+			p.raw("case write(" + p.formatExpr(cs.Channel) + ", " + p.formatExpr(cs.SendValue) + "):\n")
+		default:
+			p.raw("case " + strings.Join(cs.RecvNames, ", ") + " := read(" + p.formatExpr(cs.Channel) + "):\n")
+		}
+		p.indent++
+		for _, ss := range cs.Body {
+			p.printStmt(ss)
+		}
+		p.indent--
+	}
+	p.line("}")
+}
+
 // formatSimpleStmt is the inline form used in for-clauses.
 func (p *printer) formatSimpleStmt(s ast.Stmt) string {
 	if s == nil {
@@ -361,6 +635,12 @@ func (p *printer) formatExpr(e ast.Expr) string {
 	case *ast.SelectorExpr:
 		return p.formatExpr(e.X) + "." + e.Sel
 	case *ast.UnaryExpr:
+		// Legacy `<-ch` receive form: render as the canonical `read(ch)`
+		// so any AST round-trip produces parseable output. Real parser
+		// output no longer contains UnaryExpr{Op:"<-"}.
+		if e.Op == "<-" {
+			return "read(" + p.formatExpr(e.X) + ")"
+		}
 		return e.Op + p.formatExpr(e.X)
 	case *ast.BinaryExpr:
 		return p.formatExpr(e.X) + " " + e.Op + " " + p.formatExpr(e.Y)
@@ -380,26 +660,46 @@ func (p *printer) formatExpr(e ast.Expr) string {
 		return p.formatExpr(e.X) + "[" + p.formatExpr(e.Index) + "]"
 	case *ast.NewExpr:
 		var sb strings.Builder
-		sb.WriteString("new ")
-		sb.WriteString(p.formatType(e.Type))
-		if e.Pairs != nil {
-			sb.WriteByte('{')
-			for i, kv := range e.Pairs {
-				if i > 0 {
-					sb.WriteString(", ")
-				}
-				sb.WriteString(kv.Key + ": " + p.formatExpr(kv.Value))
-			}
-			sb.WriteByte('}')
-		} else {
+		sb.WriteString("new")
+		if e.HasParens {
 			sb.WriteByte('(')
-			for i, a := range e.Args {
+			for i, a := range e.SizeArgs {
 				if i > 0 {
 					sb.WriteString(", ")
 				}
 				sb.WriteString(p.formatExpr(a))
 			}
 			sb.WriteByte(')')
+		}
+		if e.Type != nil {
+			sb.WriteByte(' ')
+			sb.WriteString(p.formatType(e.Type))
+		}
+		if e.HasBraces {
+			sb.WriteByte('{')
+			first := true
+			for _, kv := range e.Pairs {
+				if !first {
+					sb.WriteString(", ")
+				}
+				sb.WriteString(kv.Key + ": " + p.formatExpr(kv.Value))
+				first = false
+			}
+			for _, m := range e.MapEntries {
+				if !first {
+					sb.WriteString(", ")
+				}
+				sb.WriteString(p.formatExpr(m.Key) + ": " + p.formatExpr(m.Value))
+				first = false
+			}
+			for _, x := range e.SliceElems {
+				if !first {
+					sb.WriteString(", ")
+				}
+				sb.WriteString(p.formatExpr(x))
+				first = false
+			}
+			sb.WriteByte('}')
 		}
 		return sb.String()
 	case *ast.SliceLit:

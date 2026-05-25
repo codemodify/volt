@@ -32,9 +32,10 @@ import (
 )
 
 type Checker struct {
-	errs    []string
-	funcs   map[string]*ast.FuncDecl
-	extPkgs map[string]map[string]*ast.FuncDecl // pkg → func name → decl
+	errs       []string
+	funcs      map[string]*ast.FuncDecl
+	extPkgs    map[string]map[string]*ast.FuncDecl // pkg → func name → decl
+	curResults []ast.Type                          // declared return types of the function being checked
 }
 
 func New() *Checker {
@@ -73,7 +74,7 @@ func (c *Checker) Check(file *ast.File) error {
 		}
 	}
 	if len(c.errs) > 0 {
-		return fmt.Errorf("borrow check failed:\n  %s", strings.Join(c.errs, "\n  "))
+		return fmt.Errorf("ownership check failed:\n  %s", strings.Join(c.errs, "\n  "))
 	}
 	return nil
 }
@@ -85,6 +86,8 @@ func (c *Checker) Check(file *ast.File) error {
 type state struct {
 	movable bool
 	moved   ast.Node // nil if alive; otherwise the statement that moved it
+	isParam bool     // true if this symbol is a function parameter
+	typ     ast.Type // declared type of this symbol (when known)
 }
 
 // cloneSyms returns an independent copy of the ownership state.
@@ -118,11 +121,18 @@ func mergeSyms(dst, a, b map[string]*state) {
 func (c *Checker) checkFunc(fd *ast.FuncDecl) {
 	syms := make(map[string]*state)
 	for _, p := range fd.Params {
-		syms[p.Name] = &state{movable: isMovableType(p.Type)}
+		syms[p.Name] = &state{movable: isMovableType(p.Type), isParam: true, typ: p.Type}
+	}
+	if fd.Receiver != nil {
+		syms[fd.Receiver.Name] = &state{movable: isMovableType(fd.Receiver.Type), isParam: true, typ: fd.Receiver.Type}
 	}
 	if fd.Body == nil {
 		return
 	}
+	// Stash the function's declared results so RetStmt checks can validate
+	// borrow-of-local escapes.
+	c.curResults = fd.Results
+	defer func() { c.curResults = nil }()
 	c.checkBlock(fd.Body, syms)
 }
 
@@ -137,10 +147,12 @@ func (c *Checker) checkStmt(s ast.Stmt, syms map[string]*state) {
 	case *ast.VarStmt:
 		c.checkExprUse(s.Value, syms)
 		c.maybeMoveBareIdent(s.Value, s, syms)
-		syms[s.Name] = &state{movable: isMovableType(s.Type)}
+		syms[s.Name] = &state{movable: isMovableType(s.Type), typ: s.Type}
 	case *ast.AssignStmt:
 		c.checkExprUse(s.RHS, syms)
 		c.maybeMoveBareIdent(s.RHS, s, syms)
+		// Reject writes through a shared borrow (&T).
+		c.checkBorrowWrite(s.LHS, syms)
 		if id, ok := s.LHS.(*ast.IdentExpr); ok {
 			if st, ok := syms[id.Name]; ok {
 				st.moved = nil // reassigned, revived
@@ -149,6 +161,28 @@ func (c *Checker) checkStmt(s ast.Stmt, syms map[string]*state) {
 	case *ast.RetStmt:
 		for _, v := range s.Values {
 			c.checkExprUse(v, syms)
+		}
+		// Lifetime check: if the declared return type is a borrow/pointer
+		// and the corresponding return expression is a local (non-param)
+		// identifier, reject — the borrow would outlive its storage.
+		for i, v := range s.Values {
+			if i >= len(c.curResults) {
+				break
+			}
+			if !isBorrowOrPointer(c.curResults[i]) {
+				continue
+			}
+			id, ok := v.(*ast.IdentExpr)
+			if !ok {
+				continue
+			}
+			st, ok := syms[id.Name]
+			if !ok || st.isParam {
+				continue // unknown or a parameter — assume OK
+			}
+			c.errs = append(c.errs, fmt.Sprintf(
+				"%s: cannot return read/write access to local %q — it would outlive the value it points at",
+				v.Pos(), id.Name))
 		}
 		// Returning a value can be a move; but our return values are i64
 		// for now (no string returns), so not actionable yet.
@@ -286,8 +320,44 @@ func (c *Checker) checkCallMoves(call *ast.CallExpr, syms map[string]*state) {
 		}
 		if hasMut {
 			c.errs = append(c.errs, fmt.Sprintf(
-				"%s: variable %q borrowed multiple times in same call; at least one is mutable (*T) — aliasing-XOR-mutation violation",
+				"%s: variable %q used with multiple read/write accesses in the same call; at least one asks for write access (*T) — that's not allowed alongside any other access",
 				bs[0].node.Pos(), name))
+		}
+	}
+}
+
+// checkBorrowWrite reports an error if `lhs` writes through a shared
+// borrow (`&T`). Two shapes are checked:
+//
+//   x = ...        — direct assignment to a `&T`-typed variable
+//   x.field = ...  — field-assign whose receiver is a `&T`-typed variable
+//
+// A `*T` (unique mutable borrow) is allowed; only `&T` is rejected.
+func (c *Checker) checkBorrowWrite(lhs ast.Expr, syms map[string]*state) {
+	switch e := lhs.(type) {
+	case *ast.IdentExpr:
+		st, ok := syms[e.Name]
+		if !ok {
+			return
+		}
+		if _, ok := st.typ.(*ast.BorrowType); ok {
+			c.errs = append(c.errs, fmt.Sprintf(
+				"%s: cannot write to %q — you only have read access (`&T`). Ask for write access (`*T`) to modify.",
+				e.Pos(), e.Name))
+		}
+	case *ast.SelectorExpr:
+		recv, ok := e.X.(*ast.IdentExpr)
+		if !ok {
+			return
+		}
+		st, ok := syms[recv.Name]
+		if !ok {
+			return
+		}
+		if _, ok := st.typ.(*ast.BorrowType); ok {
+			c.errs = append(c.errs, fmt.Sprintf(
+				"%s: cannot write to field %q through %q — the receiver only has read access (`&T`). Ask for write access (`*T`) to modify.",
+				e.Pos(), e.Sel, recv.Name))
 		}
 	}
 }
@@ -308,15 +378,43 @@ func (c *Checker) maybeMoveBareIdent(rhs ast.Expr, at ast.Node, syms map[string]
 // Type predicates
 // ---------------------------------------------------------------------
 
+// isMovableType reports whether a value of this type is consumed when
+// passed by value (or copied into a new variable).
+//
+// Movable:
+//   - string (owns its backing bytes)
+//   - any named type other than a Copy primitive (i.e. user-defined struct
+//     types — they may own heap memory through their fields)
+//   - slice and map (own their backing storage)
+//   - anonymous struct types
+//
+// Not movable:
+//   - numeric primitives + bool (Copy semantics)
+//   - chan T (reference-typed by design — copying yields another handle)
+//   - borrows &T / *T (not owned values)
+//   - interface-shaped types `error`, `any` (reference-typed, nilable)
 func isMovableType(t ast.Type) bool {
 	if t == nil {
 		return false
 	}
-	if nt, ok := t.(*ast.NamedType); ok {
-		switch nt.Name {
-		case "string":
-			return true
-		}
+	switch tt := t.(type) {
+	case *ast.NamedType:
+		return !isCopyPrimitive(tt.Name)
+	case *ast.SliceType, *ast.MapType, *ast.StructType:
+		return true
+	}
+	return false
+}
+
+// isCopyPrimitive lists the named types that have value-copy semantics.
+// Anything else with a name is treated as a (movable) user-defined type.
+func isCopyPrimitive(name string) bool {
+	switch name {
+	case "int", "int8", "int16", "int32", "int64",
+		"uint", "uint8", "uint16", "uint32", "uint64",
+		"byte", "bool", "float", "float32", "float64",
+		"error", "any":
+		return true
 	}
 	return false
 }

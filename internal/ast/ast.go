@@ -21,10 +21,11 @@ type Node interface {
 
 // File represents a complete .volt source file.
 type File struct {
-	P       lex.Pos
-	Package string
-	Imports []*Import
-	Decls   []Decl
+	P        lex.Pos
+	Package  string
+	Imports  []*Import
+	Decls    []Decl
+	Comments []lex.Comment // all comments in source order; populated by parser
 }
 
 func (f *File) Pos() lex.Pos { return f.P }
@@ -136,6 +137,17 @@ type StructType struct {
 
 func (t *StructType) Pos() lex.Pos { return t.P }
 func (t *StructType) typeNode()    {}
+
+// InterfaceType is `interface { method... }`. v0.7: parsed for source
+// fidelity but treated as opaque `ptr` in codegen — no dynamic
+// dispatch / vtable. A type satisfies an interface by name only.
+type InterfaceType struct {
+	P       lex.Pos
+	Methods []*Field // each Field's Type is a FunctionType-ish shape
+}
+
+func (t *InterfaceType) Pos() lex.Pos { return t.P }
+func (t *InterfaceType) typeNode()    {}
 
 // SliceType is `[]T`.
 type SliceType struct {
@@ -340,6 +352,36 @@ type SendStmt struct {
 func (s *SendStmt) Pos() lex.Pos { return s.P }
 func (s *SendStmt) stmtNode()    {}
 
+// SelectStmt is `select { case ...: ... }`. Each case is either a
+// channel send, a channel receive (with optional v / v,ok bindings),
+// or default. Semantics: pick a ready case to execute; if none and no
+// default, poll until one is ready.
+type SelectStmt struct {
+	P     lex.Pos
+	Cases []*SelectCase
+}
+
+func (s *SelectStmt) Pos() lex.Pos { return s.P }
+func (s *SelectStmt) stmtNode()    {}
+
+// SelectCase is one clause of a select.
+//
+//	Default      → IsDefault, no Channel/Send/Recv*
+//	send         → Channel + SendValue set
+//	v := <-ch    → Channel set, RecvNames = ["v"]
+//	v, ok := <-ch→ Channel set, RecvNames = ["v","ok"]
+//	<-ch         → Channel set, RecvNames empty (discard)
+type SelectCase struct {
+	P         lex.Pos
+	IsDefault bool
+	Channel   Expr
+	SendValue Expr     // non-nil for send cases
+	RecvNames []string // for recv cases (0, 1, or 2 names)
+	Body      []Stmt
+}
+
+func (c *SelectCase) Pos() lex.Pos { return c.P }
+
 // ChanType is `chan T` — a channel carrying values of T.
 type ChanType struct {
 	P    lex.Pos
@@ -348,6 +390,55 @@ type ChanType struct {
 
 func (t *ChanType) Pos() lex.Pos { return t.P }
 func (t *ChanType) typeNode()    {}
+
+// AtomicType is `atomic T` — a hardware-atomic single-word value of T.
+// T must be a word-sized primitive (int / int64 / bool / ptr).
+type AtomicType struct {
+	P    lex.Pos
+	Elem Type
+}
+
+func (t *AtomicType) Pos() lex.Pos { return t.P }
+func (t *AtomicType) typeNode()    {}
+
+// MutexType is `mutex T` — an exclusive-access wrapper around an owned T.
+type MutexType struct {
+	P    lex.Pos
+	Elem Type
+}
+
+func (t *MutexType) Pos() lex.Pos { return t.P }
+func (t *MutexType) typeNode()    {}
+
+// RwMutexType is `rwmutex T` — a many-readers-or-one-writer wrapper
+// around an owned T.
+type RwMutexType struct {
+	P    lex.Pos
+	Elem Type
+}
+
+func (t *RwMutexType) Pos() lex.Pos { return t.P }
+func (t *RwMutexType) typeNode()    {}
+
+// WaitgroupType is `waitgroup` — a counter that blocks Wait() until it
+// hits zero. Unlike mutex/rwmutex/atomic, it has no element type — it
+// only manages a count.
+type WaitgroupType struct {
+	P lex.Pos
+}
+
+func (t *WaitgroupType) Pos() lex.Pos { return t.P }
+func (t *WaitgroupType) typeNode()    {}
+
+// OnceType is `once` — coordination primitive that runs an
+// initialization block exactly once across all threads. Subsequent
+// callers block until the first finishes. No element type.
+type OnceType struct {
+	P lex.Pos
+}
+
+func (t *OnceType) Pos() lex.Pos { return t.P }
+func (t *OnceType) typeNode()    {}
 
 // SwitchStmt is `switch [tag] { case ... default ... }`.
 // When Tag is nil, the cases are boolean expressions (Go-style "switch
@@ -466,18 +557,45 @@ type UnaryExpr struct {
 func (e *UnaryExpr) Pos() lex.Pos { return e.P }
 func (e *UnaryExpr) exprNode()    {}
 
-// NewExpr is `new T{...}` or `new T()` — heap-allocates an owned T.
+// NewExpr is a heap allocation. The full grammar is:
+//
+//	new T          — bare (default-construct; legacy syntax)
+//	new T(s)       — sized: chan cap, slice length, map cap hint
+//	new T{i}       — init data: struct fields, map entries, or slice elements
+//	new T(s){i}    — sized + initial data (slice with length=s, map with cap=s)
+//
+// The type may be omitted ("short form") when the LHS of the same `=`
+// supplies it via an explicit type annotation:
+//
+//	var c Counter         = new{value: 10}
+//	var ch chan int       = new(4)
+//	var m map[string]int  = new{}
+//	var s []int           = new(8){1, 2, 3}
+//
+// Brace content has three sub-shapes, distinguished at parse time:
+//
+//	Pairs       — `name: expr` (Ident key) → struct fields
+//	MapEntries  — `expr: expr` (non-Ident key) → map entries
+//	SliceElems  — bare `expr` (no key) → slice positional elements
+//
+// The type-checker rejects shape/type mismatches (e.g. SliceElems with
+// a struct LHS).
 type NewExpr struct {
-	P     lex.Pos
-	Type  Type           // the type to allocate
-	Pairs []*KeyValuePair // for `new T{a: 1, b: 2}`; nil otherwise
-	Args  []Expr          // for `new T(args)`; nil otherwise
+	P          lex.Pos
+	Type       Type            // nullable: nil means "short form, infer from LHS"
+	SizeArgs   []Expr          // from `(...)`: chan cap, slice length, map cap hint
+	Pairs      []*KeyValuePair // from `{name: expr, ...}` (struct fields)
+	MapEntries []*MapEntry     // from `{expr: expr, ...}` (map entries)
+	SliceElems []Expr          // from `{expr, expr, ...}` (slice positional)
+	HasParens  bool            // true if source had `(...)` (even if empty)
+	HasBraces  bool            // true if source had `{...}` (even if empty)
 }
 
 func (e *NewExpr) Pos() lex.Pos { return e.P }
 func (e *NewExpr) exprNode()    {}
 
-// KeyValuePair is one `name: value` in a composite literal.
+// KeyValuePair is one `name: value` in a struct composite literal.
+// The key is an identifier (a struct field name).
 type KeyValuePair struct {
 	P     lex.Pos
 	Key   string
@@ -485,6 +603,16 @@ type KeyValuePair struct {
 }
 
 func (k *KeyValuePair) Pos() lex.Pos { return k.P }
+
+// MapEntry is one `key: value` in a map composite literal, where the
+// key is an arbitrary expression (e.g. a string literal).
+type MapEntry struct {
+	P     lex.Pos
+	Key   Expr
+	Value Expr
+}
+
+func (m *MapEntry) Pos() lex.Pos { return m.P }
 
 // SliceLit is `[]T{e1, e2, e3}`.
 type SliceLit struct {

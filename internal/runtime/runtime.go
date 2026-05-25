@@ -18,5 +18,8 @@ import _ "embed"
 //go:embed asm/start_amd64.s
 var StartAmd64Asm []byte
 
+//go:embed asm/start_arm64.s
+var StartArm64Asm []byte
+
 //go:embed asm/runtime.c
 var RuntimeC []byte

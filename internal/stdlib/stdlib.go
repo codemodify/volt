@@ -13,7 +13,7 @@ import (
 	"io/fs"
 )
 
-//go:embed log/log.volt syscall/syscall.volt
+//go:embed log/log.volt syscall/syscall.volt time/time.volt
 var files embed.FS
 
 // Source returns the source bytes for the named package's main file,

@@ -29,6 +29,7 @@ const (
 	Rune
 
 	// keywords (prefixed Kw to avoid collisions with Go identifiers like New)
+	KwAtomic
 	KwBreak
 	KwCase
 	KwChan
@@ -44,18 +45,22 @@ const (
 	KwImport
 	KwInterface
 	KwMap
+	KwMutex
 	KwNew
 	KwNil
+	KwOnce
 	KwPackage
 	KwRange
 	KwRet
 	KwRun
+	KwRwMutex
 	KwSelect
 	KwStruct
 	KwSwitch
 	KwTrue
 	KwType
 	KwVar
+	KwWaitgroup
 
 	// punctuation
 	LBrace   // {
@@ -115,6 +120,7 @@ var kindNames = [...]string{
 	Float:         "FLOAT",
 	String:        "STRING",
 	Rune:          "RUNE",
+	KwAtomic:      "atomic",
 	KwBreak:       "break",
 	KwCase:        "case",
 	KwChan:        "chan",
@@ -130,18 +136,22 @@ var kindNames = [...]string{
 	KwImport:      "import",
 	KwInterface:   "interface",
 	KwMap:         "map",
+	KwMutex:       "mutex",
 	KwNew:         "new",
 	KwNil:         "nil",
+	KwOnce:        "once",
 	KwPackage:     "package",
 	KwRange:       "range",
 	KwRet:         "ret",
 	KwRun:         "run",
+	KwRwMutex:     "rwmutex",
 	KwSelect:      "select",
 	KwStruct:      "struct",
 	KwSwitch:      "switch",
 	KwTrue:        "true",
 	KwType:        "type",
 	KwVar:         "var",
+	KwWaitgroup:   "waitgroup",
 	LBrace:        "{",
 	RBrace:        "}",
 	LParen:        "(",
@@ -196,6 +206,7 @@ func (k Kind) String() string {
 }
 
 var keywords = map[string]Kind{
+	"atomic":    KwAtomic,
 	"break":     KwBreak,
 	"case":      KwCase,
 	"chan":      KwChan,
@@ -211,18 +222,22 @@ var keywords = map[string]Kind{
 	"import":    KwImport,
 	"interface": KwInterface,
 	"map":       KwMap,
+	"mutex":     KwMutex,
 	"new":       KwNew,
 	"nil":       KwNil,
+	"once":      KwOnce,
 	"package":   KwPackage,
 	"range":     KwRange,
 	"ret":       KwRet,
 	"run":       KwRun,
+	"rwmutex":   KwRwMutex,
 	"select":    KwSelect,
 	"struct":    KwStruct,
 	"switch":    KwSwitch,
 	"true":      KwTrue,
 	"type":      KwType,
 	"var":       KwVar,
+	"waitgroup": KwWaitgroup,
 }
 
 // Pos is a source position for diagnostics.
@@ -248,6 +263,13 @@ func (t Token) String() string {
 	return fmt.Sprintf("%s @ %s", t.Kind, t.Pos)
 }
 
+// Comment is a captured comment with its source position. Position
+// refers to the start of the comment (the leading `/`).
+type Comment struct {
+	Pos  Pos
+	Text string // includes the leading `//` or `/* */` delimiters
+}
+
 // Lexer tokenizes a single source file.
 type Lexer struct {
 	file string
@@ -259,7 +281,14 @@ type Lexer struct {
 	// for Go-style semicolon insertion
 	prev    Kind // kind of last non-Semi token emitted (Illegal if none)
 	pending *Token
+
+	// captured comments in source order
+	comments []Comment
 }
+
+// Comments returns all comments encountered so far, in source order.
+// Safe to call after EOF.
+func (l *Lexer) Comments() []Comment { return l.comments }
 
 // New returns a Lexer for the given source.
 func New(file string, src []byte) *Lexer {
@@ -610,10 +639,18 @@ func (l *Lexer) skipWhitespaceAndComments() bool {
 		case '/':
 			if l.pos+1 < len(l.src) && l.src[l.pos+1] == '/' {
 				// line comment to end of line
+				start := l.posHere()
+				startByte := l.pos
 				for l.pos < len(l.src) && l.src[l.pos] != '\n' {
 					l.advance()
 				}
+				l.comments = append(l.comments, Comment{
+					Pos:  start,
+					Text: string(l.src[startByte:l.pos]),
+				})
 			} else if l.pos+1 < len(l.src) && l.src[l.pos+1] == '*' {
+				start := l.posHere()
+				startByte := l.pos
 				l.advance()
 				l.advance()
 				for l.pos+1 < len(l.src) && !(l.src[l.pos] == '*' && l.src[l.pos+1] == '/') {
@@ -626,6 +663,10 @@ func (l *Lexer) skipWhitespaceAndComments() bool {
 					l.advance()
 					l.advance()
 				}
+				l.comments = append(l.comments, Comment{
+					Pos:  start,
+					Text: string(l.src[startByte:l.pos]),
+				})
 			} else {
 				return saw
 			}

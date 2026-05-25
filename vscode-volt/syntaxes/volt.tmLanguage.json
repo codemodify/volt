@@ -158,7 +158,7 @@
         },
         {
           "name": "keyword.control.concurrency.volt",
-          "match": "\\b(run|def|chan)\\b"
+          "match": "\\b(run|def)\\b"
         },
         {
           "name": "keyword.operator.new.volt",
@@ -173,7 +173,7 @@
 
     "keywords-type-context": {
       "name": "storage.type.volt",
-      "match": "\\b(chan|map|struct|interface|fun)\\b"
+      "match": "\\b(map|struct|interface|fun)\\b"
     },
 
     "builtin-constants": {
@@ -190,8 +190,8 @@
     },
 
     "builtin-types": {
-      "name": "support.type.builtin.volt",
-      "match": "\\b(int|int8|int16|int32|int64|uint|uint8|uint16|uint32|uint64|float|float32|float64|byte|rune|bool|string|error|any|void)\\b"
+      "name": "keyword.control.type.volt",
+      "match": "\\b(int|int8|int16|int32|int64|uint|uint8|uint16|uint32|uint64|float|float32|float64|byte|rune|bool|string|error|any|void|chan|mutex|rwmutex|atomic|waitgroup|once)\\b"
     },
 
     "type-sigils": {

@@ -144,9 +144,18 @@ func resolveAndCompile(srcPath string) ([]*compiledUnit, error) {
 		}
 	}
 
+	triple := ""
+	switch buildTarget {
+	case "amd64":
+		triple = "x86_64-pc-linux-gnu"
+	case "arm64":
+		triple = "aarch64-unknown-linux-gnu"
+	}
+
 	out := make([]*compiledUnit, 0, len(parsed))
 	for _, u := range parsed {
 		g := codegen.New()
+		g.SetTarget(triple)
 		ir, err := g.Emit(u.file)
 		if err != nil {
 			return nil, err
@@ -164,13 +173,25 @@ func resolveAndCompile(srcPath string) ([]*compiledUnit, error) {
 // debug information, allowing gdb/lldb to break by source line.
 var buildEmitDebug bool
 
+// buildTarget selects the target arch. Defaults to the host arch.
+// Supported: "amd64" (Linux x86_64), "arm64" (Linux aarch64).
+var buildTarget string
+
 func runBuild(args []string, andRun bool) {
 	buildEmitDebug = false
+	buildTarget = "amd64"
 	for len(args) > 0 && len(args[0]) > 0 && args[0][0] == '-' {
 		switch args[0] {
 		case "-g":
 			buildEmitDebug = true
 			args = args[1:]
+		case "--target":
+			if len(args) < 2 {
+				fmt.Fprintln(os.Stderr, "volt: --target needs a value")
+				os.Exit(2)
+			}
+			buildTarget = args[1]
+			args = args[2:]
 		case "--":
 			args = args[1:]
 			goto done
@@ -224,7 +245,16 @@ func assembleAndLink(units []*compiledUnit, outPath string) error {
 		inputs = append(inputs, path)
 	}
 	rtPath := filepath.Join(tmp, "runtime.s")
-	if err := os.WriteFile(rtPath, runtime.StartAmd64Asm, 0o644); err != nil {
+	var rtAsm []byte
+	switch buildTarget {
+	case "amd64":
+		rtAsm = runtime.StartAmd64Asm
+	case "arm64":
+		rtAsm = runtime.StartArm64Asm
+	default:
+		return fmt.Errorf("volt: unsupported --target %q (want amd64 or arm64)", buildTarget)
+	}
+	if err := os.WriteFile(rtPath, rtAsm, 0o644); err != nil {
 		return fmt.Errorf("volt: write runtime: %w", err)
 	}
 	inputs = append(inputs, rtPath)
@@ -235,7 +265,17 @@ func assembleAndLink(units []*compiledUnit, outPath string) error {
 	}
 	inputs = append(inputs, rtcPath)
 
-	clangArgs := []string{"-nostdlib", "-nostartfiles", "-static"}
+	clangArgs := []string{
+		"-nostdlib",
+		"-nostartfiles",
+		"-static",
+		// We have no libc → no __stack_chk_fail symbol — disable the
+		// stack protector clang would otherwise insert for fn locals.
+		"-fno-stack-protector",
+	}
+	if buildTarget == "arm64" {
+		clangArgs = append(clangArgs, "--target=aarch64-linux-gnu")
+	}
 	if _, err := exec.LookPath("mold"); err == nil {
 		clangArgs = append(clangArgs, "-fuse-ld=mold")
 	}

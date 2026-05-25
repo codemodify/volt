@@ -33,30 +33,37 @@ volt_exit:
     syscall
     // not reached
 
-// volt_spawn(fn, arg1, arg2): clone a new thread that runs
-// fn(arg1, arg2) then exits this thread.
+// volt_spawn(fn, arg1, arg2, arg3, arg4): clone a new thread that runs
+// fn(arg1, arg2, arg3, arg4) then exits this thread.
 //
-// SysV: rdi = fn, rsi = arg1, rdx = arg2. For zero-arg fn pass arg1=0;
-// for 1-arg fn pass arg2=0. v0.5 max 2 args (covers most concurrent
-// patterns: chan in, chan out / done).
+// SysV: rdi = fn, rsi = arg1, rdx = arg2, rcx = arg3, r8 = arg4. For
+// fewer-arg fns pass 0s for the unused tail slots. v0.5+ max 4 args
+// (covers worker patterns needing shared mutex + chan-in + chan-out
+// + done/control).
 //
 // Steps:
-//   1. mmap 1 MB stack.
-//   2. Push (arg2, arg1, fn) so child pops fn → rax, arg1 → rdi, arg2 → rsi.
-//   3. clone() with the standard pthread flags.
-//   4. Parent returns child TID.
-//   5. Child: pop, call, sys_exit.
+//   1. Stash fn + 4 args in callee-saved regs (mmap clobbers caller-saved).
+//   2. mmap 1 MB stack.
+//   3. Push (arg4, arg3, arg2, arg1, fn) so child pops fn → rax,
+//      arg1 → rdi, arg2 → rsi, arg3 → rdx, arg4 → rcx.
+//   4. clone() with the standard pthread flags.
+//   5. Parent returns child TID.
+//   6. Child: pop into the calling-convention regs, call, sys_exit.
 .global volt_spawn
 volt_spawn:
     pushq   %rbp
     movq    %rsp, %rbp
+    pushq   %rbx
     pushq   %r12
     pushq   %r13
     pushq   %r14
+    pushq   %r15
 
     movq    %rdi, %r12          // fn
     movq    %rsi, %r13          // arg1
     movq    %rdx, %r14          // arg2
+    movq    %rcx, %r15          // arg3
+    movq    %r8,  %rbx          // arg4
 
     // mmap(NULL, 1MB, RW, PRIVATE|ANON, -1, 0)
     movq    $9,        %rax
@@ -69,7 +76,11 @@ volt_spawn:
     syscall
 
     addq    $1048576, %rax
-    // Push (arg2, arg1, fn) — fn ends up on top.
+    // Push (arg4, arg3, arg2, arg1, fn) — fn ends up on top.
+    subq    $8, %rax
+    movq    %rbx, (%rax)        // arg4
+    subq    $8, %rax
+    movq    %r15, (%rax)        // arg3
     subq    $8, %rax
     movq    %r14, (%rax)        // arg2
     subq    $8, %rax
@@ -88,9 +99,11 @@ volt_spawn:
     testq   %rax, %rax
     jz      .Lvolt_spawn_child
 
+    popq    %r15
     popq    %r14
     popq    %r13
     popq    %r12
+    popq    %rbx
     popq    %rbp
     ret
 
@@ -98,6 +111,8 @@ volt_spawn:
     popq    %rax                // fn
     popq    %rdi                // arg1
     popq    %rsi                // arg2
+    popq    %rdx                // arg3
+    popq    %rcx                // arg4
     callq   *%rax
     xorq    %rdi, %rdi
     movq    $60, %rax           // sys_exit (this thread only)

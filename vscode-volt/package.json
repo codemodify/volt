@@ -2,7 +2,7 @@
   "name": "vscode-volt",
   "displayName": "volt",
   "description": "Syntax highlighting for the volt programming language",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "codemodify",
   "engines": {
     "vscode": "^1.75.0"
