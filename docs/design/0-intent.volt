@@ -1,3 +1,6 @@
+// volt:noformat — this file is the canonical spec; alignment is hand-tuned.
+//                  `volt fmt -w` will refuse to overwrite; use --force only
+//                  when you intentionally want to reformat (you almost never do).
 
 // primitives - CAN fit in CPU register
 var v int8  = 127
@@ -34,6 +37,34 @@ var v rwmutex Counter = new {}          // can't have a size, thus no () after "
 var v atomic int = new {}               // can't have a size, thus no () after "new"
 var v waitgroup = new()                 // counter starts at 0; new(N) pre-loads counter=N; Wait() blocks until 0
 var v once = new()                      // can't have a size, runs exactly once across threads
+var v condvar = new()                   // wait/signal/broadcast pair: c.Wait(m), c.Signal(), c.Broadcast()
+
+// borrows - shared (read) vs exclusive (read+write)
+// `&T` is a shared borrow. Multiple `&T` of the same source coexist (parallel readers).
+//   Mutating the source while a `&T` is held is REJECTED — the source is frozen.
+// `&mut T` is an exclusive borrow. Single `&mut T` blocks all other borrows.
+//   `*b = v` requires `&mut T`; `*b` reads through either form.
+//   Closures may capture borrows; they cannot escape the borrowed scope.
+fun read(p &int) int { ret p }          // sees source value (read-only access)
+fun bump(p &mut int) { *p = *p + 1 }   // exclusive write through the borrow
+
+// borrows - lifecycle is block-scoped; multiple shared OK in same block
+var x int = 5
+{
+    var b1 &int = &x                     // shared borrow
+    var b2 &int = &x                     // ALSO shared OK
+    var sum int = *b1 + *b2              // 10
+}                                         // both released at `}`; x is now writable again
+
+// runtime stdlib — observability + allocator control
+//   runtime.Compact()              — walk + merge adjacent free blocks
+//   runtime.HeapBytes()            — total mmap'd bytes
+//   runtime.NumSizeClasses()       — allocator size-class count
+//   runtime.FreelistCount(sc)      — free blocks per class
+//   runtime.SetArenaChunkSize(n)   — per-chunk mmap size (default 1 MiB)
+//   runtime.ThreadCount()          — # threads registered with race detector
+//   runtime.RaceViolations()       — cumulative race count (0 without -race)
+//   runtime.ResetRaceViolations()  — zero the counter for per-subtest accounting
 
 // concurrency usage - run - spawns a new OS thread; returns immediately
 fun greet(id int) {}                    // any function is runnable

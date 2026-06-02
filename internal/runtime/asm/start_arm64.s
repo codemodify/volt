@@ -11,12 +11,44 @@
 //   write = 64, exit = 93, exit_group = 94, clone = 220, mmap = 222,
 //   futex = 98, nanosleep = 101.
 
+// argc/argv/envp captured at process entry, exposed via BSS globals
+// so the `os` package can serve os.Args / os.Getenv.
+.global volt_argc
+.global volt_argv
+.global volt_envp
+.bss
+.align 8
+volt_argc: .skip 8
+volt_argv: .skip 8
+volt_envp: .skip 8
+
 .global _start
 .text
 
 _start:
+    // Capture argc / argv / envp before doing anything else.
+    ldr     x0, [sp]              // argc
+    adrp    x9, volt_argc
+    add     x9, x9, :lo12:volt_argc
+    str     x0, [x9]
+    add     x1, sp, #8            // argv base
+    adrp    x9, volt_argv
+    add     x9, x9, :lo12:volt_argv
+    str     x1, [x9]
+    // envp = argv + (argc + 1) * 8 → sp + 8 + (argc+1)*8 → sp + (argc+2)*8
+    add     x2, x0, #2
+    lsl     x2, x2, #3
+    add     x2, sp, x2
+    adrp    x9, volt_envp
+    add     x9, x9, :lo12:volt_envp
+    str     x2, [x9]
+
     bl      main
-    // x0 = main's return value → exit code
+    // Preserve main's return value across the at-exit hook (which may
+    // flush the memory profile). x19 is callee-saved by the hook.
+    mov     x19, x0
+    bl      volt_runtime_at_program_exit
+    mov     x0, x19             // restore main's return value → exit code
     mov     x8, #94             // sys_exit_group
     svc     #0
 

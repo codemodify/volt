@@ -37,6 +37,7 @@ const (
 	KwChan1N
 	KwChanN1
 	KwChanNN
+	KwCondvar
 	KwConst
 	KwContinue
 	KwDef
@@ -49,6 +50,7 @@ const (
 	KwImport
 	KwInterface
 	KwMap
+	KwMut
 	KwMutex
 	KwNew
 	KwNil
@@ -132,6 +134,7 @@ var kindNames = [...]string{
 	KwChan1N:      "chan1N",
 	KwChanN1:      "chanN1",
 	KwChanNN:      "chanNN",
+	KwCondvar:     "condvar",
 	KwConst:       "const",
 	KwContinue:    "continue",
 	KwDef:         "def",
@@ -144,6 +147,7 @@ var kindNames = [...]string{
 	KwImport:      "import",
 	KwInterface:   "interface",
 	KwMap:         "map",
+	KwMut:         "mut",
 	KwMutex:       "mutex",
 	KwNew:         "new",
 	KwNil:         "nil",
@@ -222,6 +226,7 @@ var keywords = map[string]Kind{
 	"chan1N":    KwChan1N,
 	"chanN1":    KwChanN1,
 	"chanNN":    KwChanNN,
+	"condvar":   KwCondvar,
 	"const":     KwConst,
 	"continue":  KwContinue,
 	"def":       KwDef,
@@ -234,6 +239,7 @@ var keywords = map[string]Kind{
 	"import":    KwImport,
 	"interface": KwInterface,
 	"map":       KwMap,
+	"mut":       KwMut,
 	"mutex":     KwMutex,
 	"new":       KwNew,
 	"nil":       KwNil,
@@ -468,6 +474,20 @@ func (l *Lexer) scanString(start Pos) Token {
 				b = append(b, '"')
 			case '\'':
 				b = append(b, '\'')
+			case 'x':
+				l.advance()
+				if l.pos+1 >= len(l.src) {
+					return Token{Kind: Illegal, Text: "unterminated \\x escape", Pos: start}
+				}
+				h1 := hexNibble(l.src[l.pos])
+				h2 := hexNibble(l.src[l.pos+1])
+				if h1 < 0 || h2 < 0 {
+					return Token{Kind: Illegal, Text: "bad \\x escape", Pos: start}
+				}
+				b = append(b, byte((h1<<4)|h2))
+				l.advance()
+				l.advance()
+				continue
 			default:
 				// Unknown escape: emit the char as-is.
 				b = append(b, esc)
@@ -722,6 +742,20 @@ func isDigit(c byte) bool {
 
 func isHexDigit(c byte) bool {
 	return isDigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
+// hexNibble returns the 4-bit value of a hex digit, or -1 if not hex.
+func hexNibble(c byte) int {
+	if c >= '0' && c <= '9' {
+		return int(c - '0')
+	}
+	if c >= 'a' && c <= 'f' {
+		return int(c-'a') + 10
+	}
+	if c >= 'A' && c <= 'F' {
+		return int(c-'A') + 10
+	}
+	return -1
 }
 
 // needsSemiAfter reports whether an automatic semicolon should be inserted

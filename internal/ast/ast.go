@@ -111,10 +111,17 @@ type NamedType struct {
 func (t *NamedType) Pos() lex.Pos { return t.P }
 func (t *NamedType) typeNode()    {}
 
-// BorrowType is `&T` — shared, read-only borrow.
+// BorrowType is `&T` (shared, read-only) or `&mut T` (exclusive,
+// read/write). C8 phase 4 split: shared borrows allow multi-aliasing
+// for parallel readers; mutable borrows are exclusive and grant write
+// access. The checker enforces:
+//   - many `&T` of the same source OK at once
+//   - one `&mut T` of the source OK; blocks all other borrows
+//   - `*p = v` requires p to be `&mut T`
 type BorrowType struct {
 	P    lex.Pos
 	Elem Type
+	Mut  bool // true for `&mut T`
 }
 
 func (t *BorrowType) Pos() lex.Pos { return t.P }
@@ -516,6 +523,18 @@ type OnceType struct {
 func (t *OnceType) Pos() lex.Pos { return t.P }
 func (t *OnceType) typeNode()    {}
 
+// CondvarType is `condvar` — wait/signal/broadcast coordination
+// primitive on top of the runtime's cond_t. Used with a mutex T so
+// Wait(m) atomically releases the lock, blocks, then reacquires
+// before returning. No element type — the predicate state lives
+// inside the paired mutex's payload.
+type CondvarType struct {
+	P lex.Pos
+}
+
+func (t *CondvarType) Pos() lex.Pos { return t.P }
+func (t *CondvarType) typeNode()    {}
+
 // SwitchStmt is `switch [tag] { case ... default ... }`.
 // When Tag is nil, the cases are boolean expressions (Go-style "switch
 // {}").
@@ -640,6 +659,11 @@ type FuncLit struct {
 	Results  []Type
 	Body     *Block
 	Captures []string // free-variable names; filled in by the check pass
+	// C13 escape proof: true when any captured name is a borrow / pointer
+	// type. Codegen sets this in emitFuncLit; escape sites (emitRet,
+	// emitRun, etc.) consult it to reject closures-with-borrows from
+	// crossing scopes they can't be proven to outlive.
+	CapturesBorrow bool
 }
 
 func (e *FuncLit) Pos() lex.Pos { return e.P }

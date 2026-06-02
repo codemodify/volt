@@ -201,8 +201,13 @@ func (p *Parser) parseType() ast.Type {
 	case lex.Amp:
 		pos := p.tok.Pos
 		p.advance()
+		mut := false
+		if p.tok.Kind == lex.KwMut {
+			mut = true
+			p.advance()
+		}
 		inner := p.parseType()
-		return &ast.BorrowType{P: pos, Elem: inner}
+		return &ast.BorrowType{P: pos, Elem: inner, Mut: mut}
 	case lex.Star:
 		pos := p.tok.Pos
 		p.advance()
@@ -286,6 +291,10 @@ func (p *Parser) parseType() ast.Type {
 		pos := p.tok.Pos
 		p.advance()
 		return &ast.OnceType{P: pos}
+	case lex.KwCondvar:
+		pos := p.tok.Pos
+		p.advance()
+		return &ast.CondvarType{P: pos}
 	case lex.KwMap:
 		pos := p.tok.Pos
 		p.advance()
@@ -312,7 +321,17 @@ func (p *Parser) parseType() ast.Type {
 		pos := p.tok.Pos
 		name := p.tok.Text
 		p.advance()
-		return &ast.NamedType{P: pos, Name: name}
+		// Accept the qualified form `pkg.Type`. The qualifier is
+		// preserved on NamedType.Package so codegen can disambiguate
+		// types with the same bare name across packages.
+		var pkg string
+		if p.tok.Kind == lex.Dot && p.peekKind() == lex.Ident {
+			pkg = name
+			p.advance() // consume '.'
+			name = p.tok.Text
+			p.advance() // consume the type ident
+		}
+		return &ast.NamedType{P: pos, Package: pkg, Name: name}
 	case lex.KwFun:
 		return p.parseFuncType()
 	}
@@ -502,7 +521,7 @@ func canStartType(k lex.Kind) bool {
 		lex.KwChanN1, lex.KwChanNN,
 		lex.KwMap, lex.KwInterface,
 		lex.KwAtomic, lex.KwMutex, lex.KwRwMutex,
-		lex.KwWaitgroup, lex.KwOnce,
+		lex.KwWaitgroup, lex.KwOnce, lex.KwCondvar,
 		lex.KwFun:
 		return true
 	}
@@ -724,6 +743,13 @@ func (p *Parser) parseStmt() ast.Stmt {
 		s := &ast.ContinueStmt{P: p.tok.Pos}
 		p.advance()
 		return s
+	case lex.LBrace:
+		// Bare nested block — creates a new scope. Useful for limiting
+		// the lifetime of a guard binding (mutex.Lock()) without the
+		// `if 1 < 2 { ... }` workaround the language required before.
+		// Body Stmts inherit the same parsing path; emitStmt handles
+		// *ast.Block by pushing/popping scope around the inner stmts.
+		return p.parseBlock()
 	}
 	return p.parseSimpleStmt()
 }
@@ -1300,6 +1326,28 @@ func (p *Parser) parseUnary() ast.Expr {
 		p.errorf("`<-ch` receive form removed; use `read(ch)` instead")
 		p.advance()
 		return nil
+	case lex.Amp:
+		// C8: `&x` (shared borrow) or `&mut x` (exclusive borrow) as a
+		// value expression. Both lower to the same UnaryExpr with the
+		// alloca address; the "mut" form is distinguished by the Op
+		// string ("&mut" vs "&") so the checker can apply the right
+		// alias rules.
+		opPos := p.tok.Pos
+		p.advance()
+		op := "&"
+		if p.tok.Kind == lex.KwMut {
+			op = "&mut"
+			p.advance()
+		}
+		x := p.parseUnary()
+		return &ast.UnaryExpr{P: opPos, Op: op, X: x}
+	case lex.Star:
+		// C8: `*p` as a value expression — dereference a held borrow.
+		// Symmetric to the LHS form `*p = v` which already works.
+		opPos := p.tok.Pos
+		p.advance()
+		x := p.parseUnary()
+		return &ast.UnaryExpr{P: opPos, Op: "*", X: x}
 	}
 	return p.parsePrimary()
 }
@@ -1444,12 +1492,22 @@ func binaryOp(k lex.Kind) (string, int) {
 		return "+", 4
 	case lex.Minus:
 		return "-", 4
+	case lex.Pipe:
+		return "|", 4
+	case lex.Caret:
+		return "^", 4
 	case lex.Star:
 		return "*", 5
 	case lex.Slash:
 		return "/", 5
 	case lex.Percent:
 		return "%", 5
+	case lex.Amp:
+		return "&", 5
+	case lex.Shl:
+		return "<<", 5
+	case lex.Shr:
+		return ">>", 5
 	}
 	return "", 0
 }

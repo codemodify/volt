@@ -8,16 +8,18 @@
 - ownership can be `MOVED` to a new `OWNER`
 	- the old owner becomes dead (compile error)
 	- the old owner can be used only after assigning new memory/ownership
-- each `T` also supports
-	- `&T` for read access (does not change; concurrent reads are allowed; no sync objects needed)
-		- for this case no writers are allowed
-	- `*T` for read/write access, only one reader/writer; no sync objects needed
-		- for this case no external readers are allowed
-	- mutual exclusivity of `&T` and `*T` avoids data races
-		- nobody reads while someone external is writing
-		- nobody writes while someone external is reading
-		- **natural question**: if reads and writes are mutually exclusive, how do you ever mutate?
-			- short answer: use a `channel` / `Mutex` / `RwMutex` / `Atomic` wrapper
+- each `T` also supports (C8 phase 4+5)
+	- `&T` SHARED borrow: read-only, many concurrent readers OK
+		- the source is FROZEN (no direct mutation) while any `&T` is held
+	- `&mut T` EXCLUSIVE borrow: read+write through `*p`, only one at a time
+		- blocks all other borrows (shared or mut) of the same source
+		- the source is FROZEN through this borrow; write via `*p = v`
+	- `*T` raw pointer: FFI / struct heap pointer; no borrow-checker rules
+	- mutual exclusivity of `&T` and `&mut T` is what avoids data races
+		- nobody reads while a writer is active
+		- nobody writes while readers are active
+		- **natural question**: if reads and writes are mutually exclusive, how do you mutate shared state?
+			- short answer: use a `channel` / `Mutex` / `RwMutex` / `Atomic` / `condvar` wrapper
 			- full answer with examples: [3-concurrency.md ](3-concurrency.md#concurrency-patterns-mutating-shared-data)
 
 lang		| one-liner
@@ -52,7 +54,7 @@ test(N)
 `map[K]V`						| MOVE			| owns backing memory (hash table)								|
 `chan T`						| SHARE			| reference-typed by design, handle copy						| SHARE — both sides hold a handle to the same underlying object
 `error`, `any`					| SHARE			| Opaque interface ptr; nilable, handle copy					|
-`&T`, `*T` (borrows)			| n/a			| not owned, Borrows can't be moved or cloned; lifetime rules	|
+`&T`, `&mut T`, `*T`			| n/a			| Borrows can't be moved or cloned; source frozen while held	|
 
 
 ### `volt` vs `C` vs `Go`

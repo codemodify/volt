@@ -19,20 +19,75 @@ typedef int           i32;
 typedef short         i16;
 typedef signed char   i8;
 typedef unsigned long u64;
+typedef unsigned char u8;
 
 // Arch-conditional Linux syscall numbers + the inline-asm wrappers.
 // amd64 uses `syscall`/rax; aarch64 uses `svc #0`/x8. The numbers differ.
 #if defined(__x86_64__)
-#define SYS_EXIT_GROUP 231
-#define SYS_FUTEX      202
-#define SYS_NANOSLEEP   35
+#define SYS_EXIT_GROUP      231
+#define SYS_FUTEX           202
+#define SYS_NANOSLEEP        35
+#define SYS_OPENAT          257
+#define SYS_READ              0
+#define SYS_WRITE             1
+#define SYS_CLOSE             3
+#define SYS_UNLINKAT        263
+#define SYS_CLOCK_GETTIME   228
+#define SYS_SOCKET           41
+#define SYS_CONNECT          42
+#define SYS_ACCEPT           43
+#define SYS_BIND             49
+#define SYS_LISTEN           50
+#define SYS_SETSOCKOPT       54
+#define SYS_GETRANDOM       318
+#define SYS_MKDIRAT         258
+#define SYS_FACCESSAT       269
+#define SYS_GETTID          186
 #elif defined(__aarch64__)
-#define SYS_EXIT_GROUP  94
-#define SYS_FUTEX       98
-#define SYS_NANOSLEEP  101
+#define SYS_EXIT_GROUP       94
+#define SYS_FUTEX            98
+#define SYS_NANOSLEEP       101
+#define SYS_OPENAT           56
+#define SYS_READ             63
+#define SYS_WRITE            64
+#define SYS_CLOSE            57
+#define SYS_UNLINKAT         35
+#define SYS_CLOCK_GETTIME   113
+#define SYS_SOCKET          198
+#define SYS_CONNECT         203
+#define SYS_ACCEPT          202
+#define SYS_BIND            200
+#define SYS_LISTEN          201
+#define SYS_SETSOCKOPT      208
+#define SYS_GETRANDOM       278
+#define SYS_MKDIRAT          34
+#define SYS_FACCESSAT        48
+#define SYS_GETTID          178
 #else
 #error "unsupported arch"
 #endif
+
+// Socket-family / type constants (same on amd64 + arm64 Linux).
+#define AF_INET        2
+#define SOCK_STREAM    1
+#define IPPROTO_TCP    6
+#define SOL_SOCKET     1
+#define SO_REUSEADDR   2
+
+// CLOCK_REALTIME — wall clock; CLOCK_MONOTONIC — process-monotonic.
+#define CLOCK_REALTIME  0
+#define CLOCK_MONOTONIC 1
+
+// AT_FDCWD = -100 — passes "current working directory" to openat.
+#define AT_FDCWD (-100)
+
+// Open flags (Linux ABI; same numeric values across x86_64 and aarch64).
+#define O_RDONLY  0x0000
+#define O_WRONLY  0x0001
+#define O_RDWR    0x0002
+#define O_CREAT   0x0040
+#define O_TRUNC   0x0200
+#define O_APPEND  0x0400
 
 // ---------------------------------------------------------------------
 // Allocator: size-classed freelist over mmap-backed arena chunks.
@@ -86,6 +141,10 @@ static mutex_t       alloc_lock     = {0};
 static block_hdr_t*  freelists[NUM_SIZE_CLASSES] = {0};
 static char*         arena_curr     = 0;
 static char*         arena_end      = 0;
+// Tunable arena chunk size. Defaults to ARENA_CHUNK_SIZE; user can
+// override via runtime.SetArenaChunkSize for embedded / memory-tight
+// scenarios. volt_alloc reads this atomically when growing arenas.
+static i64           g_arena_chunk_size = ARENA_CHUNK_SIZE;
 
 // Memory-syscall syscall numbers (already declared above for FUTEX/EXIT_GROUP;
 // these are the alloc-time ones).
@@ -170,6 +229,85 @@ static void zero_bytes(void* p, i64 n) {
     for (i64 i = 0; i < n; i++) b[i] = 0;
 }
 
+// Forward decl: defined in the heap-range-tracker block below. Called
+// from volt_alloc to record mmap'd arena chunks + huge allocations.
+static void heap_range_record(char* start, i64 size);
+
+// Allocation counters for the heap-snapshot API. Bumped under
+// alloc_lock so callers see consistent counts vs heap_bytes.
+// `g_alloc_count`: total volt_alloc calls (lifetime, never decrements).
+// `g_free_count`:  total volt_free  calls (lifetime, never decrements).
+// `g_live_bytes`:  signed delta of (alloc payload) - (free payload).
+//                   approximate live-allocation footprint; doesn't
+//                   include the BLOCK_HDR_SIZE overhead per block.
+static i64 g_alloc_count = 0;
+static i64 g_free_count  = 0;
+static i64 g_live_bytes  = 0;
+
+// Per-size-class breakdown for runtime.HeapSnapshot (item 2) and the
+// memory profiler (item 3). All bumped under alloc_lock.
+//   g_live_count_class[sc]  — CURRENTLY-live block count in class sc
+//                             (alloc++ / free--). Index NUM_SIZE_CLASSES
+//                             would be the "huge" bucket but we keep it
+//                             separate so the array stays exactly sized.
+//   g_alloc_count_class[sc] — LIFETIME alloc count in class sc (memprofile).
+//   g_alloc_bytes_class[sc] — LIFETIME slot bytes handed out in class sc.
+// The *_huge scalars track mmap-direct (>32 KiB) allocations.
+static i64 g_live_count_class[NUM_SIZE_CLASSES]  = {0};
+static i64 g_alloc_count_class[NUM_SIZE_CLASSES] = {0};
+static i64 g_alloc_bytes_class[NUM_SIZE_CLASSES] = {0};
+static i64 g_live_count_huge  = 0;
+static i64 g_alloc_count_huge = 0;
+static i64 g_alloc_bytes_huge = 0;
+
+// Call-site (source-line) allocation profiling. Enabled by
+// `volt build --memprofile` (set_path turns g_mp_line_enabled on).
+// Each thread stamps its current source line via
+// volt_memprofile_note_line; volt_alloc folds the allocation into a
+// per-line bucket (linear-probe table) under alloc_lock. When
+// disabled, volt_alloc skips the table entirely (one predicted-false
+// branch). The line==0 bucket collects runtime-internal allocations
+// (chan/map machinery) that ran without a user line stamped.
+#define MP_LINE_SLOTS 1024
+// NOTE: a plain global, NOT __thread — volt's bare `_start` sets up no
+// TLS (no libc), so thread-local storage would fault on first access.
+// Under multithreading the "current line" is therefore shared, making
+// attribution approximate; documented in runtime.MemProfileDump.
+static i64 g_mp_line = 0;
+static i32 g_mp_line_enabled  = 0;
+// Keys are stored as (line + 1) so a zero slot means "empty". The
+// line==0 bucket (runtime-internal allocs) therefore stores key 1.
+static i64 g_mp_line_keys[MP_LINE_SLOTS]  = {0};
+static i64 g_mp_line_count[MP_LINE_SLOTS] = {0};
+static i64 g_mp_line_bytes[MP_LINE_SLOTS] = {0};
+static i32 g_mp_line_used = 0;                     // distinct lines recorded
+
+// mp_line_record folds one allocation (slot bytes) into the per-line
+// table. Caller holds alloc_lock. Linear-probe on (line+1). When the
+// table fills (>MP_LINE_SLOTS distinct lines — generous for real
+// programs), extra allocations fold into slot 0 (documented approx).
+static void mp_line_record(i64 line, i64 slot_bytes) {
+    i64 stored = line + 1;
+    i64 home = stored & (MP_LINE_SLOTS - 1);
+    for (i32 i = 0; i < MP_LINE_SLOTS; i++) {
+        i64 idx = (home + i) & (MP_LINE_SLOTS - 1);
+        if (g_mp_line_keys[idx] == stored) {
+            g_mp_line_count[idx]++;
+            g_mp_line_bytes[idx] += slot_bytes;
+            return;
+        }
+        if (g_mp_line_keys[idx] == 0) {
+            g_mp_line_keys[idx] = stored;
+            g_mp_line_count[idx] = 1;
+            g_mp_line_bytes[idx] = slot_bytes;
+            g_mp_line_used++;
+            return;
+        }
+    }
+    g_mp_line_count[0]++;
+    g_mp_line_bytes[0] += slot_bytes;
+}
+
 void* volt_alloc(i64 size) {
     if (size <= 0) return (void*)0;
     i32 sc = find_size_class(size);
@@ -177,37 +315,53 @@ void* volt_alloc(i64 size) {
     // Must be declared before any goto / asm so the prelude — including the
     // mutex_lock — runs first.
     void* result;
+    i64 mp_slot = 0;   // slot bytes of this alloc, for per-line profiling
 
     mutex_lock(&alloc_lock);
+    g_alloc_count++;
+    // Track full-slot bytes so alloc/free balance — freed blocks return
+    // their entire size-class bucket to the live-bytes tally.
 
     if (sc < 0) {
         // Huge: mmap-direct. Round to page (4 KiB) so munmap takes it back.
         i64 total = (BLOCK_HDR_SIZE + size + 4095) & ~4095;
         block_hdr_t* hdr = (block_hdr_t*)volt_mmap_anon(total);
+        if (hdr) heap_range_record((char*)hdr, total);
         if (!hdr) {
             mutex_unlock(&alloc_lock);
             volt_die();
         }
         hdr->tag = -1;
         hdr->huge_size = total;
+        g_live_bytes += (total - BLOCK_HDR_SIZE);
+        g_live_count_huge++;
+        g_alloc_count_huge++;
+        g_alloc_bytes_huge += (total - BLOCK_HDR_SIZE);
+        mp_slot = total - BLOCK_HDR_SIZE;
         result = (char*)hdr + BLOCK_HDR_SIZE;
     } else if (freelists[sc]) {
         block_hdr_t* hdr = freelists[sc];
         freelists[sc] = (block_hdr_t*)hdr->tag;  // next link was stashed in tag
         hdr->tag = sc;                             // restore tag for free()
         hdr->huge_size = 0;
+        g_live_bytes += size_class_bytes[sc];
+        g_live_count_class[sc]++;
+        g_alloc_count_class[sc]++;
+        g_alloc_bytes_class[sc] += size_class_bytes[sc];
+        mp_slot = size_class_bytes[sc];
         result = (char*)hdr + BLOCK_HDR_SIZE;
     } else {
         // Bump from current arena chunk.
         i64 block_size = BLOCK_HDR_SIZE + size_class_bytes[sc];
         if (arena_curr + block_size > arena_end) {
-            i64 chunk = ARENA_CHUNK_SIZE;
-            if (block_size > chunk) chunk = (block_size + 4095) & ~4095;
+            i64 chunk = __atomic_load_n(&g_arena_chunk_size, __ATOMIC_ACQUIRE);
+            if (block_size > chunk) chunk = (block_size + 4095) & ~(i64)4095;
             char* base = (char*)volt_mmap_anon(chunk);
             if (!base) {
                 mutex_unlock(&alloc_lock);
                 volt_die();
             }
+            heap_range_record(base, chunk);
             arena_curr = base;
             arena_end  = base + chunk;
         }
@@ -215,7 +369,18 @@ void* volt_alloc(i64 size) {
         hdr->tag       = sc;
         hdr->huge_size = 0;
         arena_curr    += block_size;
+        g_live_bytes += size_class_bytes[sc];
+        g_live_count_class[sc]++;
+        g_alloc_count_class[sc]++;
+        g_alloc_bytes_class[sc] += size_class_bytes[sc];
+        mp_slot = size_class_bytes[sc];
         result         = (char*)hdr + BLOCK_HDR_SIZE;
+    }
+
+    // Per-line attribution (opt-in via --memprofile). Folded under the
+    // same lock so the line table stays consistent with the counters.
+    if (g_mp_line_enabled) {
+        mp_line_record(g_mp_line, mp_slot);
     }
 
     mutex_unlock(&alloc_lock);
@@ -226,6 +391,101 @@ void* volt_alloc(i64 size) {
     return result;
 }
 
+// Forward decl so volt_slice_free / volt_map_free can call volt_free
+// (which is defined immediately below them).
+void volt_free(void* ptr);
+
+// Forward decl: volt_race_acquire/release are defined in the D.1
+// race-detector block but called by volt_chan_send/recv for per-
+// message happens-before tracking. When -race is off the detector
+// short-circuits to no-op so these calls are cheap.
+void volt_race_acquire(void* ptr);
+void volt_race_release(void* ptr);
+
+// Heap-range tracker — records every mmap'd region returned by
+// volt_mmap_anon so volt_str_free can verify a pointer originated in
+// the heap before freeing it. Without this, freeing a string literal
+// (whose ptr lies in .rodata) would corrupt the freelist. The list
+// is append-only (we don't shrink) and small in practice — each entry
+// is one arena chunk (multi-MB) or a huge-alloc block.
+#define HEAP_RANGE_MAX 256
+typedef struct { char* start; char* end; } heap_range_t;
+static heap_range_t g_heap_ranges[HEAP_RANGE_MAX];
+static i32          g_heap_range_count = 0;
+static mutex_t      g_heap_range_lock  = {0};
+
+static void heap_range_record(char* start, i64 size) {
+    mutex_lock(&g_heap_range_lock);
+    if (g_heap_range_count < HEAP_RANGE_MAX) {
+        g_heap_ranges[g_heap_range_count].start = start;
+        g_heap_ranges[g_heap_range_count].end   = start + size;
+        g_heap_range_count++;
+    }
+    mutex_unlock(&g_heap_range_lock);
+}
+
+static i32 heap_range_contains(void* p) {
+    char* ptr = (char*)p;
+    i32 n = __atomic_load_n(&g_heap_range_count, __ATOMIC_ACQUIRE);
+    for (i32 i = 0; i < n; i++) {
+        if (ptr >= g_heap_ranges[i].start && ptr < g_heap_ranges[i].end) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// volt_str_free frees the backing buffer of a heap-allocated string.
+// Runtime-safe: the heap-range check rejects pointers that didn't come
+// from volt_alloc (string literals in .rodata, foreign-allocated bytes)
+// — those become silent no-ops rather than corrupting the freelist.
+// Null-safe.
+void volt_str_free(void* buf_ptr) {
+    if (!buf_ptr) return;
+    if (!heap_range_contains(buf_ptr)) return;
+    volt_free(buf_ptr);
+}
+
+// volt_slice_free frees the backing buffer of a slice. The slice
+// header lives at a user-side alloca; the buffer is what was returned
+// by volt_alloc for the element storage. Passing 0 is a no-op so the
+// codegen can emit unconditional drops and let null sentinels (set
+// when ownership transferred) short-circuit the call.
+void volt_slice_free(void* buf_ptr) {
+    if (!buf_ptr) return;
+    volt_free(buf_ptr);
+}
+
+// volt_map_free frees a map's entries, its buckets array, and the
+// map_t header itself. Walks every bucket's linked list freeing each
+// map_entry_t. Keys (key_ptr) are NOT owned by the entry — they're
+// references into the caller's string storage (often a string literal
+// in .rodata or a heap string owned by some other Drop chain); freeing
+// them here would either segfault or double-free. Passing 0 is a
+// no-op so codegen can emit unconditional drops paired with
+// nullify-on-move.
+void volt_map_free(void* m_) {
+    if (!m_) return;
+    struct map_entry_lf { struct map_entry_lf* next; char* key_ptr; i64 key_len; i64 value; };
+    struct map_t_local {
+        mutex_t       lock;
+        i64           count;
+        i64           num_buckets;
+        struct map_entry_lf** buckets;
+    };
+    struct map_t_local* m = (struct map_t_local*)m_;
+    for (i64 i = 0; i < m->num_buckets; i++) {
+        struct map_entry_lf* e = m->buckets[i];
+        while (e) {
+            struct map_entry_lf* next = e->next;
+            volt_free(e);
+            e = next;
+        }
+    }
+    volt_free(m->buckets);
+    volt_free(m);
+}
+
 // volt_free returns a block to its size-class freelist, or munmaps it
 // if it was a huge alloc. Passing 0 is a no-op (Go-style).
 void volt_free(void* ptr) {
@@ -234,17 +494,245 @@ void volt_free(void* ptr) {
     i64 tag = hdr->tag;
 
     mutex_lock(&alloc_lock);
+    g_free_count++;
     if (tag < 0) {
         i64 huge = hdr->huge_size;
+        // Subtract the user portion (huge minus header). Snapshot is
+        // approximate — we don't recall the original `size` request,
+        // only the page-rounded total mmap.
+        g_live_bytes -= (huge - BLOCK_HDR_SIZE);
+        g_live_count_huge--;
         mutex_unlock(&alloc_lock);
         volt_munmap(hdr, huge);
         return;
     }
     i32 sc = (i32)tag;
+    g_live_bytes -= size_class_bytes[sc];
+    g_live_count_class[sc]--;
     // Stash the next-link in tag (overwrites the size class — we'll
     // restore it in volt_alloc when this block is popped).
     hdr->tag = (i64)freelists[sc];
     freelists[sc] = hdr;
+    mutex_unlock(&alloc_lock);
+}
+
+// volt_compact walks each size-class freelist, sorts entries by their
+// arena address, and merges any pair of consecutive FREE blocks into
+// a single larger block in the next-up size class. Runs under
+// alloc_lock so it's safe vs concurrent volt_alloc/volt_free but
+// blocks them for the duration.
+//
+// Merge math: two adjacent sc-blocks span `2 * (16 + sc_bytes)`
+// bytes total. Treating that span as a single block with one header
+// at offset 0 gives user-region size `16 + 2*sc_bytes`. Size class
+// sc+1 has user size `2*sc_bytes` (the table doubles), so the merged
+// block fits with 16 bytes of trailing waste — acceptable; the
+// alternative would be a custom-size class table per merge.
+//
+// Iterative pass: after merging N pairs in sc into sc+1, the new
+// sc+1 blocks become candidates for further merging if THEY end up
+// adjacent. The outer loop runs over sc=0..NUM_SIZE_CLASSES-2.
+// Per-class merges feed sc+1's freelist which is processed on the
+// NEXT outer-loop iteration, so a single pass through sc handles up
+// to one merge per pair. The user calls volt_compact() again for
+// deeper consolidation if needed.
+#define COMPACT_MAX_PER_CLASS 4096
+static block_hdr_t* compact_buf[COMPACT_MAX_PER_CLASS];
+
+void volt_compact(void) {
+    mutex_lock(&alloc_lock);
+    // Iterative: keep sweeping size classes until a full pass produces
+    // zero merges. A single sweep handles all currently-adjacent
+    // pairs at each size class; merged blocks land in sc+1's freelist
+    // and become candidates on the NEXT pass at sc+1. Loop bound is
+    // safety only — NUM_SIZE_CLASSES * 2 is plenty in practice
+    // because each pass at level sc can only feed sc+1.
+    i32 safety_iter = NUM_SIZE_CLASSES * 2;
+    while (safety_iter-- > 0) {
+        i64 merges_this_pass = 0;
+    for (i32 sc = 0; sc < NUM_SIZE_CLASSES - 1; sc++) {
+        // Drain freelist[sc] into compact_buf.
+        i32 n = 0;
+        block_hdr_t* head = freelists[sc];
+        while (head && n < COMPACT_MAX_PER_CLASS) {
+            block_hdr_t* next = (block_hdr_t*)head->tag;
+            compact_buf[n++] = head;
+            head = next;
+        }
+        // Preserve any tail beyond the buffer cap.
+        block_hdr_t* tail = head;
+
+        // Insertion sort by address.
+        for (i32 i = 1; i < n; i++) {
+            block_hdr_t* x = compact_buf[i];
+            i32 j = i - 1;
+            while (j >= 0 && (char*)compact_buf[j] > (char*)x) {
+                compact_buf[j+1] = compact_buf[j];
+                j--;
+            }
+            compact_buf[j+1] = x;
+        }
+
+        i64 block_size = BLOCK_HDR_SIZE + size_class_bytes[sc];
+        // Reset freelist[sc] to the un-drained tail; we'll push back any
+        // unmerged blocks plus the tail at the end.
+        freelists[sc] = tail;
+        for (i32 i = 0; i < n; ) {
+            if (i + 1 < n) {
+                block_hdr_t* a = compact_buf[i];
+                block_hdr_t* b = compact_buf[i+1];
+                if ((char*)a + block_size == (char*)b) {
+                    // Merge: a now represents an sc+1-sized block. Push
+                    // it onto freelists[sc+1] for further compaction
+                    // on the next outer-loop iteration.
+                    a->tag = (i64)freelists[sc+1];
+                    a->huge_size = 0;
+                    freelists[sc+1] = a;
+                    merges_this_pass++;
+                    i += 2;
+                    continue;
+                }
+            }
+            // No merge — push back to freelist[sc].
+            block_hdr_t* x = compact_buf[i];
+            x->tag = (i64)freelists[sc];
+            freelists[sc] = x;
+            i++;
+        }
+    }
+        if (merges_this_pass == 0) break;
+    }
+    mutex_unlock(&alloc_lock);
+}
+
+// volt_runtime_thread_count is defined below alongside the race
+// detector (where g_race_thread_count lives).
+i64 volt_runtime_thread_count(void);
+
+// Public setter for the arena chunk size (storage lives before
+// volt_alloc for forward visibility). Clamps to [4 KiB, 256 MiB]
+// and rounds up to the page boundary.
+
+void volt_runtime_set_arena_chunk_size(i64 bytes) {
+    if (bytes < 4096) bytes = 4096;    // page minimum
+    if (bytes > (i64)256 * 1024 * 1024) bytes = (i64)256 * 1024 * 1024; // sanity cap
+    // Round up to 4K page boundary.
+    bytes = (bytes + 4095) & ~(i64)4095;
+    __atomic_store_n(&g_arena_chunk_size, bytes, __ATOMIC_RELEASE);
+}
+
+// volt_runtime_heap_bytes returns the total bytes currently mmap'd
+// for the allocator (sum of all heap_range_record entries). NOT the
+// active-allocation count — fragmentation, freelist holes, and the
+// current arena's unused tail all contribute. Call after Compact()
+// for the most accurate "I'm using N bytes" reading.
+i64 volt_runtime_heap_bytes(void) {
+    i64 total = 0;
+    i32 n = __atomic_load_n(&g_heap_range_count, __ATOMIC_ACQUIRE);
+    for (i32 i = 0; i < n; i++) {
+        total += (i64)(g_heap_ranges[i].end - g_heap_ranges[i].start);
+    }
+    return total;
+}
+
+// volt_runtime_freelist_count returns the number of FREE blocks in
+// size-class `sc` (clamped to a valid range). 0 for any sc out of
+// bounds. Surfaced via runtime.FreelistCounts which calls this for
+// each class.
+i64 volt_runtime_freelist_count(i64 sc) {
+    if (sc < 0 || sc >= NUM_SIZE_CLASSES) return 0;
+    i64 count = 0;
+    mutex_lock(&alloc_lock);
+    block_hdr_t* p = freelists[sc];
+    while (p) {
+        count++;
+        p = (block_hdr_t*)p->tag;
+    }
+    mutex_unlock(&alloc_lock);
+    return count;
+}
+
+// volt_runtime_num_size_classes returns the number of size classes
+// — needed by runtime.FreelistCounts to size its output slice.
+i64 volt_runtime_num_size_classes(void) {
+    return (i64)NUM_SIZE_CLASSES;
+}
+
+// volt_runtime_alloc_count returns the lifetime alloc-call counter.
+i64 volt_runtime_alloc_count(void) {
+    return __atomic_load_n(&g_alloc_count, __ATOMIC_ACQUIRE);
+}
+
+// volt_runtime_free_count returns the lifetime free-call counter.
+i64 volt_runtime_free_count(void) {
+    return __atomic_load_n(&g_free_count, __ATOMIC_ACQUIRE);
+}
+
+// volt_runtime_live_bytes returns the approximate signed delta of
+// (alloc payload) - (free payload). Counts size-class slot bytes
+// rather than user-requested bytes — so a `volt_alloc(17)` that lands
+// in the 32-byte class contributes 32 to live_bytes. Reads under no
+// lock; the running write side bumps under alloc_lock so the
+// loaded value is a snapshot that may be stale by the time the call
+// returns.
+i64 volt_runtime_live_bytes(void) {
+    return __atomic_load_n(&g_live_bytes, __ATOMIC_ACQUIRE);
+}
+
+// volt_runtime_live_count_class returns the CURRENTLY-live block count
+// in size class `sc` (alloc minus free for that class). Out-of-range
+// sc returns 0. Backs runtime.HeapSnapshot's per-class breakdown.
+i64 volt_runtime_live_count_class(i64 sc) {
+    if (sc < 0 || sc >= NUM_SIZE_CLASSES) return 0;
+    return __atomic_load_n(&g_live_count_class[sc], __ATOMIC_ACQUIRE);
+}
+
+// volt_runtime_live_count_huge returns the live count of mmap-direct
+// (>32 KiB) allocations.
+i64 volt_runtime_live_count_huge(void) {
+    return __atomic_load_n(&g_live_count_huge, __ATOMIC_ACQUIRE);
+}
+
+// volt_runtime_alloc_count_class returns the LIFETIME alloc count in
+// size class `sc` (never decrements). Memory-profiler accessor.
+i64 volt_runtime_alloc_count_class(i64 sc) {
+    if (sc < 0 || sc >= NUM_SIZE_CLASSES) return 0;
+    return __atomic_load_n(&g_alloc_count_class[sc], __ATOMIC_ACQUIRE);
+}
+
+// volt_runtime_alloc_bytes_class returns the LIFETIME slot bytes handed
+// out in size class `sc`.
+i64 volt_runtime_alloc_bytes_class(i64 sc) {
+    if (sc < 0 || sc >= NUM_SIZE_CLASSES) return 0;
+    return __atomic_load_n(&g_alloc_bytes_class[sc], __ATOMIC_ACQUIRE);
+}
+
+// volt_runtime_size_class_bytes returns the byte capacity of size
+// class `sc` (16, 32, 64, ...). Lets the snapshot label each bucket.
+i64 volt_runtime_size_class_bytes(i64 sc) {
+    if (sc < 0 || sc >= NUM_SIZE_CLASSES) return 0;
+    return size_class_bytes[sc];
+}
+
+// volt_runtime_memprofile_reset zeroes the LIFETIME alloc histogram
+// (count + bytes per class, plus the huge scalars). Live counts are
+// untouched — they reflect outstanding allocations, not history.
+// Lets a profiler scope a region: reset, run, dump.
+void volt_runtime_memprofile_reset(void) {
+    mutex_lock(&alloc_lock);
+    for (i32 i = 0; i < NUM_SIZE_CLASSES; i++) {
+        g_alloc_count_class[i] = 0;
+        g_alloc_bytes_class[i] = 0;
+    }
+    g_alloc_count_huge = 0;
+    g_alloc_bytes_huge = 0;
+    // Also clear the per-line table so a scoped profile starts fresh.
+    for (i32 i = 0; i < MP_LINE_SLOTS; i++) {
+        g_mp_line_keys[i] = 0;
+        g_mp_line_count[i] = 0;
+        g_mp_line_bytes[i] = 0;
+    }
+    g_mp_line_used = 0;
     mutex_unlock(&alloc_lock);
 }
 
@@ -329,10 +817,20 @@ static void cond_broadcast(cond_t* c) {
 }
 
 // ---------------------------------------------------------------------
-// Blocking channel (single element type = i64)
+// Blocking channel — element-size parameterized.
+// The buffer is `cap * elem_size` raw bytes; send/recv memcpy at the
+// slot offset. send takes a pointer to the value; recv takes a pointer
+// to the destination. Channel handle is opaque (`ptr`) for users.
 // ---------------------------------------------------------------------
 
+// Channel backend tag — stored at offset 0 of every channel header so
+// the dispatcher can pick the right send/recv path.
+#define CHAN_BACKEND_MUTEX    0
+#define CHAN_BACKEND_LOCKFREE 1
+
 typedef struct {
+    i32      backend;      // = CHAN_BACKEND_MUTEX
+    i32      _pad0;
     mutex_t  lock;
     cond_t   not_full;
     cond_t   not_empty;
@@ -341,19 +839,89 @@ typedef struct {
     i64      head;
     i64      tail;
     i64      closed;
-    i64*     buf;          // always at least 1 slot — used as the rendezvous slot when cap == 0
-    // Unbuffered-only state (cap == 0). `has_handoff` is set by a
-    // sender after writing into buf[0]; cleared by the receiver after
-    // reading. `receivers_parked` is the count of receivers blocked
-    // on not_empty — used so volt_chan_try_send can synchronously
-    // hand off when a partner is already waiting (for select).
+    i64      elem_size;    // bytes per slot
+    void*    buf;          // (cap || 1) * elem_size bytes
     i64      has_handoff;
     i64      receivers_parked;
-} chan_i64_t;
+} chan_t;
 
-void* volt_chan_new(i64 cap) {
+// D.2: bounded MPMC lock-free queue (Vyukov-style). Each slot has a
+// sequence number; producers/consumers race via CAS on enq_pos/deq_pos
+// then write/read the slot. Capacity is rounded up to a power of 2.
+// cap=0 unbuffered rendezvous still falls back to the mutex backend
+// because there's no useful lock-free rendezvous (the operation is
+// inherently a synchronous handoff).
+typedef struct {
+    i32      backend;       // = CHAN_BACKEND_LOCKFREE
+    i32      _pad0;
+    i64      cap_mask;      // power-of-2 capacity minus 1
+    i64      elem_size;
+    i64      slot_stride;   // sizeof(i64) + aligned(elem_size)
+    i64      closed;        // atomic 0/1
+    i64      enq_pos;       // atomic monotonically increasing
+    i64      _pad1[7];      // separate cache lines for enq/deq
+    i64      deq_pos;
+    i64      _pad2[7];
+    void*    slots;
+} chan_lf_t;
+
+static i32 g_chan_default_backend = CHAN_BACKEND_MUTEX;
+
+void volt_channels_set_lockfree(i64 on) {
+    g_chan_default_backend = on ? CHAN_BACKEND_LOCKFREE : CHAN_BACKEND_MUTEX;
+}
+
+static i32 chan_backend(void* ch_) {
+    return *(i32*)ch_;
+}
+
+static i64 round_up_pow2(i64 x) {
+    if (x <= 1) return 1;
+    i64 n = 1;
+    while (n < x) n <<= 1;
+    return n;
+}
+
+static void chan_memcpy(void* dst, void* src, i64 n) {
+    u8* d = (u8*)dst;
+    u8* s = (u8*)src;
+    for (i64 i = 0; i < n; i++) d[i] = s[i];
+}
+
+static void* chan_slot(chan_t* c, i64 idx) {
+    return (void*)((u8*)c->buf + idx * c->elem_size);
+}
+
+static void* chan_lf_new(i64 cap, i64 elem_size) {
+    chan_lf_t* c = (chan_lf_t*)volt_alloc((i64)sizeof(chan_lf_t));
+    c->backend = CHAN_BACKEND_LOCKFREE;
+    i64 n = round_up_pow2(cap);
+    c->cap_mask = n - 1;
+    c->elem_size = elem_size;
+    // Slot stride: i64 seq + elem bytes, rounded to 8-byte alignment.
+    i64 stride = 8 + ((elem_size + 7) & ~(i64)7);
+    c->slot_stride = stride;
+    c->closed = 0;
+    c->enq_pos = 0;
+    c->deq_pos = 0;
+    c->slots = volt_alloc(n * stride);
+    u8* base = (u8*)c->slots;
+    for (i64 i = 0; i < n; i++) {
+        *(i64*)(base + i * stride) = i;
+    }
+    return (void*)c;
+}
+
+void* volt_chan_new(i64 cap, i64 elem_size) {
     if (cap < 0) cap = 0;
-    chan_i64_t* c = (chan_i64_t*)volt_alloc((i64)sizeof(chan_i64_t));
+    if (elem_size <= 0) elem_size = 8;
+    // Lock-free backend only applies to BUFFERED channels (cap > 0).
+    // cap=0 rendezvous keeps mutex semantics regardless.
+    if (cap > 0 && g_chan_default_backend == CHAN_BACKEND_LOCKFREE) {
+        return chan_lf_new(cap, elem_size);
+    }
+    chan_t* c = (chan_t*)volt_alloc((i64)sizeof(chan_t));
+    c->backend = CHAN_BACKEND_MUTEX;
     c->lock.state    = 0;
     c->not_full.seq  = 0;
     c->not_empty.seq = 0;
@@ -362,23 +930,155 @@ void* volt_chan_new(i64 cap) {
     c->head   = 0;
     c->tail   = 0;
     c->closed = 0;
+    c->elem_size = elem_size;
     c->has_handoff = 0;
     c->receivers_parked = 0;
-    // Always alloc at least 1 slot — for cap == 0, buf[0] is the
-    // rendezvous handoff slot; for cap > 0, it's the ring buffer.
     i64 slots = cap;
-    if (slots == 0) slots = 1;
-    c->buf = (i64*)volt_alloc(slots * (i64)sizeof(i64));
+    if (slots == 0) slots = 1; // always have a rendezvous slot for cap=0
+    c->buf = volt_alloc(slots * elem_size);
     return (void*)c;
 }
 
-void volt_chan_send(void* ch_, i64 v) {
-    chan_i64_t* c = (chan_i64_t*)ch_;
+// ---- Lock-free MPMC ring (Vyukov bounded queue) ---------------------
+// Each slot carries a sequence number. Producer waits for seq == enq_pos,
+// then CAS-claims and writes data + sets seq = enq_pos + 1. Consumer
+// waits for seq == deq_pos + 1, claims via CAS, reads data + sets
+// seq = deq_pos + cap. Wrap-around is handled by the monotonic position
+// counters mod 2^64; the slot index is `pos & cap_mask`.
+//
+// On a full queue, send spin-waits (cheap CPU pause via __builtin_ia32_pause
+// where available, just a relaxed read otherwise). The mutex backend is
+// the right choice for genuinely-blocking workloads; lockfree is intended
+// for hot fan-in/fan-out where contention dominates lock acquisition.
+
+static inline u8* chan_lf_slot(chan_lf_t* c, i64 pos) {
+    return (u8*)c->slots + (pos & c->cap_mask) * c->slot_stride;
+}
+
+static void cpu_pause(void) {
+#if defined(__x86_64__)
+    __asm__ volatile("pause" ::: "memory");
+#elif defined(__aarch64__)
+    __asm__ volatile("yield" ::: "memory");
+#endif
+}
+
+static void chan_lf_send(chan_lf_t* c, void* val_src) {
+    for (;;) {
+        if (__atomic_load_n(&c->closed, __ATOMIC_ACQUIRE)) {
+            volt_die();
+        }
+        i64 pos = __atomic_load_n(&c->enq_pos, __ATOMIC_RELAXED);
+        u8* slot = chan_lf_slot(c, pos);
+        i64 seq = __atomic_load_n((i64*)slot, __ATOMIC_ACQUIRE);
+        i64 diff = seq - pos;
+        if (diff == 0) {
+            i64 expected = pos;
+            if (__atomic_compare_exchange_n(&c->enq_pos, &expected, pos + 1,
+                    0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+                chan_memcpy(slot + 8, val_src, c->elem_size);
+                __atomic_store_n((i64*)slot, pos + 1, __ATOMIC_RELEASE);
+                return;
+            }
+        } else if (diff < 0) {
+            // Full — spin briefly and retry.
+            cpu_pause();
+        } else {
+            // Lost the race; another producer advanced enq_pos.
+            cpu_pause();
+        }
+    }
+}
+
+static i64 chan_lf_recv(chan_lf_t* c, void* val_dest) {
+    for (;;) {
+        i64 pos = __atomic_load_n(&c->deq_pos, __ATOMIC_RELAXED);
+        u8* slot = chan_lf_slot(c, pos);
+        i64 seq = __atomic_load_n((i64*)slot, __ATOMIC_ACQUIRE);
+        i64 diff = seq - (pos + 1);
+        if (diff == 0) {
+            i64 expected = pos;
+            if (__atomic_compare_exchange_n(&c->deq_pos, &expected, pos + 1,
+                    0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+                chan_memcpy(val_dest, slot + 8, c->elem_size);
+                __atomic_store_n((i64*)slot, pos + c->cap_mask + 1, __ATOMIC_RELEASE);
+                return 1;
+            }
+        } else if (diff < 0) {
+            // Empty — check closed condition.
+            if (__atomic_load_n(&c->closed, __ATOMIC_ACQUIRE)) {
+                // Double-check the slot didn't get filled between reads.
+                i64 enq = __atomic_load_n(&c->enq_pos, __ATOMIC_ACQUIRE);
+                if (enq <= pos) {
+                    u8* d = (u8*)val_dest;
+                    for (i64 i = 0; i < c->elem_size; i++) d[i] = 0;
+                    return 0;
+                }
+            }
+            cpu_pause();
+        } else {
+            cpu_pause();
+        }
+    }
+}
+
+static void chan_lf_close(chan_lf_t* c) {
+    __atomic_store_n(&c->closed, 1, __ATOMIC_RELEASE);
+}
+
+static i64 chan_lf_try_send(chan_lf_t* c, void* val_src) {
+    if (__atomic_load_n(&c->closed, __ATOMIC_ACQUIRE)) return 0;
+    i64 pos = __atomic_load_n(&c->enq_pos, __ATOMIC_RELAXED);
+    u8* slot = chan_lf_slot(c, pos);
+    i64 seq = __atomic_load_n((i64*)slot, __ATOMIC_ACQUIRE);
+    if (seq != pos) return 0;
+    i64 expected = pos;
+    if (!__atomic_compare_exchange_n(&c->enq_pos, &expected, pos + 1,
+            0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+        return 0;
+    }
+    chan_memcpy(slot + 8, val_src, c->elem_size);
+    __atomic_store_n((i64*)slot, pos + 1, __ATOMIC_RELEASE);
+    return 1;
+}
+
+static i64 chan_lf_try_recv(chan_lf_t* c, void* val_dest) {
+    i64 pos = __atomic_load_n(&c->deq_pos, __ATOMIC_RELAXED);
+    u8* slot = chan_lf_slot(c, pos);
+    i64 seq = __atomic_load_n((i64*)slot, __ATOMIC_ACQUIRE);
+    if (seq != pos + 1) {
+        if (__atomic_load_n(&c->closed, __ATOMIC_ACQUIRE)) {
+            i64 enq = __atomic_load_n(&c->enq_pos, __ATOMIC_ACQUIRE);
+            if (enq <= pos) {
+                u8* d = (u8*)val_dest;
+                for (i64 i = 0; i < c->elem_size; i++) d[i] = 0;
+                // Distinguish "closed-and-drained" from "empty" via a
+                // separate return convention: 0 = no value, 1 = got one,
+                // -1 = closed-drained. The mutex try_recv also returns 0
+                // for both cases, so callers must treat lockfree the same.
+                return 0;
+            }
+        }
+        return 0;
+    }
+    i64 expected = pos;
+    if (!__atomic_compare_exchange_n(&c->deq_pos, &expected, pos + 1,
+            0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+        return 0;
+    }
+    chan_memcpy(val_dest, slot + 8, c->elem_size);
+    __atomic_store_n((i64*)slot, pos + c->cap_mask + 1, __ATOMIC_RELEASE);
+    return 1;
+}
+
+void volt_chan_send(void* ch_, void* val_src) {
+    if (chan_backend(ch_) == CHAN_BACKEND_LOCKFREE) {
+        chan_lf_send((chan_lf_t*)ch_, val_src);
+        return;
+    }
+    chan_t* c = (chan_t*)ch_;
     mutex_lock(&c->lock);
     if (c->cap == 0) {
-        // Unbuffered: wait until any previous handoff has been picked
-        // up, then publish the value and wait until THIS one has
-        // been picked up. True rendezvous.
         while (c->has_handoff && !c->closed) {
             cond_wait(&c->not_full, &c->lock);
         }
@@ -386,7 +1086,12 @@ void volt_chan_send(void* ch_, i64 v) {
             mutex_unlock(&c->lock);
             volt_die();
         }
-        c->buf[0] = v;
+        chan_memcpy(chan_slot(c, 0), val_src, c->elem_size);
+        // Channel/race convergence: publish the sender's HB clock at
+        // the SLOT address (not the channel address), so each message
+        // gets its own happens-before edge. Lets the race detector
+        // distinguish "msg N before msg M" without false sharing.
+        volt_race_release(chan_slot(c, 0));
         c->has_handoff = 1;
         cond_signal(&c->not_empty);
         while (c->has_handoff && !c->closed) {
@@ -400,17 +1105,24 @@ void volt_chan_send(void* ch_, i64 v) {
     }
     if (c->closed) {
         mutex_unlock(&c->lock);
-        volt_die(); // send on closed channel — panic (Go-style)
+        volt_die();
     }
-    c->buf[c->tail] = v;
+    void* slot = chan_slot(c, c->tail);
+    chan_memcpy(slot, val_src, c->elem_size);
+    // Per-message HB: publish at the slot address.
+    volt_race_release(slot);
     c->tail = (c->tail + 1) % c->cap;
     c->len++;
     cond_signal(&c->not_empty);
     mutex_unlock(&c->lock);
 }
 
-i64 volt_chan_recv(void* ch_) {
-    chan_i64_t* c = (chan_i64_t*)ch_;
+// Returns 1 on success, 0 if channel closed+drained (val_dest is zeroed).
+i64 volt_chan_recv(void* ch_, void* val_dest) {
+    if (chan_backend(ch_) == CHAN_BACKEND_LOCKFREE) {
+        return chan_lf_recv((chan_lf_t*)ch_, val_dest);
+    }
+    chan_t* c = (chan_t*)ch_;
     mutex_lock(&c->lock);
     if (c->cap == 0) {
         c->receivers_parked++;
@@ -420,76 +1132,44 @@ i64 volt_chan_recv(void* ch_) {
         c->receivers_parked--;
         if (!c->has_handoff && c->closed) {
             mutex_unlock(&c->lock);
+            u8* d = (u8*)val_dest;
+            for (i64 i = 0; i < c->elem_size; i++) d[i] = 0;
             return 0;
         }
-        i64 v = c->buf[0];
-        c->has_handoff = 0;
-        cond_signal(&c->not_full); // wake the sender (and any try_send waiters)
-        mutex_unlock(&c->lock);
-        return v;
-    }
-    while (c->len == 0 && !c->closed) {
-        cond_wait(&c->not_empty, &c->lock);
-    }
-    if (c->len == 0 && c->closed) {
-        mutex_unlock(&c->lock);
-        return 0;
-    }
-    i64 v = c->buf[c->head];
-    c->head = (c->head + 1) % c->cap;
-    c->len--;
-    cond_signal(&c->not_full);
-    mutex_unlock(&c->lock);
-    return v;
-}
-
-// Two-value form: returns {value, ok}. `ok` is 0 if the channel was
-// closed AND empty when we tried to receive; 1 otherwise.
-typedef struct { i64 v; i64 ok; } chan_recv2_t;
-
-chan_recv2_t volt_chan_recv2(void* ch_) {
-    chan_i64_t* c = (chan_i64_t*)ch_;
-    chan_recv2_t r;
-    mutex_lock(&c->lock);
-    if (c->cap == 0) {
-        c->receivers_parked++;
-        while (!c->has_handoff && !c->closed) {
-            cond_wait(&c->not_empty, &c->lock);
-        }
-        c->receivers_parked--;
-        if (!c->has_handoff && c->closed) {
-            mutex_unlock(&c->lock);
-            r.v = 0;
-            r.ok = 0;
-            return r;
-        }
-        r.v = c->buf[0];
+        // Per-message HB: acquire the sender's clock at the slot.
+        volt_race_acquire(chan_slot(c, 0));
+        chan_memcpy(val_dest, chan_slot(c, 0), c->elem_size);
         c->has_handoff = 0;
         cond_signal(&c->not_full);
         mutex_unlock(&c->lock);
-        r.ok = 1;
-        return r;
+        return 1;
     }
     while (c->len == 0 && !c->closed) {
         cond_wait(&c->not_empty, &c->lock);
     }
     if (c->len == 0 && c->closed) {
         mutex_unlock(&c->lock);
-        r.v = 0;
-        r.ok = 0;
-        return r;
+        u8* d = (u8*)val_dest;
+        for (i64 i = 0; i < c->elem_size; i++) d[i] = 0;
+        return 0;
     }
-    r.v = c->buf[c->head];
+    void* slot = chan_slot(c, c->head);
+    // Per-message HB.
+    volt_race_acquire(slot);
+    chan_memcpy(val_dest, slot, c->elem_size);
     c->head = (c->head + 1) % c->cap;
     c->len--;
     cond_signal(&c->not_full);
     mutex_unlock(&c->lock);
-    r.ok = 1;
-    return r;
+    return 1;
 }
 
 void volt_chan_close(void* ch_) {
-    chan_i64_t* c = (chan_i64_t*)ch_;
+    if (chan_backend(ch_) == CHAN_BACKEND_LOCKFREE) {
+        chan_lf_close((chan_lf_t*)ch_);
+        return;
+    }
+    chan_t* c = (chan_t*)ch_;
     mutex_lock(&c->lock);
     c->closed = 1;
     cond_broadcast(&c->not_empty);
@@ -497,12 +1177,13 @@ void volt_chan_close(void* ch_) {
     mutex_unlock(&c->lock);
 }
 
-// Non-blocking send. Returns 1 if value was queued, 0 if the channel
-// is full. Panics if the channel is already closed (Go semantics).
-// On a cap=0 channel: succeeds only if a receiver is currently parked
-// — the value hands off synchronously to that receiver.
-i64 volt_chan_try_send(void* ch_, i64 v) {
-    chan_i64_t* c = (chan_i64_t*)ch_;
+// Non-blocking send. Returns 1 if value was queued, 0 if full.
+// On a cap=0 channel: succeeds only if a receiver is parked.
+i64 volt_chan_try_send(void* ch_, void* val_src) {
+    if (chan_backend(ch_) == CHAN_BACKEND_LOCKFREE) {
+        return chan_lf_try_send((chan_lf_t*)ch_, val_src);
+    }
+    chan_t* c = (chan_t*)ch_;
     mutex_lock(&c->lock);
     if (c->closed) {
         mutex_unlock(&c->lock);
@@ -513,7 +1194,7 @@ i64 volt_chan_try_send(void* ch_, i64 v) {
             mutex_unlock(&c->lock);
             return 0;
         }
-        c->buf[0] = v;
+        chan_memcpy(chan_slot(c, 0), val_src, c->elem_size);
         c->has_handoff = 1;
         cond_signal(&c->not_empty);
         mutex_unlock(&c->lock);
@@ -523,7 +1204,7 @@ i64 volt_chan_try_send(void* ch_, i64 v) {
         mutex_unlock(&c->lock);
         return 0;
     }
-    c->buf[c->tail] = v;
+    chan_memcpy(chan_slot(c, c->tail), val_src, c->elem_size);
     c->tail = (c->tail + 1) % c->cap;
     c->len++;
     cond_signal(&c->not_empty);
@@ -531,40 +1212,36 @@ i64 volt_chan_try_send(void* ch_, i64 v) {
     return 1;
 }
 
-// Non-blocking recv. Returns {value, ok}: ok=1 on success, ok=0 if
-// the channel is empty AND open, ok=0 with value=0 if closed+empty.
+// Non-blocking recv. Returns 1 if value was dequeued, 0 if empty.
 // On a cap=0 channel: succeeds only if a sender's handoff is pending.
-chan_recv2_t volt_chan_try_recv(void* ch_) {
-    chan_i64_t* c = (chan_i64_t*)ch_;
-    chan_recv2_t r;
+// Writes the dequeued bytes to *val_dest on success; zeroes on closed+empty.
+i64 volt_chan_try_recv(void* ch_, void* val_dest) {
+    if (chan_backend(ch_) == CHAN_BACKEND_LOCKFREE) {
+        return chan_lf_try_recv((chan_lf_t*)ch_, val_dest);
+    }
+    chan_t* c = (chan_t*)ch_;
     mutex_lock(&c->lock);
     if (c->cap == 0) {
         if (!c->has_handoff) {
             mutex_unlock(&c->lock);
-            r.v = 0;
-            r.ok = 0;
-            return r;
+            return 0;
         }
-        r.v = c->buf[0];
+        chan_memcpy(val_dest, chan_slot(c, 0), c->elem_size);
         c->has_handoff = 0;
         cond_signal(&c->not_full);
         mutex_unlock(&c->lock);
-        r.ok = 1;
-        return r;
+        return 1;
     }
     if (c->len == 0) {
         mutex_unlock(&c->lock);
-        r.v = 0;
-        r.ok = 0;
-        return r;
+        return 0;
     }
-    r.v = c->buf[c->head];
+    chan_memcpy(val_dest, chan_slot(c, c->head), c->elem_size);
     c->head = (c->head + 1) % c->cap;
     c->len--;
     cond_signal(&c->not_full);
     mutex_unlock(&c->lock);
-    r.ok = 1;
-    return r;
+    return 1;
 }
 
 // Sleep for `ns` nanoseconds via the sys_nanosleep syscall.
@@ -592,6 +1269,159 @@ void volt_sleep(i64 ns) {
 #endif
 }
 
+// volt_remove unlinks the entry at `path`. Mirrors Go's os.Remove:
+// tries a plain unlinkat first (works for files); on EISDIR retries
+// with AT_REMOVEDIR (works for empty directories). Returns 0 on
+// success or -errno.
+i64 volt_remove(const char* path_ptr, i64 path_len) {
+    if (path_len < 0 || path_len > 4095) return -36; // ENAMETOOLONG
+    char nbuf[4096];
+    for (i64 i = 0; i < path_len; i++) nbuf[i] = path_ptr[i];
+    nbuf[path_len] = 0;
+    i64 rc;
+#if defined(__x86_64__)
+    {
+        register i64 rax __asm__("rax") = SYS_UNLINKAT;
+        register i64 rdi __asm__("rdi") = AT_FDCWD;
+        register i64 rsi __asm__("rsi") = (i64)nbuf;
+        register i64 rdx __asm__("rdx") = 0;
+        __asm__ volatile("syscall"
+            : "+r"(rax)
+            : "r"(rdi), "r"(rsi), "r"(rdx)
+            : "rcx", "r11", "memory");
+        rc = rax;
+    }
+    if (rc == -21) {
+        register i64 rax __asm__("rax") = SYS_UNLINKAT;
+        register i64 rdi __asm__("rdi") = AT_FDCWD;
+        register i64 rsi __asm__("rsi") = (i64)nbuf;
+        register i64 rdx __asm__("rdx") = 0x200; // AT_REMOVEDIR
+        __asm__ volatile("syscall"
+            : "+r"(rax)
+            : "r"(rdi), "r"(rsi), "r"(rdx)
+            : "rcx", "r11", "memory");
+        rc = rax;
+    }
+#elif defined(__aarch64__)
+    {
+        register i64 x8 __asm__("x8") = SYS_UNLINKAT;
+        register i64 x0 __asm__("x0") = AT_FDCWD;
+        register i64 x1 __asm__("x1") = (i64)nbuf;
+        register i64 x2 __asm__("x2") = 0;
+        __asm__ volatile("svc #0"
+            : "+r"(x0)
+            : "r"(x8), "r"(x1), "r"(x2)
+            : "memory");
+        rc = x0;
+    }
+    if (rc == -21) {
+        register i64 x8 __asm__("x8") = SYS_UNLINKAT;
+        register i64 x0 __asm__("x0") = AT_FDCWD;
+        register i64 x1 __asm__("x1") = (i64)nbuf;
+        register i64 x2 __asm__("x2") = 0x200;
+        __asm__ volatile("svc #0"
+            : "+r"(x0)
+            : "r"(x8), "r"(x1), "r"(x2)
+            : "memory");
+        rc = x0;
+    }
+#endif
+    return rc;
+}
+
+// volt_mkdir creates the directory at `path` with the given mode
+// (POSIX permission bits, typically 0755). Returns 0 on success or
+// -errno. The path is copied to a NUL-terminated scratch buffer.
+i64 volt_mkdir(const char* path_ptr, i64 path_len, i64 mode) {
+    if (path_len < 0 || path_len > 4095) return -36; // ENAMETOOLONG
+    char nbuf[4096];
+    for (i64 i = 0; i < path_len; i++) nbuf[i] = path_ptr[i];
+    nbuf[path_len] = 0;
+#if defined(__x86_64__)
+    register i64 rax __asm__("rax") = SYS_MKDIRAT;
+    register i64 rdi __asm__("rdi") = AT_FDCWD;
+    register i64 rsi __asm__("rsi") = (i64)nbuf;
+    register i64 rdx __asm__("rdx") = mode;
+    __asm__ volatile("syscall"
+        : "+r"(rax)
+        : "r"(rdi), "r"(rsi), "r"(rdx)
+        : "rcx", "r11", "memory");
+    return rax;
+#elif defined(__aarch64__)
+    register i64 x8 __asm__("x8") = SYS_MKDIRAT;
+    register i64 x0 __asm__("x0") = AT_FDCWD;
+    register i64 x1 __asm__("x1") = (i64)nbuf;
+    register i64 x2 __asm__("x2") = mode;
+    __asm__ volatile("svc #0"
+        : "+r"(x0)
+        : "r"(x8), "r"(x1), "r"(x2)
+        : "memory");
+    return x0;
+#endif
+}
+
+// volt_path_exists returns 1 if `path` is accessible (F_OK = 0 means
+// "test for existence"), 0 if not. Implemented via faccessat(2).
+i64 volt_path_exists(const char* path_ptr, i64 path_len) {
+    if (path_len < 0 || path_len > 4095) return 0;
+    char nbuf[4096];
+    for (i64 i = 0; i < path_len; i++) nbuf[i] = path_ptr[i];
+    nbuf[path_len] = 0;
+    i64 rc;
+#if defined(__x86_64__)
+    register i64 rax __asm__("rax") = SYS_FACCESSAT;
+    register i64 rdi __asm__("rdi") = AT_FDCWD;
+    register i64 rsi __asm__("rsi") = (i64)nbuf;
+    register i64 rdx __asm__("rdx") = 0; // F_OK
+    __asm__ volatile("syscall"
+        : "+r"(rax)
+        : "r"(rdi), "r"(rsi), "r"(rdx)
+        : "rcx", "r11", "memory");
+    rc = rax;
+#elif defined(__aarch64__)
+    register i64 x8 __asm__("x8") = SYS_FACCESSAT;
+    register i64 x0 __asm__("x0") = AT_FDCWD;
+    register i64 x1 __asm__("x1") = (i64)nbuf;
+    register i64 x2 __asm__("x2") = 0;
+    __asm__ volatile("svc #0"
+        : "+r"(x0)
+        : "r"(x8), "r"(x1), "r"(x2)
+        : "memory");
+    rc = x0;
+#endif
+    return rc == 0 ? 1 : 0;
+}
+
+// volt_getrandom fills `buf[0..n]` with cryptographically-random
+// bytes via the Linux getrandom(2) syscall. Returns the number of
+// bytes actually written (≤ n) on success, or -errno on failure.
+// flags = 0 (blocks until kernel entropy is available; matches Go's
+// crypto/rand semantics for short reads).
+i64 volt_getrandom(char* buf, i64 n) {
+    if (n <= 0) return 0;
+#if defined(__x86_64__)
+    register i64 rax __asm__("rax") = SYS_GETRANDOM;
+    register i64 rdi __asm__("rdi") = (i64)buf;
+    register i64 rsi __asm__("rsi") = n;
+    register i64 rdx __asm__("rdx") = 0; // flags
+    __asm__ volatile("syscall"
+        : "+r"(rax)
+        : "r"(rdi), "r"(rsi), "r"(rdx)
+        : "rcx", "r11", "memory");
+    return rax;
+#elif defined(__aarch64__)
+    register i64 x8 __asm__("x8") = SYS_GETRANDOM;
+    register i64 x0 __asm__("x0") = (i64)buf;
+    register i64 x1 __asm__("x1") = n;
+    register i64 x2 __asm__("x2") = 0;
+    __asm__ volatile("svc #0"
+        : "+r"(x0)
+        : "r"(x8), "r"(x1), "r"(x2)
+        : "memory");
+    return x0;
+#endif
+}
+
 // Brief yield — used by select to avoid 100% CPU when no case is ready.
 // nanosleep(0, 1ms).
 void volt_yield(void) {
@@ -615,6 +1445,529 @@ void volt_yield(void) {
         : "r"(x8), "r"(x1)
         : "memory");
 #endif
+}
+
+// ---------------------------------------------------------------------
+// File I/O — direct syscalls (no libc).
+// Returns: nonnegative on success; negative -errno on failure
+// (matches the Linux kernel ABI directly).
+// ---------------------------------------------------------------------
+
+#if defined(__x86_64__)
+static i64 sys_openat(i64 dirfd, const char* path, i64 flags, i64 mode) {
+    register i64 rax __asm__("rax") = SYS_OPENAT;
+    register i64 rdi __asm__("rdi") = dirfd;
+    register i64 rsi __asm__("rsi") = (i64)path;
+    register i64 rdx __asm__("rdx") = flags;
+    register i64 r10 __asm__("r10") = mode;
+    __asm__ volatile("syscall"
+        : "+r"(rax)
+        : "r"(rdi), "r"(rsi), "r"(rdx), "r"(r10)
+        : "rcx", "r11", "memory");
+    return rax;
+}
+static i64 sys_read(i64 fd, void* buf, i64 n) {
+    register i64 rax __asm__("rax") = SYS_READ;
+    register i64 rdi __asm__("rdi") = fd;
+    register i64 rsi __asm__("rsi") = (i64)buf;
+    register i64 rdx __asm__("rdx") = n;
+    __asm__ volatile("syscall"
+        : "+r"(rax)
+        : "r"(rdi), "r"(rsi), "r"(rdx)
+        : "rcx", "r11", "memory");
+    return rax;
+}
+static i64 sys_write_raw(i64 fd, const void* buf, i64 n) {
+    register i64 rax __asm__("rax") = SYS_WRITE;
+    register i64 rdi __asm__("rdi") = fd;
+    register i64 rsi __asm__("rsi") = (i64)buf;
+    register i64 rdx __asm__("rdx") = n;
+    __asm__ volatile("syscall"
+        : "+r"(rax)
+        : "r"(rdi), "r"(rsi), "r"(rdx)
+        : "rcx", "r11", "memory");
+    return rax;
+}
+static i64 sys_close(i64 fd) {
+    register i64 rax __asm__("rax") = SYS_CLOSE;
+    register i64 rdi __asm__("rdi") = fd;
+    __asm__ volatile("syscall"
+        : "+r"(rax)
+        : "r"(rdi)
+        : "rcx", "r11", "memory");
+    return rax;
+}
+#elif defined(__aarch64__)
+static i64 sys_openat(i64 dirfd, const char* path, i64 flags, i64 mode) {
+    register i64 x8 __asm__("x8") = SYS_OPENAT;
+    register i64 x0 __asm__("x0") = dirfd;
+    register i64 x1 __asm__("x1") = (i64)path;
+    register i64 x2 __asm__("x2") = flags;
+    register i64 x3 __asm__("x3") = mode;
+    __asm__ volatile("svc #0"
+        : "+r"(x0)
+        : "r"(x8), "r"(x1), "r"(x2), "r"(x3)
+        : "memory");
+    return x0;
+}
+static i64 sys_read(i64 fd, void* buf, i64 n) {
+    register i64 x8 __asm__("x8") = SYS_READ;
+    register i64 x0 __asm__("x0") = fd;
+    register i64 x1 __asm__("x1") = (i64)buf;
+    register i64 x2 __asm__("x2") = n;
+    __asm__ volatile("svc #0"
+        : "+r"(x0)
+        : "r"(x8), "r"(x1), "r"(x2)
+        : "memory");
+    return x0;
+}
+static i64 sys_write_raw(i64 fd, const void* buf, i64 n) {
+    register i64 x8 __asm__("x8") = SYS_WRITE;
+    register i64 x0 __asm__("x0") = fd;
+    register i64 x1 __asm__("x1") = (i64)buf;
+    register i64 x2 __asm__("x2") = n;
+    __asm__ volatile("svc #0"
+        : "+r"(x0)
+        : "r"(x8), "r"(x1), "r"(x2)
+        : "memory");
+    return x0;
+}
+static i64 sys_close(i64 fd) {
+    register i64 x8 __asm__("x8") = SYS_CLOSE;
+    register i64 x0 __asm__("x0") = fd;
+    __asm__ volatile("svc #0"
+        : "+r"(x0)
+        : "r"(x8)
+        : "memory");
+    return x0;
+}
+#endif
+
+// ---- Socket syscall wrappers ---------------------------------------
+// Same shape per arch: rax/x8 holds the syscall number, args in the
+// standard ABI registers. accept(2) is used (not accept4) for max
+// compatibility — we don't pass flags.
+#if defined(__x86_64__)
+static i64 sys_socket(i64 domain, i64 type, i64 protocol) {
+    register i64 rax __asm__("rax") = SYS_SOCKET;
+    register i64 rdi __asm__("rdi") = domain;
+    register i64 rsi __asm__("rsi") = type;
+    register i64 rdx __asm__("rdx") = protocol;
+    __asm__ volatile("syscall"
+        : "+r"(rax)
+        : "r"(rdi), "r"(rsi), "r"(rdx)
+        : "rcx", "r11", "memory");
+    return rax;
+}
+static i64 sys_bind(i64 fd, const void* addr, i64 addrlen) {
+    register i64 rax __asm__("rax") = SYS_BIND;
+    register i64 rdi __asm__("rdi") = fd;
+    register i64 rsi __asm__("rsi") = (i64)addr;
+    register i64 rdx __asm__("rdx") = addrlen;
+    __asm__ volatile("syscall"
+        : "+r"(rax)
+        : "r"(rdi), "r"(rsi), "r"(rdx)
+        : "rcx", "r11", "memory");
+    return rax;
+}
+static i64 sys_listen(i64 fd, i64 backlog) {
+    register i64 rax __asm__("rax") = SYS_LISTEN;
+    register i64 rdi __asm__("rdi") = fd;
+    register i64 rsi __asm__("rsi") = backlog;
+    __asm__ volatile("syscall"
+        : "+r"(rax)
+        : "r"(rdi), "r"(rsi)
+        : "rcx", "r11", "memory");
+    return rax;
+}
+static i64 sys_accept(i64 fd, void* addr, void* addrlen) {
+    register i64 rax __asm__("rax") = SYS_ACCEPT;
+    register i64 rdi __asm__("rdi") = fd;
+    register i64 rsi __asm__("rsi") = (i64)addr;
+    register i64 rdx __asm__("rdx") = (i64)addrlen;
+    __asm__ volatile("syscall"
+        : "+r"(rax)
+        : "r"(rdi), "r"(rsi), "r"(rdx)
+        : "rcx", "r11", "memory");
+    return rax;
+}
+static i64 sys_connect(i64 fd, const void* addr, i64 addrlen) {
+    register i64 rax __asm__("rax") = SYS_CONNECT;
+    register i64 rdi __asm__("rdi") = fd;
+    register i64 rsi __asm__("rsi") = (i64)addr;
+    register i64 rdx __asm__("rdx") = addrlen;
+    __asm__ volatile("syscall"
+        : "+r"(rax)
+        : "r"(rdi), "r"(rsi), "r"(rdx)
+        : "rcx", "r11", "memory");
+    return rax;
+}
+static i64 sys_setsockopt(i64 fd, i64 level, i64 opt, const void* val, i64 vlen) {
+    register i64 rax __asm__("rax") = SYS_SETSOCKOPT;
+    register i64 rdi __asm__("rdi") = fd;
+    register i64 rsi __asm__("rsi") = level;
+    register i64 rdx __asm__("rdx") = opt;
+    register i64 r10 __asm__("r10") = (i64)val;
+    register i64 r8  __asm__("r8")  = vlen;
+    __asm__ volatile("syscall"
+        : "+r"(rax)
+        : "r"(rdi), "r"(rsi), "r"(rdx), "r"(r10), "r"(r8)
+        : "rcx", "r11", "memory");
+    return rax;
+}
+#elif defined(__aarch64__)
+static i64 sys_socket(i64 domain, i64 type, i64 protocol) {
+    register i64 x8 __asm__("x8") = SYS_SOCKET;
+    register i64 x0 __asm__("x0") = domain;
+    register i64 x1 __asm__("x1") = type;
+    register i64 x2 __asm__("x2") = protocol;
+    __asm__ volatile("svc #0"
+        : "+r"(x0)
+        : "r"(x8), "r"(x1), "r"(x2)
+        : "memory");
+    return x0;
+}
+static i64 sys_bind(i64 fd, const void* addr, i64 addrlen) {
+    register i64 x8 __asm__("x8") = SYS_BIND;
+    register i64 x0 __asm__("x0") = fd;
+    register i64 x1 __asm__("x1") = (i64)addr;
+    register i64 x2 __asm__("x2") = addrlen;
+    __asm__ volatile("svc #0"
+        : "+r"(x0)
+        : "r"(x8), "r"(x1), "r"(x2)
+        : "memory");
+    return x0;
+}
+static i64 sys_listen(i64 fd, i64 backlog) {
+    register i64 x8 __asm__("x8") = SYS_LISTEN;
+    register i64 x0 __asm__("x0") = fd;
+    register i64 x1 __asm__("x1") = backlog;
+    __asm__ volatile("svc #0"
+        : "+r"(x0)
+        : "r"(x8), "r"(x1)
+        : "memory");
+    return x0;
+}
+static i64 sys_accept(i64 fd, void* addr, void* addrlen) {
+    register i64 x8 __asm__("x8") = SYS_ACCEPT;
+    register i64 x0 __asm__("x0") = fd;
+    register i64 x1 __asm__("x1") = (i64)addr;
+    register i64 x2 __asm__("x2") = (i64)addrlen;
+    __asm__ volatile("svc #0"
+        : "+r"(x0)
+        : "r"(x8), "r"(x1), "r"(x2)
+        : "memory");
+    return x0;
+}
+static i64 sys_connect(i64 fd, const void* addr, i64 addrlen) {
+    register i64 x8 __asm__("x8") = SYS_CONNECT;
+    register i64 x0 __asm__("x0") = fd;
+    register i64 x1 __asm__("x1") = (i64)addr;
+    register i64 x2 __asm__("x2") = addrlen;
+    __asm__ volatile("svc #0"
+        : "+r"(x0)
+        : "r"(x8), "r"(x1), "r"(x2)
+        : "memory");
+    return x0;
+}
+static i64 sys_setsockopt(i64 fd, i64 level, i64 opt, const void* val, i64 vlen) {
+    register i64 x8 __asm__("x8") = SYS_SETSOCKOPT;
+    register i64 x0 __asm__("x0") = fd;
+    register i64 x1 __asm__("x1") = level;
+    register i64 x2 __asm__("x2") = opt;
+    register i64 x3 __asm__("x3") = (i64)val;
+    register i64 x4 __asm__("x4") = vlen;
+    __asm__ volatile("svc #0"
+        : "+r"(x0)
+        : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4)
+        : "memory");
+    return x0;
+}
+#endif
+
+// ---- High-level socket helpers exposed to volt ---------------------
+// All return >= 0 on success, < 0 on error (negated errno).
+
+// htons-style 16-bit byte swap for the port field of sockaddr_in.
+// Linux is little-endian on amd64+arm64; network order = big-endian.
+static unsigned short htons16(unsigned short x) {
+    return (unsigned short)((x << 8) | (x >> 8));
+}
+
+// Encode AF_INET / port / addr into a 16-byte sockaddr_in scratch
+// buffer. `ip32` is the host-order IPv4 address (e.g.
+// 127.0.0.1 → 0x7F000001). `port` is the host-order port.
+static void make_sockaddr_in(unsigned char out[16], i64 ip32, i64 port) {
+    // sin_family (uint16, host byte order — kernel reads as native)
+    out[0] = AF_INET & 0xFF;
+    out[1] = (AF_INET >> 8) & 0xFF;
+    // sin_port (uint16, network byte order = big-endian)
+    out[2] = (port >> 8) & 0xFF;
+    out[3] = port & 0xFF;
+    // sin_addr (uint32, network byte order)
+    out[4] = (ip32 >> 24) & 0xFF;
+    out[5] = (ip32 >> 16) & 0xFF;
+    out[6] = (ip32 >> 8) & 0xFF;
+    out[7] = ip32 & 0xFF;
+    // sin_zero[8]
+    for (int i = 8; i < 16; i++) out[i] = 0;
+    (void)htons16;
+}
+
+// volt_tcp_listen creates an AF_INET / SOCK_STREAM socket, binds it
+// to (ip, port), and starts listening with the given backlog. Returns
+// the listening fd or -errno. ip and port are host-order ints.
+i64 volt_tcp_listen(i64 ip, i64 port, i64 backlog) {
+    i64 fd = sys_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (fd < 0) return fd;
+    // SO_REUSEADDR so back-to-back listens don't hit TIME_WAIT.
+    int one = 1;
+    sys_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    unsigned char addr[16];
+    make_sockaddr_in(addr, ip, port);
+    i64 r = sys_bind(fd, addr, 16);
+    if (r < 0) { sys_close(fd); return r; }
+    r = sys_listen(fd, backlog);
+    if (r < 0) { sys_close(fd); return r; }
+    return fd;
+}
+
+// volt_tcp_accept blocks until a client connects, then returns the
+// new conn fd (or -errno). We ignore the peer address.
+i64 volt_tcp_accept(i64 listen_fd) {
+    return sys_accept(listen_fd, 0, 0);
+}
+
+// volt_tcp_dial creates a socket and connects to (ip, port). Returns
+// the connected fd or -errno.
+i64 volt_tcp_dial(i64 ip, i64 port) {
+    i64 fd = sys_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (fd < 0) return fd;
+    unsigned char addr[16];
+    make_sockaddr_in(addr, ip, port);
+    i64 r = sys_connect(fd, addr, 16);
+    if (r < 0) { sys_close(fd); return r; }
+    return fd;
+}
+
+// volt_open: opens `path` (a (ptr, len) byte sequence — volt strings
+// don't carry a NUL terminator). Returns fd on success or -errno.
+// The path is copied to a NUL-terminated scratch buffer for the syscall.
+i64 volt_open(const char* path_ptr, i64 path_len, i64 flags, i64 mode) {
+    if (path_len < 0 || path_len > 4095) return -36; // ENAMETOOLONG
+    char nbuf[4096];
+    for (i64 i = 0; i < path_len; i++) nbuf[i] = path_ptr[i];
+    nbuf[path_len] = 0;
+    return sys_openat(AT_FDCWD, nbuf, flags, mode);
+}
+
+// volt_close: closes fd. Returns 0 on success, -errno on failure.
+i64 volt_close(i64 fd) {
+    return sys_close(fd);
+}
+
+// mp_emit_i64 appends the base-10 ASCII of `n` to buf[*pos], advancing
+// *pos. Local helper for the memory-profile JSON writer. cap guards
+// against overflow (silently truncates rather than corrupt the stack).
+static void mp_emit_i64(char* buf, i64* pos, i64 cap, i64 n) {
+    char tmp[24];
+    i32 t = 0;
+    i32 neg = 0;
+    u64 u;
+    if (n < 0) { neg = 1; u = (u64)(-(n + 1)) + 1; } else { u = (u64)n; }
+    if (u == 0) tmp[t++] = '0';
+    while (u > 0) { tmp[t++] = (char)('0' + (i32)(u % 10)); u /= 10; }
+    if (neg && *pos < cap) buf[(*pos)++] = '-';
+    while (t > 0 && *pos < cap) buf[(*pos)++] = tmp[--t];
+}
+
+// mp_emit_str appends NUL-terminated literal `s` to buf[*pos].
+static void mp_emit_str(char* buf, i64* pos, i64 cap, const char* s) {
+    while (*s && *pos < cap) buf[(*pos)++] = *s++;
+}
+
+// volt_runtime_memprofile_dump writes the current allocation profile
+// to `path` as JSON. Layout (one line):
+//   {"size_classes":[{"bytes":16,"live":N,"alloc_count":M,"alloc_bytes":B},...],
+//    "huge":{"live":N,"alloc_count":M,"alloc_bytes":B},
+//    "totals":{"alloc_count":X,"free_count":Y,"live_bytes":Z}}
+// Returns 0 on success, -errno on open/write failure. Snapshots the
+// counters under alloc_lock so the dump is internally consistent.
+// Static dump scratch (BSS, not stack) — the by_line array can run to
+// hundreds of entries; keep it off the half-torn-down exit stack.
+// Guarded by g_mp_dump_lock since two threads could race a dump.
+static char   g_mp_dump_buf[65536];
+static mutex_t g_mp_dump_lock = {0};
+
+i64 volt_runtime_memprofile_dump(const char* path_ptr, i64 path_len) {
+    // Snapshot everything under alloc_lock into locals so we don't hold
+    // it during I/O. The per-line table is snapshotted too.
+    i64 live_c[NUM_SIZE_CLASSES];
+    i64 acnt_c[NUM_SIZE_CLASSES];
+    i64 abyt_c[NUM_SIZE_CLASSES];
+    i64 live_h, acnt_h, abyt_h, alloc_t, free_t, livebytes;
+    static i64 ln_key[MP_LINE_SLOTS];
+    static i64 ln_cnt[MP_LINE_SLOTS];
+    static i64 ln_byt[MP_LINE_SLOTS];
+
+    mutex_lock(&g_mp_dump_lock);
+    mutex_lock(&alloc_lock);
+    for (i32 i = 0; i < NUM_SIZE_CLASSES; i++) {
+        live_c[i] = g_live_count_class[i];
+        acnt_c[i] = g_alloc_count_class[i];
+        abyt_c[i] = g_alloc_bytes_class[i];
+    }
+    live_h = g_live_count_huge;
+    acnt_h = g_alloc_count_huge;
+    abyt_h = g_alloc_bytes_huge;
+    alloc_t = g_alloc_count;
+    free_t = g_free_count;
+    livebytes = g_live_bytes;
+    for (i32 i = 0; i < MP_LINE_SLOTS; i++) {
+        ln_key[i] = g_mp_line_keys[i];
+        ln_cnt[i] = g_mp_line_count[i];
+        ln_byt[i] = g_mp_line_bytes[i];
+    }
+    mutex_unlock(&alloc_lock);
+
+    char* buf = g_mp_dump_buf;
+    i64 pos = 0;
+    i64 cap = sizeof(g_mp_dump_buf);
+    mp_emit_str(buf, &pos, cap, "{\"size_classes\":[");
+    for (i32 i = 0; i < NUM_SIZE_CLASSES; i++) {
+        if (i > 0) mp_emit_str(buf, &pos, cap, ",");
+        mp_emit_str(buf, &pos, cap, "{\"bytes\":");
+        mp_emit_i64(buf, &pos, cap, size_class_bytes[i]);
+        mp_emit_str(buf, &pos, cap, ",\"live\":");
+        mp_emit_i64(buf, &pos, cap, live_c[i]);
+        mp_emit_str(buf, &pos, cap, ",\"alloc_count\":");
+        mp_emit_i64(buf, &pos, cap, acnt_c[i]);
+        mp_emit_str(buf, &pos, cap, ",\"alloc_bytes\":");
+        mp_emit_i64(buf, &pos, cap, abyt_c[i]);
+        mp_emit_str(buf, &pos, cap, "}");
+    }
+    mp_emit_str(buf, &pos, cap, "],\"huge\":{\"live\":");
+    mp_emit_i64(buf, &pos, cap, live_h);
+    mp_emit_str(buf, &pos, cap, ",\"alloc_count\":");
+    mp_emit_i64(buf, &pos, cap, acnt_h);
+    mp_emit_str(buf, &pos, cap, ",\"alloc_bytes\":");
+    mp_emit_i64(buf, &pos, cap, abyt_h);
+    // Per-line allocation sites (line==0 = runtime-internal). Only
+    // non-empty slots are emitted; stored keys are line+1. Bounded by
+    // the remaining buffer (mp_emit_* truncate safely, but we stop
+    // emitting entries well before the cap to keep the JSON valid).
+    mp_emit_str(buf, &pos, cap, "},\"by_line\":[");
+    i32 emitted = 0;
+    for (i32 i = 0; i < MP_LINE_SLOTS; i++) {
+        if (ln_key[i] == 0) continue;
+        if (pos > cap - 256) break;   // leave room for the trailer
+        if (emitted > 0) mp_emit_str(buf, &pos, cap, ",");
+        mp_emit_str(buf, &pos, cap, "{\"line\":");
+        mp_emit_i64(buf, &pos, cap, ln_key[i] - 1);
+        mp_emit_str(buf, &pos, cap, ",\"alloc_count\":");
+        mp_emit_i64(buf, &pos, cap, ln_cnt[i]);
+        mp_emit_str(buf, &pos, cap, ",\"alloc_bytes\":");
+        mp_emit_i64(buf, &pos, cap, ln_byt[i]);
+        mp_emit_str(buf, &pos, cap, "}");
+        emitted++;
+    }
+    mp_emit_str(buf, &pos, cap, "],\"totals\":{\"alloc_count\":");
+    mp_emit_i64(buf, &pos, cap, alloc_t);
+    mp_emit_str(buf, &pos, cap, ",\"free_count\":");
+    mp_emit_i64(buf, &pos, cap, free_t);
+    mp_emit_str(buf, &pos, cap, ",\"live_bytes\":");
+    mp_emit_i64(buf, &pos, cap, livebytes);
+    mp_emit_str(buf, &pos, cap, "}}\n");
+
+    // O_WRONLY|O_CREAT|O_TRUNC = 577, mode 0644 = 420.
+    i64 fd = volt_open(path_ptr, path_len, 577, 420);
+    if (fd < 0) { mutex_unlock(&g_mp_dump_lock); return fd; }
+    i64 w = sys_write_raw(fd, buf, pos);
+    sys_close(fd);
+    mutex_unlock(&g_mp_dump_lock);
+    if (w < 0) return w;
+    return 0;
+}
+
+// volt_memprofile_note_line stamps the calling thread's current source
+// line so the next volt_alloc attributes its allocation there. Emitted
+// per-statement by codegen only under `--memprofile`. Cheap: a single
+// thread-local store.
+void volt_memprofile_note_line(i64 line) {
+    g_mp_line = line;
+}
+
+// Memory-profile auto-dump path. Set by `volt build --memprofile <p>`
+// (codegen injects a volt_runtime_memprofile_set_path call at main's
+// entry). When non-empty, volt_runtime_at_program_exit dumps the
+// profile just before the process exits — robust against multiple
+// return points in main since it lives in the _start epilogue.
+static char g_memprofile_path[4096];
+static i64  g_memprofile_path_len = 0;
+
+void volt_runtime_memprofile_set_path(const char* p, i64 n) {
+    if (n < 0) n = 0;
+    if (n > 4095) n = 4095;
+    for (i64 i = 0; i < n; i++) g_memprofile_path[i] = p[i];
+    g_memprofile_path_len = n;
+    // A registered path implies the user wants profiling — turn on the
+    // per-line accumulation so volt_alloc records call sites.
+    g_mp_line_enabled = 1;
+}
+
+// volt_runtime_at_program_exit runs in the _start epilogue after main
+// returns, before sys_exit_group. Currently: flush the memory profile
+// if a path was registered. Cheap no-op otherwise. Keep this free of
+// anything that could fault — it runs with the process half-torn-down.
+void volt_runtime_at_program_exit(void) {
+    if (g_memprofile_path_len > 0) {
+        volt_runtime_memprofile_dump(g_memprofile_path, g_memprofile_path_len);
+    }
+}
+
+// volt_write_n: writes up to `n` bytes from buf to fd. Returns bytes
+// written, or -errno. Used by syscall.Write when the caller wants the
+// byte count; log.Println uses the older void volt_write which is
+// implemented in start_*.s.
+i64 volt_write_n(i64 fd, const void* buf, i64 n) {
+    return sys_write_raw(fd, buf, n);
+}
+
+// volt_read_all: reads all available bytes from fd into a heap buffer
+// and returns the resulting %string-shaped value (ptr+len). On error
+// returns a zero-init string (ptr=NULL, len=0). Caller checks ptr.
+//
+// SysV / AArch64 ABI: a 16-byte struct return goes back in rax+rdx
+// (x0+x1 on arm64), so the LLVM %string layout {ptr, i64} maps cleanly.
+typedef struct { void* ptr; i64 len; } volt_string_t;
+
+volt_string_t volt_read_all(i64 fd) {
+    volt_string_t r;
+    r.ptr = 0;
+    r.len = 0;
+    i64 cap = 4096;
+    char* buf = (char*)volt_alloc(cap);
+    i64 len = 0;
+    while (1) {
+        if (len + 4096 > cap) {
+            i64 new_cap = cap * 2;
+            char* new_buf = (char*)volt_alloc(new_cap);
+            for (i64 i = 0; i < len; i++) new_buf[i] = buf[i];
+            buf = new_buf;
+            cap = new_cap;
+        }
+        i64 nread = sys_read(fd, buf + len, 4096);
+        if (nread < 0) {
+            r.ptr = 0;
+            r.len = 0;
+            return r;
+        }
+        if (nread == 0) break;
+        len += nread;
+    }
+    r.ptr = buf;
+    r.len = len;
+    return r;
 }
 
 // ---------------------------------------------------------------------
@@ -711,6 +2064,29 @@ i64 volt_map_get(void* m_, char* key_ptr, i64 key_len) {
     return 0; // not found: zero value (Go-like)
 }
 
+// volt_map_delete removes the entry with the given key. Silently
+// succeeds if the key is absent (matching Go's `delete(m, k)` no-op
+// on missing). Buckets stay sized; only the count drops.
+void volt_map_delete(void* m_, char* key_ptr, i64 key_len) {
+    map_t* m = (map_t*)m_;
+    if (m == 0) return;
+    mutex_lock(&m->lock);
+    u64 h = hash_bytes(key_ptr, key_len);
+    map_entry_t** prev = &m->buckets[h % (u64)m->num_buckets];
+    map_entry_t* e = *prev;
+    while (e) {
+        if (key_eq(e->key_ptr, e->key_len, key_ptr, key_len)) {
+            *prev = e->next;
+            m->count--;
+            mutex_unlock(&m->lock);
+            return;
+        }
+        prev = &e->next;
+        e = e->next;
+    }
+    mutex_unlock(&m->lock);
+}
+
 void volt_map_set(void* m_, char* key_ptr, i64 key_len, i64 value) {
     map_t* m = (map_t*)m_;
     mutex_lock(&m->lock);
@@ -734,6 +2110,213 @@ void volt_map_set(void* m_, char* key_ptr, i64 key_len, i64 value) {
     m->count++;
     map_maybe_grow(m);
     mutex_unlock(&m->lock);
+}
+
+// ---- String construction --------------------------------------------
+// volt_string_from_bytes builds a fresh %string by heap-allocating
+// `n` bytes and copying from `buf`. Used by bytes.Builder.String()
+// (and any future []byte → string conversion path). The returned
+// string owns its bytes; the input slice's backing buffer is
+// untouched (no aliasing).
+volt_string_t volt_string_from_bytes(const char* buf, i64 n) {
+    volt_string_t r;
+    r.ptr = 0;
+    r.len = 0;
+    if (n <= 0) return r;
+    char* dst = (char*)volt_alloc(n);
+    for (i64 i = 0; i < n; i++) dst[i] = buf[i];
+    r.ptr = dst;
+    r.len = n;
+    return r;
+}
+
+// volt_string_concat builds a fresh %string by heap-allocating
+// a_len+b_len bytes and copying both inputs in sequence. The result
+// is an independently-owned string; the inputs are untouched.
+
+volt_string_t volt_string_concat(const char* a_ptr, i64 a_len,
+                                  const char* b_ptr, i64 b_len) {
+    volt_string_t r;
+    r.ptr = 0;
+    r.len = 0;
+    if (a_len < 0) a_len = 0;
+    if (b_len < 0) b_len = 0;
+    i64 total = a_len + b_len;
+    if (total == 0) return r;
+    char* buf = (char*)volt_alloc(total);
+    for (i64 i = 0; i < a_len; i++) buf[i] = a_ptr[i];
+    for (i64 i = 0; i < b_len; i++) buf[a_len + i] = b_ptr[i];
+    r.ptr = buf;
+    r.len = total;
+    return r;
+}
+
+// volt_string_eq compares two strings byte-by-byte. Returns 1 if
+// equal (same length AND same bytes), 0 otherwise. Used by `==` /
+// `!=` for %string operands.
+i64 volt_string_eq(const char* a_ptr, i64 a_len,
+                    const char* b_ptr, i64 b_len) {
+    if (a_len != b_len) return 0;
+    for (i64 i = 0; i < a_len; i++) {
+        if (a_ptr[i] != b_ptr[i]) return 0;
+    }
+    return 1;
+}
+
+// volt_chr_string makes a 1-byte string from byte b. Mostly useful
+// for digit-by-digit construction (Itoa, etc.).
+volt_string_t volt_chr_string(i64 b) {
+    volt_string_t r;
+    char* buf = (char*)volt_alloc(1);
+    buf[0] = (char)(b & 0xff);
+    r.ptr = buf;
+    r.len = 1;
+    return r;
+}
+
+// ---- Process args / env --------------------------------------------
+// argc/argv/envp are stashed by _start (start_*.s) at process entry.
+// Expose helpers that the stdlib can call to materialize volt strings.
+
+extern i64    volt_argc;
+extern char** volt_argv;
+extern char** volt_envp;
+
+static i64 cstr_len(const char* s) {
+    if (s == 0) return 0;
+    i64 n = 0;
+    while (s[n] != 0) n++;
+    return n;
+}
+
+// volt_arg_count(): number of CLI arguments (including argv[0]).
+i64 volt_arg_count(void) { return volt_argc; }
+
+// volt_arg_at(i): returns a {ptr, len} pointing INTO argv[i]'s storage.
+// The bytes live for the process lifetime (kernel-provided), so callers
+// can keep the string indefinitely without copying.
+volt_string_t volt_arg_at(i64 i) {
+    volt_string_t r;
+    r.ptr = 0;
+    r.len = 0;
+    if (i < 0 || i >= volt_argc) return r;
+    char* p = volt_argv[i];
+    r.ptr = p;
+    r.len = cstr_len(p);
+    return r;
+}
+
+// volt_env_get(name_ptr, name_len): scan envp for "name=value"; return
+// the value as a volt_string_t, or {NULL, 0} if not found.
+volt_string_t volt_env_get(const char* name_ptr, i64 name_len) {
+    volt_string_t r;
+    r.ptr = 0;
+    r.len = 0;
+    if (volt_envp == 0) return r;
+    for (i64 i = 0; volt_envp[i] != 0; i++) {
+        char* entry = volt_envp[i];
+        // Match name followed by '='.
+        i64 j;
+        int ok = 1;
+        for (j = 0; j < name_len; j++) {
+            if (entry[j] == 0 || entry[j] != name_ptr[j]) {
+                ok = 0;
+                break;
+            }
+        }
+        if (!ok) continue;
+        if (entry[j] != '=') continue;
+        r.ptr = entry + j + 1;
+        r.len = cstr_len(entry + j + 1);
+        return r;
+    }
+    return r;
+}
+
+// ---- Clock / time ---------------------------------------------------
+// volt_now_ns(): nanoseconds since the Unix epoch (CLOCK_REALTIME via
+// sys_clock_gettime). Used by `time.Now()` in the stdlib.
+
+typedef struct { i64 sec; i64 nsec; } volt_timespec_t;
+
+#if defined(__x86_64__)
+static i64 sys_clock_gettime(i64 clk, volt_timespec_t* ts) {
+    register i64 rax __asm__("rax") = SYS_CLOCK_GETTIME;
+    register i64 rdi __asm__("rdi") = clk;
+    register i64 rsi __asm__("rsi") = (i64)ts;
+    __asm__ volatile("syscall"
+        : "+r"(rax)
+        : "r"(rdi), "r"(rsi)
+        : "rcx", "r11", "memory");
+    return rax;
+}
+#elif defined(__aarch64__)
+static i64 sys_clock_gettime(i64 clk, volt_timespec_t* ts) {
+    register i64 x8 __asm__("x8") = SYS_CLOCK_GETTIME;
+    register i64 x0 __asm__("x0") = clk;
+    register i64 x1 __asm__("x1") = (i64)ts;
+    __asm__ volatile("svc #0"
+        : "+r"(x0)
+        : "r"(x8), "r"(x1)
+        : "memory");
+    return x0;
+}
+#endif
+
+i64 volt_now_ns(void) {
+    volt_timespec_t ts;
+    ts.sec = 0;
+    ts.nsec = 0;
+    sys_clock_gettime(CLOCK_REALTIME, &ts);
+    return ts.sec * 1000000000 + ts.nsec;
+}
+
+i64 volt_mono_ns(void) {
+    volt_timespec_t ts;
+    ts.sec = 0;
+    ts.nsec = 0;
+    sys_clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.sec * 1000000000 + ts.nsec;
+}
+
+// ---- map iteration --------------------------------------------------
+// Iterator state walks bucket-by-bucket, entry-chain-by-entry-chain.
+// NOT lock-safe — mutating the map during iteration is UB (same as Go).
+
+typedef struct {
+    map_t*       m;
+    i64          bucket_idx;
+    map_entry_t* curr;
+} map_iter_t;
+
+void* volt_map_iter_new(void* m_) {
+    map_iter_t* it = (map_iter_t*)volt_alloc((i64)sizeof(map_iter_t));
+    it->m = (map_t*)m_;
+    it->bucket_idx = 0;
+    it->curr = 0;
+    return it;
+}
+
+// Returns 1 if a next entry was produced (filling out_key_ptr/len/val);
+// 0 if iteration is done. Concurrent mutation is unsafe by design.
+i64 volt_map_iter_next(void* it_, char** out_key_ptr, i64* out_key_len, i64* out_val) {
+    map_iter_t* it = (map_iter_t*)it_;
+    map_t* m = it->m;
+    if (m == 0) return 0;
+
+    if (it->curr) {
+        it->curr = it->curr->next;
+    }
+    while (!it->curr && it->bucket_idx < m->num_buckets) {
+        it->curr = m->buckets[it->bucket_idx];
+        it->bucket_idx++;
+    }
+    if (!it->curr) return 0;
+
+    *out_key_ptr = it->curr->key_ptr;
+    *out_key_len = it->curr->key_len;
+    *out_val     = it->curr->value;
+    return 1;
 }
 
 // ---- slice grow / append --------------------------------------------
@@ -824,6 +2407,54 @@ void volt_write_int(i64 fd, i64 n) {
         buf[len++] = tmp[--tlen];
     }
     volt_write(fd, buf, len);
+}
+
+// volt_int_to_string builds the decimal representation of `n` as a
+// fresh heap %string. Returns {ptr, len}; same layout that LLVM
+// %string maps to.
+volt_string_t volt_int_to_string(i64 n) {
+    char tmp[24];
+    i64 tlen = 0;
+    i64 neg = (n < 0);
+    u64 u = neg ? (u64)(-n) : (u64)n;
+    if (u == 0) {
+        tmp[tlen++] = '0';
+    } else {
+        while (u > 0) {
+            tmp[tlen++] = (char)('0' + (u % 10));
+            u /= 10;
+        }
+    }
+    i64 total = tlen + (neg ? 1 : 0);
+    char* out = (char*)volt_alloc(total);
+    i64 pos = 0;
+    if (neg) out[pos++] = '-';
+    while (tlen > 0) {
+        out[pos++] = tmp[--tlen];
+    }
+    volt_string_t r;
+    r.ptr = out;
+    r.len = total;
+    return r;
+}
+
+// volt_bool_to_string returns "true" or "false" as a heap-allocated
+// %string. The 5/4-byte buffers are freshly allocated so the caller
+// can hold the result indefinitely.
+volt_string_t volt_bool_to_string(i64 b) {
+    volt_string_t r;
+    if (b) {
+        char* buf = (char*)volt_alloc(4);
+        buf[0] = 't'; buf[1] = 'r'; buf[2] = 'u'; buf[3] = 'e';
+        r.ptr = buf;
+        r.len = 4;
+    } else {
+        char* buf = (char*)volt_alloc(5);
+        buf[0] = 'f'; buf[1] = 'a'; buf[2] = 'l'; buf[3] = 's'; buf[4] = 'e';
+        r.ptr = buf;
+        r.len = 5;
+    }
+    return r;
 }
 
 // volt_write_bool writes "true" or "false" to `fd`.
@@ -1248,4 +2879,399 @@ void volt_once_do(void* o_, void* fn_, void* env) {
         cond_wait(&o->done_cond, &o->lock);
     }
     mutex_unlock(&o->lock);
+}
+
+// ---- condvar -------------------------------------------------------
+// User-facing condition variable. Built on the runtime cond_t + the
+// user-provided mutex T. Wait(m) atomically unlocks m, sleeps until
+// signaled, then reacquires m before returning — the standard
+// pthread_cond_wait semantics. Signal wakes one waiter; Broadcast
+// wakes all. The condvar's storage is just a cond_t (4 bytes); we
+// box it in a fresh volt_alloc so the handle is a stable ptr that
+// can be moved across threads like any other reference primitive.
+
+void* volt_cond_new(void) {
+    cond_t* c = (cond_t*)volt_alloc((i64)sizeof(cond_t));
+    c->seq = 0;
+    return c;
+}
+
+// volt_cond_wait expects `m_` to be a sync_mutex_t* (the same handle
+// that volt_mutex_new returned). It accesses m->lock directly — same
+// layout as volt_mutex_lock/unlock. Caller MUST hold the lock; on
+// return the lock is held again. Spurious wakeups are possible per
+// the futex contract; callers should re-check the predicate.
+void volt_cond_wait(void* c_, void* m_) {
+    cond_t* c = (cond_t*)c_;
+    sync_mutex_t* m = (sync_mutex_t*)m_;
+    cond_wait(c, &m->lock);
+}
+
+void volt_cond_signal(void* c_) {
+    cond_signal((cond_t*)c_);
+}
+
+void volt_cond_broadcast(void* c_) {
+    cond_broadcast((cond_t*)c_);
+}
+
+// ---------------------------------------------------------------------
+// D.1: happens-before race detector.
+//
+// Public API (codegen emits these when `-race` is on):
+//   volt_race_enable()           — turn on globally (called from main).
+//   volt_race_thread_start()     — register the current OS thread (called
+//                                  from main + from the spawn trampoline
+//                                  before the user fn).
+//   volt_race_thread_end()       — deregister (currently a no-op; thread
+//                                  slots aren't reclaimed in a v1 detector).
+//   volt_race_read (ptr, size)   — instrumented load barrier.
+//   volt_race_write(ptr, size)   — instrumented store barrier.
+//   volt_race_acquire(ptr)       — sync-acquire (chan recv / mutex Lock /
+//                                  atomic Read). Merges the published
+//                                  vector clock for ptr into mine.
+//   volt_race_release(ptr)       — sync-release (chan send / mutex Unlock /
+//                                  atomic Write). Bumps my clock and
+//                                  publishes my vector clock at ptr.
+//
+// Algorithm: per-thread vector clocks of fixed width VOLT_RACE_MAX_THREADS.
+// Each thread holds a kernel tid → dense-slot mapping. Sync locations
+// (chan/mutex/atomic handles) hold a published vector clock; memory
+// locations hold {last-writer slot, last-writer epoch, last-reader slot,
+// last-reader epoch}. A read races with a prior write iff the prior
+// write's epoch is NOT visible in my view (clk[wslot] < write_epoch).
+// A write races with the prior reader too. False negatives are possible
+// when a single slot loses precision (we keep only the most-recent
+// read), but every reported race is real.
+//
+// All data structures are striped-mutex hash tables — slow but correct.
+// The detector is OFF by default; the `-race` flag turns it on by
+// emitting a volt_race_enable() at the head of main + per-thread
+// volt_race_thread_start() in the spawn trampoline path.
+
+#define VOLT_RACE_MAX_THREADS  64
+#define VOLT_RACE_SYNC_BUCKETS 1024
+#define VOLT_RACE_SYNC_STRIPES   16
+#define VOLT_RACE_MEM_BUCKETS  16384
+#define VOLT_RACE_MEM_STRIPES    64
+
+typedef struct race_vclock {
+    i64 c[VOLT_RACE_MAX_THREADS];
+} race_vclock_t;
+
+typedef struct race_thread {
+    i32 used;
+    i64 ktid;
+    race_vclock_t clk;   // my current view; clk[my slot] is my own epoch
+} race_thread_t;
+
+typedef struct race_sync_entry {
+    i64 addr;
+    race_vclock_t clk;
+    struct race_sync_entry* next;
+} race_sync_entry_t;
+
+typedef struct race_mem_entry {
+    i64 addr;
+    i32 wslot, rslot;
+    i64 wepoch, repoch;
+    // Pass 752 DWARF-style race report: record the source line of the
+    // last writer/reader so the race report can cite where each side
+    // touched the location. 0 means unknown (e.g. write happened
+    // inside a runtime helper that didn't pass a line).
+    i64 wline, rline;
+    struct race_mem_entry* next;
+} race_mem_entry_t;
+
+static i32             g_race_enabled        = 0;
+static race_thread_t   g_race_threads[VOLT_RACE_MAX_THREADS];
+static i32             g_race_thread_count   = 0;
+// Pass 753 polish: count detected races so user code can assert
+// race-freedom in tests via runtime.RaceViolations(). Bumped from
+// race_report; cleared by volt_race_reset_violations.
+static i64             g_race_violations     = 0;
+static mutex_t         g_race_thread_lock    = {0};
+
+static race_sync_entry_t* g_race_sync[VOLT_RACE_SYNC_BUCKETS];
+static mutex_t            g_race_sync_lock[VOLT_RACE_SYNC_STRIPES];
+
+static race_mem_entry_t*  g_race_mem[VOLT_RACE_MEM_BUCKETS];
+static mutex_t            g_race_mem_lock[VOLT_RACE_MEM_STRIPES];
+
+static i64 race_sys_gettid(void) {
+#if defined(__x86_64__)
+    register i64 rax __asm__("rax") = SYS_GETTID;
+    __asm__ volatile("syscall" : "+r"(rax) : : "rcx", "r11", "memory");
+    return rax;
+#elif defined(__aarch64__)
+    register i64 x8 __asm__("x8") = SYS_GETTID;
+    register i64 x0 __asm__("x0") = 0;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8) : "memory");
+    return x0;
+#endif
+}
+
+// Returns the dense slot for the calling OS thread, registering it on
+// first call. Returns -1 if the thread table is full (silent loss of
+// precision — better than crashing).
+static i32 race_current_slot(void) {
+    i64 ktid = race_sys_gettid();
+    // Optimistic read-only scan first.
+    i32 n = __atomic_load_n(&g_race_thread_count, __ATOMIC_ACQUIRE);
+    for (i32 i = 0; i < n; i++) {
+        if (g_race_threads[i].used && g_race_threads[i].ktid == ktid) {
+            return i;
+        }
+    }
+    // Need to register.
+    mutex_lock(&g_race_thread_lock);
+    n = g_race_thread_count;
+    for (i32 i = 0; i < n; i++) {
+        if (g_race_threads[i].used && g_race_threads[i].ktid == ktid) {
+            mutex_unlock(&g_race_thread_lock);
+            return i;
+        }
+    }
+    if (n >= VOLT_RACE_MAX_THREADS) {
+        mutex_unlock(&g_race_thread_lock);
+        return -1;
+    }
+    g_race_threads[n].ktid = ktid;
+    for (i32 i = 0; i < VOLT_RACE_MAX_THREADS; i++) g_race_threads[n].clk.c[i] = 0;
+    g_race_threads[n].clk.c[n] = 1;  // start at epoch 1
+    __atomic_store_n(&g_race_threads[n].used, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_race_thread_count, n + 1, __ATOMIC_RELEASE);
+    mutex_unlock(&g_race_thread_lock);
+    return n;
+}
+
+// Hash a 64-bit address. We mostly want to strip the low alignment bits
+// and spread the rest. Knuth's multiplicative is good enough.
+static i64 race_hash_addr(i64 a) {
+    u64 x = (u64)(a >> 3);
+    x *= 0x9E3779B97F4A7C15ULL;
+    x ^= x >> 27;
+    return (i64)x;
+}
+
+// Write a non-negative i64 into buf as decimal. Returns # bytes written.
+static i32 race_fmt_i64(char* buf, i64 v) {
+    if (v < 0) v = 0;
+    if (v == 0) { buf[0] = '0'; return 1; }
+    char tmp[24];
+    i32 n = 0;
+    while (v > 0 && n < 24) { tmp[n++] = (char)('0' + v % 10); v /= 10; }
+    for (i32 i = 0; i < n; i++) buf[i] = tmp[n - 1 - i];
+    return n;
+}
+
+// Reports a race to stderr (fd=2). Format:
+//   "WARNING: DATA RACE (<kind>)\n  addr=0x<addr> t<a>@e<ae>:line<al> vs t<b>@e<be>:line<bl>\n"
+// The :lineN suffix is omitted when the line is 0 (unknown). Never aborts.
+static void race_report(const char* kind, i64 addr,
+                        i32 aslot, i64 aepoch, i64 aline,
+                        i32 bslot, i64 bepoch, i64 bline) {
+    char buf[256];
+    i32 i = 0;
+    const char* w = "WARNING: DATA RACE (";
+    while (*w) buf[i++] = *w++;
+    w = kind;
+    while (*w) buf[i++] = *w++;
+    buf[i++] = ')'; buf[i++] = '\n';
+    const char* tag = "  addr=0x";
+    w = tag; while (*w) buf[i++] = *w++;
+    for (i32 sh = 60; sh >= 0; sh -= 4) {
+        i64 d = (addr >> sh) & 0xf;
+        buf[i++] = (char)(d < 10 ? '0' + d : 'a' + (d - 10));
+    }
+    buf[i++] = ' '; buf[i++] = 't';
+    i += race_fmt_i64(buf + i, aslot);
+    buf[i++] = '@'; buf[i++] = 'e';
+    i += race_fmt_i64(buf + i, aepoch);
+    if (aline > 0) {
+        const char* lt = ":line"; w = lt; while (*w) buf[i++] = *w++;
+        i += race_fmt_i64(buf + i, aline);
+    }
+    buf[i++] = ' '; buf[i++] = 'v'; buf[i++] = 's'; buf[i++] = ' ';
+    buf[i++] = 't';
+    i += race_fmt_i64(buf + i, bslot);
+    buf[i++] = '@'; buf[i++] = 'e';
+    i += race_fmt_i64(buf + i, bepoch);
+    if (bline > 0) {
+        const char* lt = ":line"; w = lt; while (*w) buf[i++] = *w++;
+        i += race_fmt_i64(buf + i, bline);
+    }
+    buf[i++] = '\n';
+    sys_write_raw(2, buf, i);
+    __atomic_add_fetch(&g_race_violations, 1, __ATOMIC_RELAXED);
+}
+
+// volt_race_violations returns the cumulative count of races detected
+// since program start (or the last volt_race_reset_violations call).
+// Surfaced to volt code via runtime.RaceViolations() — useful in
+// tests that want to assert race-freedom or count expected races.
+i64 volt_race_violations(void) {
+    return (i64)__atomic_load_n(&g_race_violations, __ATOMIC_ACQUIRE);
+}
+
+void volt_race_reset_violations(void) {
+    __atomic_store_n(&g_race_violations, 0, __ATOMIC_RELEASE);
+}
+
+// volt_race_enable is called ONCE from main when `-race` is set.
+// Subsequent reads of g_race_enabled use __ATOMIC_RELAXED — there's
+// no need for an acquire fence because (1) the value never decreases
+// (set 0→1 once, then stable forever), (2) the call happens before
+// any threads spawn via `run`, so thread creation itself provides the
+// happens-before edge, and (3) the early-exit is on the hot path of
+// every chan/mutex op even when -race is OFF — relaxing removes a
+// memory fence per call on weak-memory archs (arm64). Pass 755 perf.
+void volt_race_enable(void) {
+    __atomic_store_n(&g_race_enabled, 1, __ATOMIC_RELEASE);
+    (void)race_current_slot();  // register main thread
+}
+
+void volt_race_thread_start(void) {
+    if (!__atomic_load_n(&g_race_enabled, __ATOMIC_RELAXED)) return;
+    (void)race_current_slot();
+}
+
+void volt_race_thread_end(void) {
+    // v1: no reclaim. Slots are stable for the life of the process.
+}
+
+// volt_runtime_thread_count surfaces the race-detector's registered
+// thread count to user code via runtime.ThreadCount(). Without -race
+// the detector is inert and the count stays 0 — the runtime doesn't
+// track threads globally otherwise.
+i64 volt_runtime_thread_count(void) {
+    return (i64)__atomic_load_n(&g_race_thread_count, __ATOMIC_ACQUIRE);
+}
+
+void volt_race_acquire(void* ptr) {
+    if (!__atomic_load_n(&g_race_enabled, __ATOMIC_RELAXED)) return;
+    i32 me = race_current_slot();
+    if (me < 0) return;
+    i64 a = (i64)ptr;
+    i64 h = race_hash_addr(a);
+    i64 bi = h & (VOLT_RACE_SYNC_BUCKETS - 1);
+    i64 si = h & (VOLT_RACE_SYNC_STRIPES - 1);
+    mutex_lock(&g_race_sync_lock[si]);
+    race_sync_entry_t* e = g_race_sync[bi];
+    while (e && e->addr != a) e = e->next;
+    if (e) {
+        // Merge e->clk into mine. Iterate only over registered slots —
+        // unregistered slots have clock 0 on both sides and contribute
+        // nothing. Pass 752: this caps the per-merge cost at the
+        // currently-active thread count rather than the fixed
+        // VOLT_RACE_MAX_THREADS ceiling (matters when the program
+        // uses just a handful of threads but the detector is on).
+        i32 n = __atomic_load_n(&g_race_thread_count, __ATOMIC_ACQUIRE);
+        for (i32 i = 0; i < n; i++) {
+            if (e->clk.c[i] > g_race_threads[me].clk.c[i]) {
+                g_race_threads[me].clk.c[i] = e->clk.c[i];
+            }
+        }
+    }
+    mutex_unlock(&g_race_sync_lock[si]);
+}
+
+void volt_race_release(void* ptr) {
+    if (!__atomic_load_n(&g_race_enabled, __ATOMIC_RELAXED)) return;
+    i32 me = race_current_slot();
+    if (me < 0) return;
+    // Bump my own epoch.
+    g_race_threads[me].clk.c[me]++;
+    i64 a = (i64)ptr;
+    i64 h = race_hash_addr(a);
+    i64 bi = h & (VOLT_RACE_SYNC_BUCKETS - 1);
+    i64 si = h & (VOLT_RACE_SYNC_STRIPES - 1);
+    mutex_lock(&g_race_sync_lock[si]);
+    race_sync_entry_t* e = g_race_sync[bi];
+    while (e && e->addr != a) e = e->next;
+    if (!e) {
+        e = (race_sync_entry_t*)volt_alloc(sizeof(race_sync_entry_t));
+        e->addr = a;
+        e->next = g_race_sync[bi];
+        g_race_sync[bi] = e;
+    }
+    // Take element-wise max of my clock and existing published clock.
+    // Same registered-slot cap as the acquire merge above.
+    i32 n = __atomic_load_n(&g_race_thread_count, __ATOMIC_ACQUIRE);
+    for (i32 i = 0; i < n; i++) {
+        if (g_race_threads[me].clk.c[i] > e->clk.c[i]) {
+            e->clk.c[i] = g_race_threads[me].clk.c[i];
+        }
+    }
+    mutex_unlock(&g_race_sync_lock[si]);
+}
+
+static race_mem_entry_t* race_mem_get_or_create(i64 addr, i64 bi, i64 si) {
+    race_mem_entry_t* e = g_race_mem[bi];
+    while (e && e->addr != addr) e = e->next;
+    if (!e) {
+        e = (race_mem_entry_t*)volt_alloc(sizeof(race_mem_entry_t));
+        e->addr = addr;
+        e->wslot = -1; e->rslot = -1;
+        e->wepoch = 0; e->repoch = 0;
+        e->wline = 0; e->rline = 0;
+        e->next = g_race_mem[bi];
+        g_race_mem[bi] = e;
+    }
+    (void)si;
+    return e;
+}
+
+void volt_race_read(void* ptr, i64 size, i64 line) {
+    if (!__atomic_load_n(&g_race_enabled, __ATOMIC_RELAXED)) return;
+    if (size <= 0) return;
+    i32 me = race_current_slot();
+    if (me < 0) return;
+    i64 a = (i64)ptr;
+    i64 h = race_hash_addr(a);
+    i64 bi = h & (VOLT_RACE_MEM_BUCKETS - 1);
+    i64 si = h & (VOLT_RACE_MEM_STRIPES - 1);
+    mutex_lock(&g_race_mem_lock[si]);
+    race_mem_entry_t* e = race_mem_get_or_create(a, bi, si);
+    // Race iff a prior writer's epoch isn't visible in my view.
+    if (e->wslot >= 0 && e->wslot != me &&
+        g_race_threads[me].clk.c[e->wslot] < e->wepoch) {
+        race_report("read-after-unsync-write", a,
+                    me, g_race_threads[me].clk.c[me], line,
+                    e->wslot, e->wepoch, e->wline);
+    }
+    // Update last-reader (most recent wins; v1 trades precision for speed).
+    e->rslot = me;
+    e->repoch = g_race_threads[me].clk.c[me];
+    e->rline = line;
+    mutex_unlock(&g_race_mem_lock[si]);
+}
+
+void volt_race_write(void* ptr, i64 size, i64 line) {
+    if (!__atomic_load_n(&g_race_enabled, __ATOMIC_RELAXED)) return;
+    if (size <= 0) return;
+    i32 me = race_current_slot();
+    if (me < 0) return;
+    i64 a = (i64)ptr;
+    i64 h = race_hash_addr(a);
+    i64 bi = h & (VOLT_RACE_MEM_BUCKETS - 1);
+    i64 si = h & (VOLT_RACE_MEM_STRIPES - 1);
+    mutex_lock(&g_race_mem_lock[si]);
+    race_mem_entry_t* e = race_mem_get_or_create(a, bi, si);
+    if (e->wslot >= 0 && e->wslot != me &&
+        g_race_threads[me].clk.c[e->wslot] < e->wepoch) {
+        race_report("write-after-unsync-write", a,
+                    me, g_race_threads[me].clk.c[me], line,
+                    e->wslot, e->wepoch, e->wline);
+    }
+    if (e->rslot >= 0 && e->rslot != me &&
+        g_race_threads[me].clk.c[e->rslot] < e->repoch) {
+        race_report("write-after-unsync-read", a,
+                    me, g_race_threads[me].clk.c[me], line,
+                    e->rslot, e->repoch, e->rline);
+    }
+    e->wslot = me;
+    e->wepoch = g_race_threads[me].clk.c[me];
+    e->wline = line;
+    mutex_unlock(&g_race_mem_lock[si]);
 }

@@ -1,3 +1,4 @@
+// volt:noformat — spec file; hand-aligned.
 // =====================================================================
 // defer.volt — `def`, the only user-visible cleanup mechanism
 // =====================================================================

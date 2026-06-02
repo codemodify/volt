@@ -56,7 +56,8 @@
 	- Both are still **reference-typed**: copying the handle gives another reference to the same channel. Many threads may hold `chan read T` over the same channel (many readers), and many may hold `chan write T` (many writers).
 	- An unrestricted `chan T` narrows implicitly on call to either directional form; the reverse (widening back to `chan T`) is not allowed.
 - `mutex T` / `rwmutex T` / `atomic T` — see [mutating shared data](#concurrency-patterns---mutating-shared-data)
-- `waitgroup` / `once` — coordination primitives (no payload); see same section
+- `waitgroup` / `once` / `condvar` — coordination primitives (no payload); see same section
+	- `condvar`: Pass 750 wait/signal/broadcast pair built on the futex `cond_t`. `c.Wait(m)` atomically releases mutex `m`, blocks, and reacquires `m` before returning. `c.Signal()` wakes one waiter; `c.Broadcast()` wakes all. Use when chan/waitgroup/once don't fit (predicate-wait patterns).
 
 #### `select` -  reading concurrently from different channels using
 ```go

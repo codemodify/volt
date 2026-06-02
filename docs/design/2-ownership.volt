@@ -1,3 +1,4 @@
+// volt:noformat — spec file; hand-aligned.
 // =====================================================================
 // 2-ownership.volt — runnable examples of the ownership model
 // =====================================================================
@@ -13,6 +14,14 @@ import "log"
 // =====================================================================
 // 1. Primitives
 // =====================================================================
+// Borrow forms (C8 phase 4+):
+//   T       — owned value (copy for primitives, move for composites)
+//   &T      — shared borrow (read-only, many concurrent OK)
+//   &mut T  — exclusive borrow (read+write, single at a time)
+//   *T      — raw pointer (FFI / struct heap pointer; no borrow rules)
+//
+// Phase 5 rule: the SOURCE is frozen while a borrow is held —
+// `var b &mut int = &mut x; x = 5` is rejected. Mutate via *b instead.
 
 fun primitivesCopy(n int) {
     log.Println("primitivesCopy n=%d", n)
@@ -22,13 +31,13 @@ fun primitivesRead(n &int) {
     log.Println("primitivesRead n=%d", n)
 }
 
-fun primitivesWrite(n *int) {
-    n = n + 1
-    log.Println("primitivesWrite n=%d", n)
+fun primitivesWrite(n &mut int) {
+    *n = *n + 1                          // write through the exclusive borrow
+    log.Println("primitivesWrite n=%d", *n)
 }
 
 fun primitivesBadWrite(n &int) {
-    n = n + 1                            // fail: write through `&T` (read-only)
+    *n = *n + 1                          // fail: write through `&T` (shared, read-only)
 }
 
 fun primitives() {
@@ -60,12 +69,12 @@ fun (c &Counter) Read() int {
     ret c.value
 }
 
-fun (c *Counter) Bump() {
+fun (c &mut Counter) Bump() {
     c.value = c.value + 1
 }
 
 fun (c &Counter) BadWrite() {
-    c.value = 99                         // fail: write through `&T` (read-only)
+    c.value = 99                         // fail: write through `&T` (shared, read-only)
 }
 
 fun structs() {

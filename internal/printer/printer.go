@@ -262,7 +262,38 @@ func (p *printer) printTypeDecl(d *ast.TypeDecl) {
 		p.indent++
 		for _, m := range it.Methods {
 			p.flushCommentsBefore(m.P.Line)
-			p.line(m.Name + "()")
+			// Render each method's full signature so the formatted
+			// source round-trips through the parser.
+			sig := m.Name + "()"
+			if ft, ok := m.Type.(*ast.FuncType); ok {
+				var sb strings.Builder
+				sb.WriteString(m.Name + "(")
+				for j, prm := range ft.Params {
+					if j > 0 {
+						sb.WriteString(", ")
+					}
+					if prm.Name != "" {
+						sb.WriteString(prm.Name + " ")
+					}
+					sb.WriteString(p.formatType(prm.Type))
+				}
+				sb.WriteByte(')')
+				if len(ft.Results) == 1 {
+					sb.WriteByte(' ')
+					sb.WriteString(p.formatType(ft.Results[0]))
+				} else if len(ft.Results) > 1 {
+					sb.WriteString(" (")
+					for j, r := range ft.Results {
+						if j > 0 {
+							sb.WriteString(", ")
+						}
+						sb.WriteString(p.formatType(r))
+					}
+					sb.WriteByte(')')
+				}
+				sig = sb.String()
+			}
+			p.line(sig)
 			p.markLine(m.P.Line)
 		}
 		p.indent--
@@ -332,6 +363,9 @@ func (p *printer) formatType(t ast.Type) string {
 	case *ast.NamedType:
 		return t.Name
 	case *ast.BorrowType:
+		if t.Mut {
+			return "&mut " + p.formatType(t.Elem)
+		}
 		return "&" + p.formatType(t.Elem)
 	case *ast.PointerType:
 		return "*" + p.formatType(t.Elem)
@@ -340,7 +374,51 @@ func (p *printer) formatType(t ast.Type) string {
 	case *ast.MapType:
 		return "map[" + p.formatType(t.Key) + "]" + p.formatType(t.Value)
 	case *ast.ChanType:
-		return "chan " + p.formatType(t.Elem)
+		head := t.Multi.MultiName()
+		switch t.Dir {
+		case ast.ChanRead:
+			head = head + " read"
+		case ast.ChanWrite:
+			head = head + " write"
+		}
+		return head + " " + p.formatType(t.Elem)
+	case *ast.AtomicType:
+		return "atomic " + p.formatType(t.Elem)
+	case *ast.MutexType:
+		return "mutex " + p.formatType(t.Elem)
+	case *ast.RwMutexType:
+		return "rwmutex " + p.formatType(t.Elem)
+	case *ast.WaitgroupType:
+		return "waitgroup"
+	case *ast.OnceType:
+		return "once"
+	case *ast.FuncType:
+		var sb strings.Builder
+		sb.WriteString("fun(")
+		for i, prm := range t.Params {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			if prm.Name != "" {
+				sb.WriteString(prm.Name + " ")
+			}
+			sb.WriteString(p.formatType(prm.Type))
+		}
+		sb.WriteByte(')')
+		if len(t.Results) == 1 {
+			sb.WriteByte(' ')
+			sb.WriteString(p.formatType(t.Results[0]))
+		} else if len(t.Results) > 1 {
+			sb.WriteString(" (")
+			for i, r := range t.Results {
+				if i > 0 {
+					sb.WriteString(", ")
+				}
+				sb.WriteString(p.formatType(r))
+			}
+			sb.WriteByte(')')
+		}
+		return sb.String()
 	case *ast.InterfaceType:
 		if len(t.Methods) == 0 {
 			return "interface{}"
@@ -351,7 +429,38 @@ func (p *printer) formatType(t ast.Type) string {
 			if i > 0 {
 				sb.WriteString("; ")
 			}
-			sb.WriteString(m.Name + "()")
+			sb.WriteString(m.Name)
+			// Each method's Type is a *ast.FuncType holding the
+			// parameters + return types. Emit `(P1, P2) R` so the
+			// formatted source round-trips through the parser.
+			if ft, ok := m.Type.(*ast.FuncType); ok {
+				sb.WriteByte('(')
+				for j, prm := range ft.Params {
+					if j > 0 {
+						sb.WriteString(", ")
+					}
+					if prm.Name != "" {
+						sb.WriteString(prm.Name + " ")
+					}
+					sb.WriteString(p.formatType(prm.Type))
+				}
+				sb.WriteByte(')')
+				if len(ft.Results) == 1 {
+					sb.WriteByte(' ')
+					sb.WriteString(p.formatType(ft.Results[0]))
+				} else if len(ft.Results) > 1 {
+					sb.WriteString(" (")
+					for j, r := range ft.Results {
+						if j > 0 {
+							sb.WriteString(", ")
+						}
+						sb.WriteString(p.formatType(r))
+					}
+					sb.WriteByte(')')
+				}
+			} else {
+				sb.WriteString("()")
+			}
 		}
 		sb.WriteString(" }")
 		return sb.String()
@@ -482,7 +591,11 @@ func (p *printer) printIfStmt(s *ast.IfStmt, asElseIf bool) {
 		prefix = "} else "
 	}
 	p.writeIndent()
-	p.raw(prefix + "if " + p.formatExpr(s.Cond) + " {\n")
+	head := prefix + "if "
+	if s.Init != nil {
+		head += p.formatSimpleStmt(s.Init) + "; "
+	}
+	p.raw(head + p.formatExpr(s.Cond) + " {\n")
 	p.indent++
 	if s.Then != nil {
 		for _, ss := range s.Then.Stmts {
@@ -513,6 +626,17 @@ func (p *printer) printForStmt(s *ast.ForStmt) {
 	p.writeIndent()
 	p.raw("for ")
 	switch {
+	case s.RangeOver != nil:
+		// `for i, v := range EXPR { ... }` (RangeV may be "")
+		i := s.RangeI
+		if i == "" {
+			i = "_"
+		}
+		if s.RangeV != "" {
+			p.raw(i + ", " + s.RangeV + " := range " + p.formatExpr(s.RangeOver) + " ")
+		} else {
+			p.raw(i + " := range " + p.formatExpr(s.RangeOver) + " ")
+		}
 	case s.Init == nil && s.Cond == nil && s.Post == nil:
 		// `for { ... }`
 	case s.Init == nil && s.Post == nil:
@@ -609,6 +733,14 @@ func (p *printer) formatSimpleStmt(s ast.Stmt) string {
 		return p.formatExpr(s.LHS) + " = " + p.formatExpr(s.RHS)
 	case *ast.ExprStmt:
 		return p.formatExpr(s.Expr)
+	case *ast.MultiVarStmt:
+		return strings.Join(s.Names, ", ") + " := " + p.formatExpr(s.RHS)
+	case *ast.MultiAssignStmt:
+		lhs := make([]string, len(s.LHS))
+		for i, e := range s.LHS {
+			lhs[i] = p.formatExpr(e)
+		}
+		return strings.Join(lhs, ", ") + " = " + p.formatExpr(s.RHS)
 	}
 	return ""
 }
@@ -617,9 +749,84 @@ func (p *printer) formatSimpleStmt(s ast.Stmt) string {
 // Expressions
 // ---------------------------------------------------------------------
 
+// formatStmtInline returns a single-line rendering of `s` suitable for
+// embedding in a closure body literal. Best-effort: complex statements
+// (nested blocks, control flow) collapse to a single statement string
+// that the parser will still accept.
+func (p *printer) formatStmtInline(s ast.Stmt) string {
+	switch s := s.(type) {
+	case *ast.RetStmt:
+		if len(s.Values) == 0 {
+			return "ret"
+		}
+		var parts []string
+		for _, v := range s.Values {
+			parts = append(parts, p.formatExpr(v))
+		}
+		return "ret " + strings.Join(parts, ", ")
+	case *ast.ExprStmt:
+		return p.formatExpr(s.Expr)
+	case *ast.AssignStmt:
+		return p.formatExpr(s.LHS) + " = " + p.formatExpr(s.RHS)
+	case *ast.VarStmt:
+		out := "var " + s.Name
+		if s.Type != nil {
+			out += " " + p.formatType(s.Type)
+		}
+		if s.Value != nil {
+			out += " = " + p.formatExpr(s.Value)
+		}
+		return out
+	case *ast.IfStmt:
+		out := "if " + p.formatExpr(s.Cond) + " {"
+		if s.Then != nil {
+			for i, st := range s.Then.Stmts {
+				if i > 0 {
+					out += "; "
+				} else {
+					out += " "
+				}
+				out += p.formatStmtInline(st)
+			}
+		}
+		out += " }"
+		return out
+	}
+	return "<?stmt>"
+}
+
+// binaryPrec returns the precedence of a binary operator (higher =
+// binds tighter). Matches the parser's parsing levels so the printer
+// can decide where parentheses are necessary to preserve evaluation
+// order when re-emitting. Mirrors Go's operator precedence:
+//
+//	5: * / % & << >>      (multiplicative)
+//	4: + - | ^            (additive)
+//	3: == != < <= > >=    (comparison)
+//	2: &&                 (logical and)
+//	1: ||                 (logical or)
+//	0: unknown / non-binary
+func binaryPrec(op string) int {
+	switch op {
+	case "*", "/", "%", "&", "<<", ">>":
+		return 5
+	case "+", "-", "|", "^":
+		return 4
+	case "==", "!=", "<", "<=", ">", ">=":
+		return 3
+	case "&&":
+		return 2
+	case "||":
+		return 1
+	}
+	return 0
+}
+
 func (p *printer) formatExpr(e ast.Expr) string {
 	switch e := e.(type) {
 	case *ast.IntLit:
+		return e.Text
+	case *ast.FloatLit:
 		return e.Text
 	case *ast.BoolLit:
 		if e.Value {
@@ -641,9 +848,27 @@ func (p *printer) formatExpr(e ast.Expr) string {
 		if e.Op == "<-" {
 			return "read(" + p.formatExpr(e.X) + ")"
 		}
+		// `&mut` is a multi-character keyword-style operator — needs a
+		// space before the operand, else `&mut x` round-trips as the
+		// unparseable `&mutx`.
+		if e.Op == "&mut" {
+			return "&mut " + p.formatExpr(e.X)
+		}
 		return e.Op + p.formatExpr(e.X)
 	case *ast.BinaryExpr:
-		return p.formatExpr(e.X) + " " + e.Op + " " + p.formatExpr(e.Y)
+		// Parenthesize each operand if it's a BinaryExpr whose
+		// operator has lower precedence than ours (left-associative:
+		// same precedence on RHS also requires parens).
+		outerP := binaryPrec(e.Op)
+		left := p.formatExpr(e.X)
+		if be, ok := e.X.(*ast.BinaryExpr); ok && binaryPrec(be.Op) < outerP {
+			left = "(" + left + ")"
+		}
+		right := p.formatExpr(e.Y)
+		if be, ok := e.Y.(*ast.BinaryExpr); ok && binaryPrec(be.Op) <= outerP {
+			right = "(" + right + ")"
+		}
+		return left + " " + e.Op + " " + right
 	case *ast.CallExpr:
 		var sb strings.Builder
 		sb.WriteString(p.formatExpr(e.Fun))
@@ -701,6 +926,45 @@ func (p *printer) formatExpr(e ast.Expr) string {
 			}
 			sb.WriteByte('}')
 		}
+		return sb.String()
+	case *ast.FuncLit:
+		var sb strings.Builder
+		sb.WriteString("fun(")
+		for i, prm := range e.Params {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			if prm.Name != "" {
+				sb.WriteString(prm.Name + " ")
+			}
+			sb.WriteString(p.formatType(prm.Type))
+		}
+		sb.WriteByte(')')
+		if len(e.Results) == 1 {
+			sb.WriteByte(' ')
+			sb.WriteString(p.formatType(e.Results[0]))
+		} else if len(e.Results) > 1 {
+			sb.WriteString(" (")
+			for i, r := range e.Results {
+				if i > 0 {
+					sb.WriteString(", ")
+				}
+				sb.WriteString(p.formatType(r))
+			}
+			sb.WriteByte(')')
+		}
+		// Body on one line — multi-line closure pretty-printing is a
+		// future widening (the parser accepts the single-line form).
+		sb.WriteString(" { ")
+		if e.Body != nil {
+			for i, st := range e.Body.Stmts {
+				if i > 0 {
+					sb.WriteString("; ")
+				}
+				sb.WriteString(p.formatStmtInline(st))
+			}
+		}
+		sb.WriteString(" }")
 		return sb.String()
 	case *ast.SliceLit:
 		var sb strings.Builder

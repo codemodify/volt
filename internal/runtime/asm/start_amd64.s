@@ -10,14 +10,46 @@
 // synthesizing `ret i64 0` if the user wrote a void main. We forward
 // main's i64 result to sys_exit_group as the process exit code so all
 // spawned threads are torn down.
+//
+// _start also captures argc / argv / envp from the initial stack so the
+// `os` package can expose them later (os.Args, os.Getenv). Linux puts:
+//   (rsp)        argc
+//   8(rsp)       argv[0]
+//   ...          argv[argc] = NULL
+//                envp[0]
+//                ...
+//                envp[N] = NULL
+// We stash argc as i64 and argv/envp as base pointers in BSS globals.
+
+.global volt_argc
+.global volt_argv
+.global volt_envp
+.bss
+.align 8
+volt_argc: .skip 8
+volt_argv: .skip 8
+volt_envp: .skip 8
 
 .global _start
 .text
 
 _start:
+    // Capture argc / argv / envp before any stack alignment.
+    movq    (%rsp),       %rax            // argc
+    movq    %rax,         volt_argc(%rip)
+    leaq    8(%rsp),      %rcx            // argv base
+    movq    %rcx,         volt_argv(%rip)
+    // envp = argv + (argc + 1) * 8
+    leaq    8(%rcx,%rax,8), %rdx
+    movq    %rdx,         volt_envp(%rip)
+
     andq    $-16, %rsp
     call    main
-    movq    %rax, %rdi      // exit code = main's return value
+    // Preserve main's return value across the at-exit hook (which may
+    // flush the memory profile). %rbx is callee-saved by the hook.
+    movq    %rax, %rbx
+    call    volt_runtime_at_program_exit
+    movq    %rbx, %rdi      // exit code = main's return value
     movq    $231, %rax      // sys_exit_group (terminates whole process)
     syscall
 

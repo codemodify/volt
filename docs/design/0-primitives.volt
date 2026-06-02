@@ -1,3 +1,4 @@
+// volt:noformat — spec file; hand-aligned.
 // =====================================================================
 // 0-primitives.volt — every built-in primitive type, declared and used
 // =====================================================================

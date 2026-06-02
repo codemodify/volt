@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/codemodify/volt/internal/ast"
+	"github.com/codemodify/volt/internal/lex"
 )
 
 // Channel multiplicity contracts.
@@ -50,7 +51,9 @@ import (
 //     once total (we only need to know "main reads at least once").
 
 type chanCheck struct {
-	decl               *ast.VarStmt
+	pos                lex.Pos
+	name               string
+	isParam            bool // parameter-sourced (at-most semantics) vs var-decl (exactly-N)
 	multi              ast.ChanMulti
 	mainReads          bool
 	mainWrites         bool
@@ -65,6 +68,18 @@ func (c *Checker) checkChanContracts(fd *ast.FuncDecl) {
 		return
 	}
 	contracts := map[string]*chanCheck{}
+	// Seed parameter-sourced contracts: any `chanXY T` parameter is
+	// tracked with at-most semantics so the function body's endpoint
+	// usage gets verified against the contract cap (the caller may be
+	// supplying additional endpoints; we can only reject definite
+	// violations from this function's side).
+	for _, p := range fd.Params {
+		ct, ok := p.Type.(*ast.ChanType)
+		if !ok || ct.Multi == ast.ChanMultiNone {
+			continue
+		}
+		contracts[p.Name] = &chanCheck{pos: p.Pos(), name: p.Name, isParam: true, multi: ct.Multi}
+	}
 	c.collectChanContracts(fd.Body, contracts)
 	if len(contracts) == 0 {
 		return
@@ -88,7 +103,7 @@ func (c *Checker) collectChanContractsStmt(s ast.Stmt, contracts map[string]*cha
 	switch s := s.(type) {
 	case *ast.VarStmt:
 		if ct, ok := s.Type.(*ast.ChanType); ok && ct.Multi != ast.ChanMultiNone {
-			contracts[s.Name] = &chanCheck{decl: s, multi: ct.Multi}
+			contracts[s.Name] = &chanCheck{pos: s.Pos(), name: s.Name, multi: ct.Multi}
 		}
 	case *ast.IfStmt:
 		if s.Init != nil {
@@ -359,28 +374,37 @@ func (c *Checker) validateChanContract(cc *chanCheck) {
 		writerCount++
 	}
 	name := cc.multi.MultiName()
-	pos := cc.decl.Pos()
-	decl := cc.decl.Name
+	pos := cc.pos
+	decl := cc.name
 
 	needOneReader := cc.multi == ast.ChanMulti11 || cc.multi == ast.ChanMulti1N
 	needOneWriter := cc.multi == ast.ChanMulti11 || cc.multi == ast.ChanMultiN1
+
+	// Parameter-sourced contracts use at-most semantics: the caller may
+	// be supplying additional endpoints we can't see, so we only reject
+	// the function-body usage that DEFINITELY violates the cap (a count
+	// > 1 or an in-loop spawn). count == 0 is fine for params.
+	site := "declared"
+	if cc.isParam {
+		site = "parameter"
+	}
 
 	if needOneReader {
 		switch {
 		case cc.spawnReadersInLoop:
 			c.errs = append(c.errs, fmt.Sprintf(
-				"%s: %s %q contract violated — declared `One Reader` but a `run` reading from %q appears inside a loop (each iteration spawns a new reader); use chanN1 or chanNN for many readers",
-				pos, name, decl, decl))
+				"%s: %s %q contract violated — %s `One Reader` but a `run` reading from %q appears inside a loop (each iteration spawns a new reader); use chanN1 or chanNN for many readers",
+				pos, name, decl, site, decl))
 		case readerCount > 1:
 			c.errs = append(c.errs, fmt.Sprintf(
-				"%s: %s %q contract violated — declared `One Reader` but found %d reader endpoint(s); use chanN1 or chanNN for many readers",
-				pos, name, decl, readerCount))
-		case readerCount == 0:
+				"%s: %s %q contract violated — %s `One Reader` but found %d reader endpoint(s); use chanN1 or chanNN for many readers",
+				pos, name, decl, site, readerCount))
+		case readerCount == 0 && !cc.isParam:
 			c.errs = append(c.errs, fmt.Sprintf(
 				"%s: %s %q contract violated — declared `One Reader` but no reader endpoint exists",
 				pos, name, decl))
 		}
-	} else {
+	} else if !cc.isParam {
 		if readerCount == 0 && !cc.spawnReadersInLoop {
 			c.errs = append(c.errs, fmt.Sprintf(
 				"%s: %s %q contract violated — declared `Many Readers` but no reader endpoint exists",
@@ -392,18 +416,18 @@ func (c *Checker) validateChanContract(cc *chanCheck) {
 		switch {
 		case cc.spawnWritersInLoop:
 			c.errs = append(c.errs, fmt.Sprintf(
-				"%s: %s %q contract violated — declared `One Writer` but a `run` writing to %q appears inside a loop (each iteration spawns a new writer); use chan1N or chanNN for many writers",
-				pos, name, decl, decl))
+				"%s: %s %q contract violated — %s `One Writer` but a `run` writing to %q appears inside a loop (each iteration spawns a new writer); use chan1N or chanNN for many writers",
+				pos, name, decl, site, decl))
 		case writerCount > 1:
 			c.errs = append(c.errs, fmt.Sprintf(
-				"%s: %s %q contract violated — declared `One Writer` but found %d writer endpoint(s); use chan1N or chanNN for many writers",
-				pos, name, decl, writerCount))
-		case writerCount == 0:
+				"%s: %s %q contract violated — %s `One Writer` but found %d writer endpoint(s); use chan1N or chanNN for many writers",
+				pos, name, decl, site, writerCount))
+		case writerCount == 0 && !cc.isParam:
 			c.errs = append(c.errs, fmt.Sprintf(
 				"%s: %s %q contract violated — declared `One Writer` but no writer endpoint exists",
 				pos, name, decl))
 		}
-	} else {
+	} else if !cc.isParam {
 		if writerCount == 0 && !cc.spawnWritersInLoop {
 			c.errs = append(c.errs, fmt.Sprintf(
 				"%s: %s %q contract violated — declared `Many Writers` but no writer endpoint exists",
