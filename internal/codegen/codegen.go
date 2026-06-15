@@ -1301,6 +1301,22 @@ func scanMovedNames(body *ast.Block) map[string]bool {
 					return
 				}
 			}
+			// Param-disposition (S3, level 3): audited stdlib functions that
+			// BORROW all their args (read them, retain nothing) don't take
+			// ownership — so the caller keeps owning its arguments and may free
+			// them at scope end. Don't mark such args moved (walkExpr, not
+			// walkMove). SAFE because each listed fn is audited to never store/
+			// return/escape any arg. Any OTHER use of the same var (e.g. a
+			// consuming call elsewhere) still marks it moved, so this only
+			// un-suppresses frees that are provably safe.
+			if sel, ok := x.Fun.(*ast.SelectorExpr); ok {
+				if pkg, ok := sel.X.(*ast.IdentExpr); ok && stdlibAllParamsBorrowed[pkg.Name+"."+sel.Sel] {
+					for _, a := range x.Args {
+						walkExpr(a)
+					}
+					return
+				}
+			}
 			walkExpr(x.Fun)
 			for _, a := range x.Args {
 				walkMove(a)
@@ -5016,6 +5032,26 @@ func isOwnedSliceReturnCall(e ast.Expr) bool {
 		return false
 	}
 	return stdlibOwnedSliceReturns[pkg.Name+"."+sel.Sel]
+}
+
+// stdlibAllParamsBorrowed is the whitelist of "pkg.Fn" callsites that BORROW
+// every argument — they read their args and retain NOTHING (no arg is stored,
+// returned, or otherwise escaped; they return freshly-allocated output). So
+// the caller keeps owning its arguments and may free them at scope exit; the
+// move-scan therefore does NOT mark these call-args as moved. S3 level-3.
+//
+// SAFETY: each entry was AUDITED (read the body) to confirm it never retains
+// an arg. A wrong entry would let the caller free a value the callee kept →
+// use-after-free, so this list stays TIGHT (read-only transformers only).
+// Reuses the S3-audited fresh-return set (those functions also borrow inputs).
+var stdlibAllParamsBorrowed = map[string]bool{
+	"strings.Fields":          true, // reads s, builds fresh out
+	"strings.Split":           true, // reads s+sep, builds fresh out
+	"strings.SplitN":          true,
+	"maps.KeysStringInt":      true, // reads m, builds fresh out
+	"maps.ValuesStringInt":    true,
+	"maps.KeysStringString":   true,
+	"maps.ValuesStringString": true,
 }
 
 var stdlibHeapStringProducers = map[string]bool{
