@@ -4795,6 +4795,26 @@ skipNormalEmit:
 			})
 		}
 	}
+	// S3 first cut: a slice returned by an audited stdlib OWNED-RETURN call
+	// (strings.Fields, maps.Keys, …) is a FRESH caller-owned slice — free its
+	// backing at scope exit, exactly like a local `new []T{...}` and under the
+	// SAME movedNames gate (suppressed if x is passed/returned/stored → no
+	// use-after-free, only a possible leak). Frees the backing only; element
+	// payloads of []string returns still leak (a documented follow-up).
+	if typeStr == "%slice" && !c.movedNames[s.Name] && isOwnedSliceReturnCall(s.Value) {
+		// BACKING ONLY — never element-free a function RETURN's elements: the
+		// callee may have filled the returned slice with values that ALIAS its
+		// inputs (e.g. maps.Keys copies the map's key headers), so element-free
+		// here could double-free the caller's still-owned input. The backing
+		// itself is always freshly new'd by the audited callee, so freeing it
+		// is sound. (Full element reclamation of returns needs interprocedural
+		// element-provenance — a documented follow-up.)
+		c.drops = append(c.drops, dropEntry{
+			kind:  dropKindSlice,
+			depth: c.scopeDepth,
+			ptr:   ptr,
+		})
+	}
 	// A3 strings: register a string drop only when RHS is a KNOWN
 	// heap-producer (string concat, `chr` builtin). Function-call
 	// results conservatively skip auto-free because we can't tell
@@ -4954,6 +4974,50 @@ func isHeapStringProducer(e ast.Expr) bool {
 // returns inside these functions are harmlessly skipped by the
 // runtime check. The dominant case (real heap data) frees correctly,
 // recycling memory in tight loops.
+// stdlibOwnedSliceReturns is the whitelist of "pkg.Fn" callsites that return
+// a FRESHLY-allocated slice the caller solely owns — so `var x = pkg.Fn(...)`
+// registers a backing free at scope exit, exactly like a local `new []T{...}`
+// (and under the SAME movedNames gate: if x is passed/returned/stored, the
+// free is suppressed → no use-after-free, only a possible leak). S3 first cut.
+//
+// SAFETY: unlike the string list above (volt_str_free is heap-range-safe so
+// over-including is harmless), volt_slice_free frees the buffer pointer
+// directly — so a function that returns its INPUT aliased (e.g. sort.IntsAsc
+// does `ret s`, sorting in place) must NOT be listed, or the caller would
+// double-free. Every entry here was AUDITED to `new(...)` a fresh slice and
+// return THAT, never an aliased input/param. Frees the BACKING only; for
+// []string returns the element strings still leak (a separate follow-up —
+// element-payload free for non-`new` locals).
+var stdlibOwnedSliceReturns = map[string]bool{
+	"strings.Fields":         true, // new(count) []string{...}; ret out
+	"strings.Split":          true, // new(parts) []string{...}; ret out
+	"strings.SplitN":         true, // ret Split(...) / new(...) []string{}
+	"maps.KeysStringInt":     true, // new(n) []string{}; ret out
+	"maps.ValuesStringInt":   true, // new(n) []int{}; ret out
+	"maps.KeysStringString":  true, // new(n) []string{}; ret out
+	"maps.ValuesStringString": true, // new(n) []string{}; ret out
+}
+
+// isOwnedSliceReturnCall reports whether `e` is a call `pkg.Fn(...)` on the
+// audited stdlibOwnedSliceReturns whitelist — i.e. its result is a fresh,
+// caller-owned slice whose backing should be freed at the caller's scope
+// exit. Checked purely at the call site by name (no cross-package plumbing).
+func isOwnedSliceReturnCall(e ast.Expr) bool {
+	call, ok := e.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	pkg, ok := sel.X.(*ast.IdentExpr)
+	if !ok {
+		return false
+	}
+	return stdlibOwnedSliceReturns[pkg.Name+"."+sel.Sel]
+}
+
 var stdlibHeapStringProducers = map[string]bool{
 	"fmt.Sprintf":         true,
 	"fmt.Sprintln":        true,
