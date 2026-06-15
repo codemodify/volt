@@ -1,7 +1,8 @@
-// Partial-borrow conflict: borrowing one field mutably freezes the
-// WHOLE container (conservative). A second mutable borrow of another
-// field while the first is live must be rejected — volt doesn't yet
-// track disjoint field borrows.
+// Partial-borrow conflict (C8 phase 7): disjoint fields CAN be write
+// borrowed at once (`&pt.x` into `*int` + `&pt.y` into `*int` is fine),
+// but a whole-container write borrow (`&pt` into `*Point`) while a field
+// of pt is still borrowed must be rejected — the whole-var write borrow
+// would alias the live field borrow.
 package main
 
 type Point struct {
@@ -11,9 +12,9 @@ type Point struct {
 
 fun main() int {
 	var pt Point = new Point {x: 1, y: 2}
-	var bx &mut int = &mut pt.x
-	var by &mut int = &mut pt.y   // ERROR: pt already mutably borrowed
+	var bx *int = &pt.x
+	var whole *Point = &pt   // ERROR: field pt.x still borrowed
 	*bx = 10
-	*by = 20
+	whole.y = 20
 	ret 0
 }

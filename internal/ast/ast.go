@@ -111,23 +111,24 @@ type NamedType struct {
 func (t *NamedType) Pos() lex.Pos { return t.P }
 func (t *NamedType) typeNode()    {}
 
-// BorrowType is `&T` (shared, read-only) or `&mut T` (exclusive,
-// read/write). C8 phase 4 split: shared borrows allow multi-aliasing
-// for parallel readers; mutable borrows are exclusive and grant write
-// access. The checker enforces:
+// BorrowType is `&T` — a shared, read-only borrow. Many `&T` of the
+// same source may coexist. The exclusive write borrow is `*T`
+// (PointerType): one at a time, mutually exclusive with any `&T`.
+// The checker enforces:
 //   - many `&T` of the same source OK at once
-//   - one `&mut T` of the source OK; blocks all other borrows
-//   - `*p = v` requires p to be `&mut T`
+//   - one `*T` write borrow of the source OK; blocks all other borrows
+//   - `*p = v` requires p to be `*T`
 type BorrowType struct {
 	P    lex.Pos
 	Elem Type
-	Mut  bool // true for `&mut T`
 }
 
 func (t *BorrowType) Pos() lex.Pos { return t.P }
 func (t *BorrowType) typeNode()    {}
 
-// PointerType is `*T` — unique, read/write borrow.
+// PointerType is `*T` — the exclusive write borrow (one at a time, XOR
+// with any `&T`) when taken as `&x` of a named var; also the owning
+// heap pointer returned by `new T{}`.
 type PointerType struct {
 	P    lex.Pos
 	Elem Type
@@ -209,12 +210,14 @@ type TypeDecl struct {
 func (d *TypeDecl) Pos() lex.Pos { return d.P }
 func (d *TypeDecl) declNode()    {}
 
-// ConstDecl is a top-level `const Name = Value` declaration. v0.5 limits
-// Value to a literal-constant expression; codegen substitutes the value
-// at each use site.
+// ConstDecl is a top-level `const Name [Type] = Value` declaration. v0.5
+// limits Value to a literal-constant expression; codegen substitutes the
+// value at each use site. Type is optional (nil when omitted) and is kept
+// only so the formatter can round-trip it; codegen ignores it.
 type ConstDecl struct {
 	P     lex.Pos
 	Name  string
+	Type  Type // may be nil
 	Value Expr
 }
 
@@ -233,7 +236,8 @@ type Stmt interface {
 
 // Block is `{ stmts }`.
 type Block struct {
-	P     lex.Pos
+	P     lex.Pos // the opening `{`
+	End   lex.Pos // the closing `}` (used by the formatter to bound in-body comment flushing)
 	Stmts []Stmt
 }
 
@@ -255,6 +259,12 @@ type VarStmt struct {
 	Name  string
 	Type  Type // may be nil (inferred)
 	Value Expr
+	// MovedAtEnd is set by the checker at the declaring block's close when
+	// this local's value has been moved out (and not revived) by then. The
+	// checker's move-state is type-aware (it knows movable-vs-Copy field
+	// extracts), so codegen unions this into movedNames to suppress the
+	// scope-end free precisely — the foundation for safe recursive reclaim.
+	MovedAtEnd bool
 }
 
 func (s *VarStmt) Pos() lex.Pos { return s.P }
@@ -375,16 +385,6 @@ type RunStmt struct {
 
 func (s *RunStmt) Pos() lex.Pos { return s.P }
 func (s *RunStmt) stmtNode()    {}
-
-// SendStmt is `ch <- value` — channel send.
-type SendStmt struct {
-	P       lex.Pos
-	Channel Expr
-	Value   Expr
-}
-
-func (s *SendStmt) Pos() lex.Pos { return s.P }
-func (s *SendStmt) stmtNode()    {}
 
 // SelectStmt is `select { case ...: ... }`. Each case is either a
 // channel send, a channel receive (with optional v / v,ok bindings),
@@ -692,7 +692,7 @@ func (e *UnaryExpr) exprNode()    {}
 
 // NewExpr is a heap allocation. The full grammar is:
 //
-//	new T          — bare (default-construct; legacy syntax)
+//	new T          — bare (default-construct, no size/init)
 //	new T(s)       — sized: chan cap, slice length, map cap hint
 //	new T{i}       — init data: struct fields, map entries, or slice elements
 //	new T(s){i}    — sized + initial data (slice with length=s, map with cap=s)

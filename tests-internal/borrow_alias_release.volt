@@ -8,8 +8,8 @@ fun main() int {
 	var x int = 100
 
 	{
-		var b1 &mut int = &mut x
-		var b2 &mut int = b1
+		var b1 *int = &x
+		var b2 *int = b1
 		*b1 = 1
 		*b2 = *b2 + 1
 		if *b1 != 2 { ret 1 }

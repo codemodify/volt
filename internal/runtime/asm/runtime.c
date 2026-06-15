@@ -43,6 +43,18 @@ typedef unsigned char u8;
 #define SYS_MKDIRAT         258
 #define SYS_FACCESSAT       269
 #define SYS_GETTID          186
+#define SYS_CLONE            56
+#define SYS_EXECVE          59
+#define SYS_WAIT4           61
+#define SYS_PIPE2          293
+#define SYS_DUP3           292
+#define SYS_IOCTL            16
+#define SYS_PPOLL          271
+#define SYS_CHDIR            80
+#define SYS_RT_SIGACTION     13
+#define SYS_KILL             62
+#define SYS_GETPID           39
+#define SYS_EXIT            60
 #elif defined(__aarch64__)
 #define SYS_EXIT_GROUP       94
 #define SYS_FUTEX            98
@@ -63,6 +75,18 @@ typedef unsigned char u8;
 #define SYS_MKDIRAT          34
 #define SYS_FACCESSAT        48
 #define SYS_GETTID          178
+#define SYS_CLONE           220
+#define SYS_EXECVE          221
+#define SYS_WAIT4           260
+#define SYS_PIPE2            59
+#define SYS_DUP3            24
+#define SYS_IOCTL            29
+#define SYS_PPOLL            73
+#define SYS_CHDIR            49
+#define SYS_RT_SIGACTION    134
+#define SYS_KILL            129
+#define SYS_GETPID          172
+#define SYS_EXIT            93
 #else
 #error "unsupported arch"
 #endif
@@ -215,6 +239,120 @@ static void volt_munmap(void* p, i64 size) {
 #endif
 }
 
+// ---------------------------------------------------------------------
+// Thread-local storage (TLS)
+//
+// volt is freestanding (no libc) and built with -fno-stack-protector,
+// so the thread register (x86-64 %fs / aarch64 tpidr_el0) is entirely
+// unused by the rest of the runtime — we're free to repurpose it. Each
+// thread points its thread register at a small mmap'd per-thread block;
+// volt_tls_init runs once per thread (from _start for the main thread,
+// from volt_spawn's child for workers). Slot 0 currently backs the
+// memory-profiler's per-thread "current source line"; more per-thread
+// state can be added at higher offsets.
+//
+// TLS is only READ/WRITTEN under `--memprofile` (the note-line emission
+// and the g_mp_line_enabled-gated alloc path), so a thread that never
+// profiles never touches its TLS block.
+#define TLS_BLOCK_SIZE 64
+
+#if defined(__x86_64__)
+#define SYS_ARCH_PRCTL 158
+#define ARCH_SET_FS    0x1002
+#endif
+
+// Shared fallback TLS block, used only if a thread's per-thread mmap
+// fails (hard-OOM). Pointing the thread register here keeps the gated
+// accessors hitting VALID memory — worst case under OOM is a mis-
+// attributed profile line, never a NULL-deref at %fs:0 / *(tpidr).
+static i64 g_tls_fallback[TLS_BLOCK_SIZE / 8] = {0};
+
+// Deadlock backstop (#7 stage 2) — atomic thread accounting.
+//   g_live_threads : threads that currently exist. Starts at 1 (main).
+//                    Codegen emits volt_thread_begin() BEFORE each
+//                    volt_spawn (parent-side, so a worker is counted
+//                    before it can ever park — no race window), and the
+//                    spawn-child assembly calls volt_thread_exit() after
+//                    the worker's function returns.
+//   g_parked       : threads currently inside a tracked FUTEX_WAIT.
+//   g_progress     : bumped on every FUTEX_WAKE (a thread made another
+//                    runnable). When every live thread is parked and
+//                    g_progress holds steady across the grace window, no
+//                    thread can ever issue a wake → permanent deadlock.
+static i32 g_live_threads = 1;
+static i32 g_parked       = 0;
+static i64 g_progress     = 0;
+
+// volt_thread_begin / volt_thread_exit bracket a spawned worker's life.
+// begin is emitted by codegen just before volt_spawn; exit is called from
+// the volt_spawn child (start_*.s) right after the worker fn returns and
+// before its sys_exit. The main thread is the static +1 and never calls
+// exit (it tears the process down via sys_exit_group).
+void volt_thread_begin(void) {
+    __atomic_add_fetch(&g_live_threads, 1, __ATOMIC_SEQ_CST);
+}
+void volt_thread_exit(void) {
+    __atomic_sub_fetch(&g_live_threads, 1, __ATOMIC_SEQ_CST);
+}
+
+// Forward decl: defined later (alongside its sys_rt_sigaction helper), but
+// invoked once from volt_tls_init below to disarm SIGPIPE process-wide.
+static void volt_ignore_sigpipe(void);
+
+// volt_tls_init allocates this thread's TLS block and points the thread
+// register at it. On mmap failure it degrades to the shared fallback
+// block so the (profiling-gated) accessors never fault. Called once
+// per thread (from _start for main, volt_spawn child for workers).
+void volt_tls_init(void) {
+    // Disarm SIGPIPE once, on the first (main-thread) init — before main
+    // runs and before any worker spawns, so a write to a closed pipe/socket
+    // returns -EPIPE instead of killing the process. Idempotent anyway.
+    static int sigpipe_done = 0;
+    if (!sigpipe_done) {
+        sigpipe_done = 1;
+        volt_ignore_sigpipe();
+    }
+    void* block = volt_mmap_anon(TLS_BLOCK_SIZE);
+    if (!block) {
+        block = (void*)g_tls_fallback;   // OOM: degrade, don't crash
+    } else {
+        for (i32 i = 0; i < TLS_BLOCK_SIZE; i++) ((char*)block)[i] = 0;
+    }
+#if defined(__x86_64__)
+    register i64 rax __asm__("rax") = SYS_ARCH_PRCTL;
+    register i64 rdi __asm__("rdi") = ARCH_SET_FS;
+    register i64 rsi __asm__("rsi") = (i64)block;
+    __asm__ volatile("syscall" : "+r"(rax) : "r"(rdi), "r"(rsi) : "rcx", "r11", "memory");
+#elif defined(__aarch64__)
+    __asm__ volatile("msr tpidr_el0, %0" :: "r"(block) : "memory");
+#endif
+}
+
+// volt_tls_get_slot0 / volt_tls_set_slot0 read/write the i64 at offset 0
+// of this thread's TLS block. On x86-64 %fs:0 directly addresses the
+// block; on aarch64 tpidr_el0 holds the block pointer, so we load from
+// it. Caller must have run volt_tls_init on this thread first.
+static inline i64 volt_tls_get_slot0(void) {
+    i64 v = 0;
+#if defined(__x86_64__)
+    __asm__ volatile("movq %%fs:0, %0" : "=r"(v));
+#elif defined(__aarch64__)
+    void* base;
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(base));
+    v = *(volatile i64*)base;
+#endif
+    return v;
+}
+static inline void volt_tls_set_slot0(i64 v) {
+#if defined(__x86_64__)
+    __asm__ volatile("movq %0, %%fs:0" :: "r"(v) : "memory");
+#elif defined(__aarch64__)
+    void* base;
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(base));
+    *(volatile i64*)base = v;
+#endif
+}
+
 // Find the smallest size class that fits `size`. Returns -1 if larger
 // than the biggest class (caller routes to mmap-direct path).
 static i32 find_size_class(i64 size) {
@@ -269,11 +407,11 @@ static i64 g_alloc_bytes_huge = 0;
 // branch). The line==0 bucket collects runtime-internal allocations
 // (chan/map machinery) that ran without a user line stamped.
 #define MP_LINE_SLOTS 1024
-// NOTE: a plain global, NOT __thread — volt's bare `_start` sets up no
-// TLS (no libc), so thread-local storage would fault on first access.
-// Under multithreading the "current line" is therefore shared, making
-// attribution approximate; documented in runtime.MemProfileDump.
-static i64 g_mp_line = 0;
+// The memory-profiler's "current source line" is now PER-THREAD, held
+// in TLS slot 0 (see volt_tls_get_slot0 / set_slot0). _start and
+// volt_spawn run volt_tls_init on every thread, so each thread tracks
+// its own line and attribution is exact under multithreading. Accessed
+// only when g_mp_line_enabled (i.e. under --memprofile).
 static i32 g_mp_line_enabled  = 0;
 // Keys are stored as (line + 1) so a zero slot means "empty". The
 // line==0 bucket (runtime-internal allocs) therefore stores key 1.
@@ -380,7 +518,7 @@ void* volt_alloc(i64 size) {
     // Per-line attribution (opt-in via --memprofile). Folded under the
     // same lock so the line table stays consistent with the counters.
     if (g_mp_line_enabled) {
-        mp_line_record(g_mp_line, mp_slot);
+        mp_line_record(volt_tls_get_slot0(), mp_slot);
     }
 
     mutex_unlock(&alloc_lock);
@@ -394,6 +532,10 @@ void* volt_alloc(i64 size) {
 // Forward decl so volt_slice_free / volt_map_free can call volt_free
 // (which is defined immediately below them).
 void volt_free(void* ptr);
+// Forward decl: volt_map_free (defined below, before the map_t section)
+// frees boxed map values via map_free_value, which is defined later
+// alongside the map implementation.
+static void map_free_value(i64 value_kind, i64 value);
 
 // Forward decl: volt_race_acquire/release are defined in the D.1
 // race-detector block but called by volt_chan_send/recv for per-
@@ -456,14 +598,35 @@ void volt_slice_free(void* buf_ptr) {
     volt_free(buf_ptr);
 }
 
-// volt_map_free frees a map's entries, its buckets array, and the
-// map_t header itself. Walks every bucket's linked list freeing each
-// map_entry_t. Keys (key_ptr) are NOT owned by the entry — they're
-// references into the caller's string storage (often a string literal
-// in .rodata or a heap string owned by some other Drop chain); freeing
-// them here would either segfault or double-free. Passing 0 is a
-// no-op so codegen can emit unconditional drops paired with
-// nullify-on-move.
+// volt_slice_free_str_elems frees the per-element %string PAYLOADS of a
+// []string backing buffer, then the buffer itself (#5 / S1b). Each element
+// is a {char* ptr; i64 len} = 16 bytes; element i's backing pointer is the
+// first 8 bytes at offset i*16. volt_str_free is heap-range-safe, so a
+// literal-backed element (rodata ptr) is a harmless no-op. Codegen emits a
+// call to this (instead of volt_slice_free) ONLY for a []string local the
+// compiler proved is the SOLE owner of independent element payloads — reads
+// copy out (S1a), writes move in, so no element payload is aliased elsewhere.
+// Null buffer is a no-op.
+void volt_slice_free_str_elems(void* buf_ptr, i64 len) {
+    if (!buf_ptr) return;
+    for (i64 i = 0; i < len; i++) {
+        char* elem = *(char**)((char*)buf_ptr + i * 16);
+        volt_str_free(elem);
+    }
+    volt_free(buf_ptr);
+}
+
+// volt_map_free frees a map's entries (each entry's map-owned key copy
+// + the entry node), its buckets array, and the map_t header itself.
+// Keys ARE owned by the entry as of the key-copy change in volt_map_set
+// — each was copied from the caller's storage at insert time, so freeing
+// them here is correct (no alias, no double-free with the caller's
+// original). Kind-1 (boxed %string) VALUES are also map-owned and freed
+// here via map_free_value — the value was moved into the map at set-time
+// and map-get deep-copies, so the map is the sole owner of its backing.
+// Other value kinds (plain i64, slice boxes) are not freed (slice value
+// ownership is a documented follow-up). Passing 0 is a no-op so codegen
+// can emit unconditional drops paired with nullify-on-move.
 void volt_map_free(void* m_) {
     if (!m_) return;
     struct map_entry_lf { struct map_entry_lf* next; char* key_ptr; i64 key_len; i64 value; };
@@ -472,12 +635,15 @@ void volt_map_free(void* m_) {
         i64           count;
         i64           num_buckets;
         struct map_entry_lf** buckets;
+        i64           value_kind;
     };
     struct map_t_local* m = (struct map_t_local*)m_;
     for (i64 i = 0; i < m->num_buckets; i++) {
         struct map_entry_lf* e = m->buckets[i];
         while (e) {
             struct map_entry_lf* next = e->next;
+            map_free_value(m->value_kind, e->value);   // boxed value (if owned)
+            volt_free(e->key_ptr);                      // map-owned key copy
             volt_free(e);
             e = next;
         }
@@ -775,6 +941,113 @@ static i64 sys_futex(i32* uaddr, i32 op, i32 val) {
 #endif
 }
 
+// sys_futex_timed is FUTEX_WAIT with a RELATIVE timeout (the deadlock
+// backstop's grace timer). timeout points to a {i64 sec; i64 nsec} laid
+// out exactly like struct timespec. Returns the raw syscall result:
+// 0 on a real wake, -EAGAIN(-11) if *uaddr already != val, -ETIMEDOUT
+// (-110) on grace expiry, -EINTR(-4) on signal.
+static i64 sys_futex_timed(i32* uaddr, i32 val, void* timeout) {
+#if defined(__x86_64__)
+    register i64 rax __asm__("rax") = SYS_FUTEX;
+    register i64 rdi __asm__("rdi") = (i64)uaddr;
+    register i64 rsi __asm__("rsi") = FUTEX_WAIT;
+    register i64 rdx __asm__("rdx") = val;
+    register i64 r10 __asm__("r10") = (i64)timeout;
+    register i64 r8  __asm__("r8")  = 0;
+    register i64 r9  __asm__("r9")  = 0;
+    __asm__ volatile(
+        "syscall"
+        : "+r"(rax)
+        : "r"(rdi), "r"(rsi), "r"(rdx), "r"(r10), "r"(r8), "r"(r9)
+        : "rcx", "r11", "memory");
+    return rax;
+#elif defined(__aarch64__)
+    register i64 x8 __asm__("x8") = SYS_FUTEX;
+    register i64 x0 __asm__("x0") = (i64)uaddr;
+    register i64 x1 __asm__("x1") = FUTEX_WAIT;
+    register i64 x2 __asm__("x2") = val;
+    register i64 x3 __asm__("x3") = (i64)timeout;
+    register i64 x4 __asm__("x4") = 0;
+    register i64 x5 __asm__("x5") = 0;
+    __asm__ volatile(
+        "svc #0"
+        : "+r"(x0)
+        : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
+        : "memory");
+    return x0;
+#endif
+}
+
+extern void volt_write(i64 fd, const char* buf, i64 len);
+
+// deadlock_abort: the no-deadlock invariant's runtime half. A true
+// deadlock would otherwise hang forever; instead we print a diagnostic
+// and exit non-zero — the same clean exit_group path volt already uses
+// for other unrecoverable runtime errors (volt_die). Never returns.
+static void deadlock_abort(void) {
+    static const char msg[] =
+        "volt: fatal: deadlock detected — every thread is blocked and none can make progress\n";
+    volt_write(2, msg, (i64)(sizeof(msg) - 1));
+    volt_die();
+}
+
+// Grace timer + confirmation count for the all-blocked check. A real
+// deadlock hangs forever, so detection latency is irrelevant; we trade it
+// for safety. Aborting only after the all-parked + no-progress state
+// PERSISTS across several grace windows makes a false positive on a live
+// program effectively impossible: waking a parked thread requires a
+// RUNNING thread to FUTEX_WAKE it, so once every thread is parked the
+// state cannot change — and the multi-window confirmation plus the
+// g_progress epoch rule out the microsecond "woken but not yet
+// decremented" accounting window.
+#define DEADLOCK_GRACE_NS      250000000   /* 250 ms per window */
+#define DEADLOCK_CONFIRMATIONS 4           /* ~1.25 s of confirmed all-blocked */
+
+// futex_wait_tracked performs a FUTEX_WAIT with deadlock accounting. It
+// stays counted as parked for its whole blocked life: on our grace
+// timeout it re-checks the all-blocked condition and loops (still parked)
+// rather than returning, so a periodic wake never makes the caller see a
+// spurious unblock. It returns to the caller only on a real wake or a
+// value-change (which the caller's own retry loop re-tests).
+static void futex_wait_tracked(i32* uaddr, i32 val) {
+    __atomic_add_fetch(&g_parked, 1, __ATOMIC_SEQ_CST);
+    struct { i64 sec; i64 nsec; } ts;
+    ts.sec  = 0;
+    ts.nsec = DEADLOCK_GRACE_NS;
+    i64 baseline      = 0;
+    i32 have_baseline = 0;
+    i32 confirms      = 0;
+    for (;;) {
+        i64 r = sys_futex_timed(uaddr, val, &ts);
+        if (r != -110 /* -ETIMEDOUT */) {
+            if (r == -4 /* -EINTR */) {
+                continue;   // spurious signal — keep waiting, stay parked
+            }
+            break;          // real wake (0) or value changed (-EAGAIN)
+        }
+        // Grace timer fired — evaluate the all-blocked condition.
+        i32 parked = __atomic_load_n(&g_parked, __ATOMIC_SEQ_CST);
+        i32 live   = __atomic_load_n(&g_live_threads, __ATOMIC_SEQ_CST);
+        i64 prog   = __atomic_load_n(&g_progress, __ATOMIC_SEQ_CST);
+        if (live > 0 && parked >= live) {
+            if (have_baseline && prog == baseline) {
+                if (++confirms >= DEADLOCK_CONFIRMATIONS) {
+                    deadlock_abort();
+                }
+            } else {
+                baseline      = prog;   // start/refresh the no-progress window
+                have_baseline = 1;
+                confirms      = 0;
+            }
+        } else {
+            have_baseline = 0;          // a thread is runnable / progressed
+            confirms      = 0;
+        }
+        // loop back and re-wait, still counted as parked.
+    }
+    __atomic_sub_fetch(&g_parked, 1, __ATOMIC_SEQ_CST);
+}
+
 // (mutex_t was forward-declared in the allocator section above.)
 typedef struct { i32 seq; } cond_t;
 
@@ -788,13 +1061,14 @@ static void mutex_lock(mutex_t* m) {
         if (__atomic_exchange_n(&m->state, 2, __ATOMIC_ACQUIRE) == 0) {
             return;
         }
-        sys_futex(&m->state, FUTEX_WAIT, 2);
+        futex_wait_tracked(&m->state, 2);
     }
 }
 
 static void mutex_unlock(mutex_t* m) {
     i32 prev = __atomic_exchange_n(&m->state, 0, __ATOMIC_RELEASE);
     if (prev == 2) {
+        __atomic_add_fetch(&g_progress, 1, __ATOMIC_RELAXED);  // a waiter is being woken
         sys_futex(&m->state, FUTEX_WAKE, 1);
     }
 }
@@ -802,17 +1076,19 @@ static void mutex_unlock(mutex_t* m) {
 static void cond_wait(cond_t* c, mutex_t* m) {
     i32 seq = __atomic_load_n(&c->seq, __ATOMIC_ACQUIRE);
     mutex_unlock(m);
-    sys_futex(&c->seq, FUTEX_WAIT, seq);
+    futex_wait_tracked(&c->seq, seq);
     mutex_lock(m);
 }
 
 static void cond_signal(cond_t* c) {
     __atomic_add_fetch(&c->seq, 1, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&g_progress, 1, __ATOMIC_RELAXED);
     sys_futex(&c->seq, FUTEX_WAKE, 1);
 }
 
 static void cond_broadcast(cond_t* c) {
     __atomic_add_fetch(&c->seq, 1, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&g_progress, 1, __ATOMIC_RELAXED);
     sys_futex(&c->seq, FUTEX_WAKE, 0x7fffffff);
 }
 
@@ -823,14 +1099,17 @@ static void cond_broadcast(cond_t* c) {
 // to the destination. Channel handle is opaque (`ptr`) for users.
 // ---------------------------------------------------------------------
 
-// Channel backend tag — stored at offset 0 of every channel header so
-// the dispatcher can pick the right send/recv path.
-#define CHAN_BACKEND_MUTEX    0
-#define CHAN_BACKEND_LOCKFREE 1
-
+// A channel is a futex mutex + two condvars guarding a ring buffer.
+// cap=0 is an unbuffered rendezvous (synchronous handoff); cap>0 buffers.
+//
+// NOTE (future research): this is volt's single channel implementation.
+// A lock-free MPMC ring backend (selectable via `--channels lockfree`)
+// was prototyped and removed to keep the model simple — blocking ops
+// should park, not spin, and one backend is far easier to reason about
+// (it's also what the deadlock backstop relies on). See the
+// "channel backend research" note in TODO.md before reintroducing one.
 typedef struct {
-    i32      backend;      // = CHAN_BACKEND_MUTEX
-    i32      _pad0;
+    i64      refcount;     // atomic; volt_chan_new=1, retain/release, free at 0
     mutex_t  lock;
     cond_t   not_full;
     cond_t   not_empty;
@@ -845,43 +1124,6 @@ typedef struct {
     i64      receivers_parked;
 } chan_t;
 
-// D.2: bounded MPMC lock-free queue (Vyukov-style). Each slot has a
-// sequence number; producers/consumers race via CAS on enq_pos/deq_pos
-// then write/read the slot. Capacity is rounded up to a power of 2.
-// cap=0 unbuffered rendezvous still falls back to the mutex backend
-// because there's no useful lock-free rendezvous (the operation is
-// inherently a synchronous handoff).
-typedef struct {
-    i32      backend;       // = CHAN_BACKEND_LOCKFREE
-    i32      _pad0;
-    i64      cap_mask;      // power-of-2 capacity minus 1
-    i64      elem_size;
-    i64      slot_stride;   // sizeof(i64) + aligned(elem_size)
-    i64      closed;        // atomic 0/1
-    i64      enq_pos;       // atomic monotonically increasing
-    i64      _pad1[7];      // separate cache lines for enq/deq
-    i64      deq_pos;
-    i64      _pad2[7];
-    void*    slots;
-} chan_lf_t;
-
-static i32 g_chan_default_backend = CHAN_BACKEND_MUTEX;
-
-void volt_channels_set_lockfree(i64 on) {
-    g_chan_default_backend = on ? CHAN_BACKEND_LOCKFREE : CHAN_BACKEND_MUTEX;
-}
-
-static i32 chan_backend(void* ch_) {
-    return *(i32*)ch_;
-}
-
-static i64 round_up_pow2(i64 x) {
-    if (x <= 1) return 1;
-    i64 n = 1;
-    while (n < x) n <<= 1;
-    return n;
-}
-
 static void chan_memcpy(void* dst, void* src, i64 n) {
     u8* d = (u8*)dst;
     u8* s = (u8*)src;
@@ -892,36 +1134,11 @@ static void* chan_slot(chan_t* c, i64 idx) {
     return (void*)((u8*)c->buf + idx * c->elem_size);
 }
 
-static void* chan_lf_new(i64 cap, i64 elem_size) {
-    chan_lf_t* c = (chan_lf_t*)volt_alloc((i64)sizeof(chan_lf_t));
-    c->backend = CHAN_BACKEND_LOCKFREE;
-    i64 n = round_up_pow2(cap);
-    c->cap_mask = n - 1;
-    c->elem_size = elem_size;
-    // Slot stride: i64 seq + elem bytes, rounded to 8-byte alignment.
-    i64 stride = 8 + ((elem_size + 7) & ~(i64)7);
-    c->slot_stride = stride;
-    c->closed = 0;
-    c->enq_pos = 0;
-    c->deq_pos = 0;
-    c->slots = volt_alloc(n * stride);
-    u8* base = (u8*)c->slots;
-    for (i64 i = 0; i < n; i++) {
-        *(i64*)(base + i * stride) = i;
-    }
-    return (void*)c;
-}
-
 void* volt_chan_new(i64 cap, i64 elem_size) {
     if (cap < 0) cap = 0;
     if (elem_size <= 0) elem_size = 8;
-    // Lock-free backend only applies to BUFFERED channels (cap > 0).
-    // cap=0 rendezvous keeps mutex semantics regardless.
-    if (cap > 0 && g_chan_default_backend == CHAN_BACKEND_LOCKFREE) {
-        return chan_lf_new(cap, elem_size);
-    }
     chan_t* c = (chan_t*)volt_alloc((i64)sizeof(chan_t));
-    c->backend = CHAN_BACKEND_MUTEX;
+    c->refcount = 1;
     c->lock.state    = 0;
     c->not_full.seq  = 0;
     c->not_empty.seq = 0;
@@ -939,143 +1156,27 @@ void* volt_chan_new(i64 cap, i64 elem_size) {
     return (void*)c;
 }
 
-// ---- Lock-free MPMC ring (Vyukov bounded queue) ---------------------
-// Each slot carries a sequence number. Producer waits for seq == enq_pos,
-// then CAS-claims and writes data + sets seq = enq_pos + 1. Consumer
-// waits for seq == deq_pos + 1, claims via CAS, reads data + sets
-// seq = deq_pos + cap. Wrap-around is handled by the monotonic position
-// counters mod 2^64; the slot index is `pos & cap_mask`.
-//
-// On a full queue, send spin-waits (cheap CPU pause via __builtin_ia32_pause
-// where available, just a relaxed read otherwise). The mutex backend is
-// the right choice for genuinely-blocking workloads; lockfree is intended
-// for hot fan-in/fan-out where contention dominates lock acquisition.
-
-static inline u8* chan_lf_slot(chan_lf_t* c, i64 pos) {
-    return (u8*)c->slots + (pos & c->cap_mask) * c->slot_stride;
+// Channel reference counting (#6). A channel is a SHARED handle — the creator
+// plus each goroutine that captured it (`run f(c)`). volt_chan_new starts the
+// count at 1 (the creator); retain adds the goroutine's ref before a spawn;
+// release drops a ref at the creator's scope-end and at each goroutine's end;
+// the last release frees the struct + its buffer. Null-safe.
+void volt_chan_retain(void* ch_) {
+    if (!ch_) return;
+    __atomic_fetch_add(&((chan_t*)ch_)->refcount, 1, __ATOMIC_RELAXED);
 }
 
-static void cpu_pause(void) {
-#if defined(__x86_64__)
-    __asm__ volatile("pause" ::: "memory");
-#elif defined(__aarch64__)
-    __asm__ volatile("yield" ::: "memory");
-#endif
-}
-
-static void chan_lf_send(chan_lf_t* c, void* val_src) {
-    for (;;) {
-        if (__atomic_load_n(&c->closed, __ATOMIC_ACQUIRE)) {
-            volt_die();
-        }
-        i64 pos = __atomic_load_n(&c->enq_pos, __ATOMIC_RELAXED);
-        u8* slot = chan_lf_slot(c, pos);
-        i64 seq = __atomic_load_n((i64*)slot, __ATOMIC_ACQUIRE);
-        i64 diff = seq - pos;
-        if (diff == 0) {
-            i64 expected = pos;
-            if (__atomic_compare_exchange_n(&c->enq_pos, &expected, pos + 1,
-                    0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
-                chan_memcpy(slot + 8, val_src, c->elem_size);
-                __atomic_store_n((i64*)slot, pos + 1, __ATOMIC_RELEASE);
-                return;
-            }
-        } else if (diff < 0) {
-            // Full — spin briefly and retry.
-            cpu_pause();
-        } else {
-            // Lost the race; another producer advanced enq_pos.
-            cpu_pause();
-        }
-    }
-}
-
-static i64 chan_lf_recv(chan_lf_t* c, void* val_dest) {
-    for (;;) {
-        i64 pos = __atomic_load_n(&c->deq_pos, __ATOMIC_RELAXED);
-        u8* slot = chan_lf_slot(c, pos);
-        i64 seq = __atomic_load_n((i64*)slot, __ATOMIC_ACQUIRE);
-        i64 diff = seq - (pos + 1);
-        if (diff == 0) {
-            i64 expected = pos;
-            if (__atomic_compare_exchange_n(&c->deq_pos, &expected, pos + 1,
-                    0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
-                chan_memcpy(val_dest, slot + 8, c->elem_size);
-                __atomic_store_n((i64*)slot, pos + c->cap_mask + 1, __ATOMIC_RELEASE);
-                return 1;
-            }
-        } else if (diff < 0) {
-            // Empty — check closed condition.
-            if (__atomic_load_n(&c->closed, __ATOMIC_ACQUIRE)) {
-                // Double-check the slot didn't get filled between reads.
-                i64 enq = __atomic_load_n(&c->enq_pos, __ATOMIC_ACQUIRE);
-                if (enq <= pos) {
-                    u8* d = (u8*)val_dest;
-                    for (i64 i = 0; i < c->elem_size; i++) d[i] = 0;
-                    return 0;
-                }
-            }
-            cpu_pause();
-        } else {
-            cpu_pause();
-        }
-    }
-}
-
-static void chan_lf_close(chan_lf_t* c) {
-    __atomic_store_n(&c->closed, 1, __ATOMIC_RELEASE);
-}
-
-static i64 chan_lf_try_send(chan_lf_t* c, void* val_src) {
-    if (__atomic_load_n(&c->closed, __ATOMIC_ACQUIRE)) return 0;
-    i64 pos = __atomic_load_n(&c->enq_pos, __ATOMIC_RELAXED);
-    u8* slot = chan_lf_slot(c, pos);
-    i64 seq = __atomic_load_n((i64*)slot, __ATOMIC_ACQUIRE);
-    if (seq != pos) return 0;
-    i64 expected = pos;
-    if (!__atomic_compare_exchange_n(&c->enq_pos, &expected, pos + 1,
-            0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
-        return 0;
-    }
-    chan_memcpy(slot + 8, val_src, c->elem_size);
-    __atomic_store_n((i64*)slot, pos + 1, __ATOMIC_RELEASE);
-    return 1;
-}
-
-static i64 chan_lf_try_recv(chan_lf_t* c, void* val_dest) {
-    i64 pos = __atomic_load_n(&c->deq_pos, __ATOMIC_RELAXED);
-    u8* slot = chan_lf_slot(c, pos);
-    i64 seq = __atomic_load_n((i64*)slot, __ATOMIC_ACQUIRE);
-    if (seq != pos + 1) {
-        if (__atomic_load_n(&c->closed, __ATOMIC_ACQUIRE)) {
-            i64 enq = __atomic_load_n(&c->enq_pos, __ATOMIC_ACQUIRE);
-            if (enq <= pos) {
-                u8* d = (u8*)val_dest;
-                for (i64 i = 0; i < c->elem_size; i++) d[i] = 0;
-                // Distinguish "closed-and-drained" from "empty" via a
-                // separate return convention: 0 = no value, 1 = got one,
-                // -1 = closed-drained. The mutex try_recv also returns 0
-                // for both cases, so callers must treat lockfree the same.
-                return 0;
-            }
-        }
-        return 0;
-    }
-    i64 expected = pos;
-    if (!__atomic_compare_exchange_n(&c->deq_pos, &expected, pos + 1,
-            0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
-        return 0;
-    }
-    chan_memcpy(val_dest, slot + 8, c->elem_size);
-    __atomic_store_n((i64*)slot, pos + c->cap_mask + 1, __ATOMIC_RELEASE);
-    return 1;
+void volt_chan_release(void* ch_) {
+    if (!ch_) return;
+    if (__atomic_sub_fetch(&((chan_t*)ch_)->refcount, 1, __ATOMIC_ACQ_REL) != 0) return;
+    // Last holder dropped: no concurrent users remain (any goroutine still
+    // using or parked on the channel holds a ref), so freeing is safe.
+    chan_t* c = (chan_t*)ch_;
+    volt_free(c->buf);
+    volt_free(c);
 }
 
 void volt_chan_send(void* ch_, void* val_src) {
-    if (chan_backend(ch_) == CHAN_BACKEND_LOCKFREE) {
-        chan_lf_send((chan_lf_t*)ch_, val_src);
-        return;
-    }
     chan_t* c = (chan_t*)ch_;
     mutex_lock(&c->lock);
     if (c->cap == 0) {
@@ -1119,9 +1220,6 @@ void volt_chan_send(void* ch_, void* val_src) {
 
 // Returns 1 on success, 0 if channel closed+drained (val_dest is zeroed).
 i64 volt_chan_recv(void* ch_, void* val_dest) {
-    if (chan_backend(ch_) == CHAN_BACKEND_LOCKFREE) {
-        return chan_lf_recv((chan_lf_t*)ch_, val_dest);
-    }
     chan_t* c = (chan_t*)ch_;
     mutex_lock(&c->lock);
     if (c->cap == 0) {
@@ -1165,10 +1263,6 @@ i64 volt_chan_recv(void* ch_, void* val_dest) {
 }
 
 void volt_chan_close(void* ch_) {
-    if (chan_backend(ch_) == CHAN_BACKEND_LOCKFREE) {
-        chan_lf_close((chan_lf_t*)ch_);
-        return;
-    }
     chan_t* c = (chan_t*)ch_;
     mutex_lock(&c->lock);
     c->closed = 1;
@@ -1180,9 +1274,6 @@ void volt_chan_close(void* ch_) {
 // Non-blocking send. Returns 1 if value was queued, 0 if full.
 // On a cap=0 channel: succeeds only if a receiver is parked.
 i64 volt_chan_try_send(void* ch_, void* val_src) {
-    if (chan_backend(ch_) == CHAN_BACKEND_LOCKFREE) {
-        return chan_lf_try_send((chan_lf_t*)ch_, val_src);
-    }
     chan_t* c = (chan_t*)ch_;
     mutex_lock(&c->lock);
     if (c->closed) {
@@ -1216,9 +1307,6 @@ i64 volt_chan_try_send(void* ch_, void* val_src) {
 // On a cap=0 channel: succeeds only if a sender's handoff is pending.
 // Writes the dequeued bytes to *val_dest on success; zeroes on closed+empty.
 i64 volt_chan_try_recv(void* ch_, void* val_dest) {
-    if (chan_backend(ch_) == CHAN_BACKEND_LOCKFREE) {
-        return chan_lf_try_recv((chan_lf_t*)ch_, val_dest);
-    }
     chan_t* c = (chan_t*)ch_;
     mutex_lock(&c->lock);
     if (c->cap == 0) {
@@ -1542,6 +1630,112 @@ static i64 sys_close(i64 fd) {
     return x0;
 }
 #endif
+
+// ---- Terminal / poll syscall wrappers ------------------------------
+// ioctl(fd, request, argp) drives TIOCGWINSZ (window size) and
+// TCGETS/TCSETS (termios get/set) for the `term` stdlib package.
+// ppoll(fds, nfds, timeout, sigmask, sigsetsize) backs PollIn — a
+// readability wait with a millisecond timeout. Same shape per arch.
+#if defined(__x86_64__)
+static i64 sys_ioctl(i64 fd, i64 req, void* argp) {
+    register i64 rax __asm__("rax") = SYS_IOCTL;
+    register i64 rdi __asm__("rdi") = fd;
+    register i64 rsi __asm__("rsi") = req;
+    register i64 rdx __asm__("rdx") = (i64)argp;
+    __asm__ volatile("syscall"
+        : "+r"(rax)
+        : "r"(rdi), "r"(rsi), "r"(rdx)
+        : "rcx", "r11", "memory");
+    return rax;
+}
+static i64 sys_ppoll(void* fds, i64 nfds, void* tmo, void* sig, i64 sigsz) {
+    register i64 rax __asm__("rax") = SYS_PPOLL;
+    register i64 rdi __asm__("rdi") = (i64)fds;
+    register i64 rsi __asm__("rsi") = nfds;
+    register i64 rdx __asm__("rdx") = (i64)tmo;
+    register i64 r10 __asm__("r10") = (i64)sig;
+    register i64 r8  __asm__("r8")  = sigsz;
+    __asm__ volatile("syscall"
+        : "+r"(rax)
+        : "r"(rdi), "r"(rsi), "r"(rdx), "r"(r10), "r"(r8)
+        : "rcx", "r11", "memory");
+    return rax;
+}
+#elif defined(__aarch64__)
+static i64 sys_ioctl(i64 fd, i64 req, void* argp) {
+    register i64 x8 __asm__("x8") = SYS_IOCTL;
+    register i64 x0 __asm__("x0") = fd;
+    register i64 x1 __asm__("x1") = req;
+    register i64 x2 __asm__("x2") = (i64)argp;
+    __asm__ volatile("svc #0"
+        : "+r"(x0)
+        : "r"(x8), "r"(x1), "r"(x2)
+        : "memory");
+    return x0;
+}
+static i64 sys_ppoll(void* fds, i64 nfds, void* tmo, void* sig, i64 sigsz) {
+    register i64 x8 __asm__("x8") = SYS_PPOLL;
+    register i64 x0 __asm__("x0") = (i64)fds;
+    register i64 x1 __asm__("x1") = nfds;
+    register i64 x2 __asm__("x2") = (i64)tmo;
+    register i64 x3 __asm__("x3") = (i64)sig;
+    register i64 x4 __asm__("x4") = sigsz;
+    __asm__ volatile("svc #0"
+        : "+r"(x0)
+        : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4)
+        : "memory");
+    return x0;
+}
+#endif
+
+// rt_sigaction(sig, act, oldact, sigsetsize). Used only to install SIG_IGN
+// for SIGPIPE at startup (see volt_ignore_sigpipe).
+#if defined(__x86_64__)
+static i64 sys_rt_sigaction(i64 sig, void* act, void* oldact, i64 sigsz) {
+    register i64 rax __asm__("rax") = SYS_RT_SIGACTION;
+    register i64 rdi __asm__("rdi") = sig;
+    register i64 rsi __asm__("rsi") = (i64)act;
+    register i64 rdx __asm__("rdx") = (i64)oldact;
+    register i64 r10 __asm__("r10") = sigsz;
+    __asm__ volatile("syscall"
+        : "+r"(rax)
+        : "r"(rdi), "r"(rsi), "r"(rdx), "r"(r10)
+        : "rcx", "r11", "memory");
+    return rax;
+}
+#elif defined(__aarch64__)
+static i64 sys_rt_sigaction(i64 sig, void* act, void* oldact, i64 sigsz) {
+    register i64 x8 __asm__("x8") = SYS_RT_SIGACTION;
+    register i64 x0 __asm__("x0") = sig;
+    register i64 x1 __asm__("x1") = (i64)act;
+    register i64 x2 __asm__("x2") = (i64)oldact;
+    register i64 x3 __asm__("x3") = sigsz;
+    __asm__ volatile("svc #0"
+        : "+r"(x0)
+        : "r"(x8), "r"(x1), "r"(x2), "r"(x3)
+        : "memory");
+    return x0;
+}
+#endif
+
+// volt_ignore_sigpipe installs SIG_IGN for SIGPIPE so that writing to a
+// pipe/socket whose read end has closed returns -EPIPE instead of killing
+// the whole process with the default SIGPIPE action. exec's stdin feed
+// (writing Input to a child that may exit early, e.g. `head`) and socket
+// writes both rely on this. Idempotent; called once from volt_tls_init on
+// the main thread (before main, before any worker spawn).
+//
+// kernel struct sigaction { void* handler; u64 flags; void* restorer;
+// u64 mask; }; sigsetsize = 8. SIG_IGN = 1. No restorer is needed because
+// SIG_IGN never enters a handler. SIGPIPE = 13 on both linux/amd64+arm64.
+static void volt_ignore_sigpipe(void) {
+    i64 act[4];
+    act[0] = 1;   // sa_handler = SIG_IGN
+    act[1] = 0;   // sa_flags
+    act[2] = 0;   // sa_restorer (unused for SIG_IGN)
+    act[3] = 0;   // sa_mask
+    sys_rt_sigaction(13, act, 0, 8);
+}
 
 // ---- Socket syscall wrappers ---------------------------------------
 // Same shape per arch: rax/x8 holds the syscall number, args in the
@@ -1894,7 +2088,7 @@ i64 volt_runtime_memprofile_dump(const char* path_ptr, i64 path_len) {
 // per-statement by codegen only under `--memprofile`. Cheap: a single
 // thread-local store.
 void volt_memprofile_note_line(i64 line) {
-    g_mp_line = line;
+    volt_tls_set_slot0(line);
 }
 
 // Memory-profile auto-dump path. Set by `volt build --memprofile <p>`
@@ -1970,6 +2164,147 @@ volt_string_t volt_read_all(i64 fd) {
     return r;
 }
 
+// volt_read_line reads a single line from fd: bytes up to (and
+// consuming, but not including) the next '\n', or up to EOF. Returns a
+// fresh heap %string. On a terminal in canonical mode a read returns
+// once the user presses Enter, so this yields exactly the typed line —
+// the building block for interactive prompts. Reads one byte at a time
+// so it never consumes past the newline (important for a TTY: leaves
+// the rest of stdin for the next prompt). Empty line / immediate EOF
+// returns "" (ptr non-null, len 0). Read error returns ptr=NULL.
+volt_string_t volt_read_line(i64 fd) {
+    volt_string_t r;
+    r.ptr = 0;
+    r.len = 0;
+    i64 cap = 256;
+    char* buf = (char*)volt_alloc(cap);
+    i64 len = 0;
+    while (1) {
+        if (len + 1 > cap) {
+            i64 new_cap = cap * 2;
+            char* new_buf = (char*)volt_alloc(new_cap);
+            for (i64 i = 0; i < len; i++) new_buf[i] = buf[i];
+            buf = new_buf;
+            cap = new_cap;
+        }
+        char c;
+        i64 nread = sys_read(fd, &c, 1);
+        if (nread < 0) { r.ptr = 0; r.len = 0; return r; }
+        if (nread == 0) break;     // EOF
+        if (c == '\n') break;      // end of line (newline consumed, not stored)
+        buf[len] = c;
+        len += 1;
+    }
+    r.ptr = buf;     // non-null even for an empty line
+    r.len = len;
+    return r;
+}
+
+// ---------------------------------------------------------------------
+// Terminal control — backs the `term` stdlib package. All ioctl/poll
+// based, no libc. termios/winsize are accessed by byte offset inside an
+// 8-byte-aligned scratch buffer; the field layout below is the Linux
+// asm-generic ABI, identical on x86_64 and aarch64 (both little-endian).
+//
+//   struct winsize  { u16 ws_row@0; u16 ws_col@2; ... }
+//   struct termios  { u32 c_iflag@0; c_oflag@4; c_cflag@8; c_lflag@12;
+//                     u8 c_line@16; u8 c_cc[NCCS=19]@17 }  (VMIN=6,VTIME=5)
+//   struct pollfd   { int fd@0; short events@4; short revents@6 }
+// ---------------------------------------------------------------------
+
+#define TIOCGWINSZ 0x5413
+#define TCGETS     0x5401
+#define TCSETS     0x5402
+#define T_ICANON   0x0002   // c_lflag: canonical (line) mode
+#define T_ECHO     0x0008   // c_lflag: echo input
+#define T_ISIG     0x0001   // c_lflag: generate signals (INTR/QUIT/SUSP)
+#define T_ICRNL    0x0100   // c_iflag: translate CR -> NL on input
+#define T_IXON     0x0400   // c_iflag: XON/XOFF flow control on output
+#define POLLIN_BIT 0x0001
+
+static i64 saved_termios[8];     // raw bytes of the pre-raw termios
+static i32 saved_termios_ok = 0; // set once volt_term_makeraw succeeds
+
+// volt_term_size: TIOCGWINSZ on fd. Packs the result as (rows<<16)|cols
+// so a single i64 carries both. Returns 0 on failure (e.g. fd is not a
+// terminal) — callers substitute a sensible default (24x80).
+i64 volt_term_size(i64 fd) {
+    i64 raw[8];
+    char* b = (char*)raw;
+    for (int i = 0; i < 8; i++) raw[i] = 0;
+    i64 rc = sys_ioctl(fd, TIOCGWINSZ, b);
+    if (rc < 0) return 0;
+    u64 rows = *(unsigned short*)(b + 0);
+    u64 cols = *(unsigned short*)(b + 2);
+    return (i64)((rows << 16) | cols);
+}
+
+// volt_term_makeraw: switch fd into "cbreak" mode — ICANON/ECHO/ISIG
+// off, CR translation + flow control off, VMIN=1/VTIME=0 (one byte at a
+// time, blocking). Disabling ISIG means Ctrl-C arrives as byte 3 rather
+// than killing the process, so a TUI can always run its restore-on-exit
+// path. The prior settings are saved for volt_term_restore. Returns 0
+// on success or the negative ioctl errno.
+i64 volt_term_makeraw(i64 fd) {
+    i64 raw[8];
+    char* b = (char*)raw;
+    for (int i = 0; i < 8; i++) raw[i] = 0;
+    i64 rc = sys_ioctl(fd, TCGETS, b);
+    if (rc < 0) return rc;
+    for (int i = 0; i < 8; i++) saved_termios[i] = raw[i];
+    saved_termios_ok = 1;
+    unsigned int* iflag = (unsigned int*)(b + 0);
+    unsigned int* lflag = (unsigned int*)(b + 12);
+    *iflag = *iflag & ~(unsigned int)(T_ICRNL | T_IXON);
+    *lflag = *lflag & ~(unsigned int)(T_ICANON | T_ECHO | T_ISIG);
+    b[23] = 1;   // c_cc[VMIN]  = 1
+    b[22] = 0;   // c_cc[VTIME] = 0
+    return sys_ioctl(fd, TCSETS, b);
+}
+
+// volt_term_restore: put fd back to the settings saved by the last
+// volt_term_makeraw. A no-op (returns 0) if raw mode was never entered.
+i64 volt_term_restore(i64 fd) {
+    if (!saved_termios_ok) return 0;
+    i64 raw[8];
+    for (int i = 0; i < 8; i++) raw[i] = saved_termios[i];
+    return sys_ioctl(fd, TCSETS, (char*)raw);
+}
+
+// volt_read_byte: read exactly one byte from fd. Returns 0..255 on
+// success, -1 on EOF (read==0), -2 on error (read<0). The primitive
+// behind term.ReadKey.
+i64 volt_read_byte(i64 fd) {
+    unsigned char c = 0;
+    i64 n = sys_read(fd, &c, 1);
+    if (n < 0) return -2;
+    if (n == 0) return -1;
+    return (i64)c;
+}
+
+// volt_poll_in: wait up to `ms` milliseconds for fd to become readable.
+// Returns 1 if readable, 0 on timeout, -1 on error. ms < 0 blocks
+// indefinitely (NULL timeout). Lets a TUI loop refresh on a tick while
+// still reacting immediately to a keypress.
+i64 volt_poll_in(i64 fd, i64 ms) {
+    i64 pfd_raw = 0;
+    char* pfd = (char*)&pfd_raw;
+    *(int*)(pfd + 0) = (int)fd;
+    *(short*)(pfd + 4) = (short)POLLIN_BIT;
+    *(short*)(pfd + 6) = 0;
+    if (ms < 0) {
+        i64 rc = sys_ppoll(pfd, 1, 0, 0, 8);
+        if (rc < 0) return -1;
+        return rc > 0 ? 1 : 0;
+    }
+    i64 ts[2];                       // struct timespec { sec; nsec; }
+    ts[0] = ms / 1000;
+    ts[1] = (ms % 1000) * 1000000;
+    i64 rc = sys_ppoll(pfd, 1, (char*)ts, 0, 8);
+    if (rc < 0) return -1;
+    return rc > 0 ? 1 : 0;
+}
+
 // ---------------------------------------------------------------------
 // Map (string → i64). Chained hash table, fixed bucket count.
 // Keys are passed as (ptr, len) pairs (the same {ptr, i64} the volt
@@ -1997,8 +2332,44 @@ typedef struct {
     mutex_t       lock;
     i64           count;
     i64           num_buckets;
-    map_entry_t** buckets; // length == num_buckets
+    map_entry_t** buckets;    // length == num_buckets
+    i64           value_kind; // 0 = plain i64 value; 1 = boxed %string value
 } map_t;
+
+// map_free_value reclaims a boxed value when the map owns it. Only
+// value_kind 1 (boxed %string) is owned: the i64 value is a pointer to
+// a 16-byte {char* ptr; i64 len} box whose backing was moved into the
+// map at set-time. volt_str_free is heap-range-safe (no-ops on .rodata
+// literal backings). value_kind 0 (plain i64 / slice box) is left
+// untouched — slice value ownership is a documented follow-up.
+static void map_free_value(i64 value_kind, i64 value) {
+    if (value_kind != 1) return;
+    if (value == 0) return;
+    char** box = (char**)value;   // box[0] = backing ptr
+    volt_str_free(box[0]);
+    volt_free(box);
+}
+
+// map_clone_value returns an independent copy of a boxed value so a
+// cloned map owns its values separately from the source (else freeing
+// the clone would double-free the shared value box/backing). Only
+// value_kind 1 (boxed %string) is deep-copied: a fresh 16-byte box +
+// a fresh backing buffer holding the same bytes. Other kinds are
+// returned as-is (shallow), matching their current ownership.
+static i64 map_clone_value(i64 value_kind, i64 value) {
+    if (value_kind != 1) return value;
+    if (value == 0) return 0;
+    char** src_box = (char**)value;
+    char* src_ptr  = src_box[0];
+    i64   src_len  = ((i64*)value)[1];   // box layout: {char* ptr; i64 len}
+    i64 kalloc = src_len > 0 ? src_len : 1;
+    char* nbacking = (char*)volt_alloc(kalloc);
+    for (i64 i = 0; i < src_len; i++) nbacking[i] = src_ptr[i];
+    char** nbox = (char**)volt_alloc(16);
+    nbox[0] = nbacking;
+    ((i64*)nbox)[1] = src_len;
+    return (i64)nbox;
+}
 
 static u64 hash_bytes(const char* p, i64 n) {
     u64 h = 5381;
@@ -2016,10 +2387,11 @@ static int key_eq(const char* a, i64 alen, const char* b, i64 blen) {
     return 1;
 }
 
-void* volt_map_new(void) {
+void* volt_map_new(i64 value_kind) {
     map_t* m = (map_t*)volt_alloc((i64)sizeof(map_t));
     m->num_buckets = MAP_INIT_BUCKETS;
     m->buckets = (map_entry_t**)volt_alloc((i64)sizeof(map_entry_t*) * MAP_INIT_BUCKETS);
+    m->value_kind = value_kind;
     return m;
 }
 
@@ -2030,6 +2402,7 @@ static void map_maybe_grow(map_t* m) {
     if (m->count * 4 <= m->num_buckets * 3) return;
 
     i64 new_n = m->num_buckets * 2;
+    map_entry_t** old_buckets = m->buckets;
     map_entry_t** new_buckets = (map_entry_t**)volt_alloc((i64)sizeof(map_entry_t*) * new_n);
     for (i64 i = 0; i < m->num_buckets; i++) {
         map_entry_t* e = m->buckets[i];
@@ -2042,6 +2415,9 @@ static void map_maybe_grow(map_t* m) {
             e = next;
         }
     }
+    // Entries were relinked into new_buckets; the old pointer array is
+    // now stale and was previously leaked on every resize. Reclaim it.
+    volt_free(old_buckets);
     m->buckets = new_buckets;
     m->num_buckets = new_n;
 }
@@ -2078,6 +2454,11 @@ void volt_map_delete(void* m_, char* key_ptr, i64 key_len) {
         if (key_eq(e->key_ptr, e->key_len, key_ptr, key_len)) {
             *prev = e->next;
             m->count--;
+            // Free the map-owned key copy, the boxed value (if owned),
+            // and the entry itself.
+            map_free_value(m->value_kind, e->value);
+            volt_free(e->key_ptr);
+            volt_free(e);
             mutex_unlock(&m->lock);
             return;
         }
@@ -2095,6 +2476,10 @@ void volt_map_set(void* m_, char* key_ptr, i64 key_len, i64 value) {
     map_entry_t* e = *bucket;
     while (e) {
         if (key_eq(e->key_ptr, e->key_len, key_ptr, key_len)) {
+            // Overwrite: free the OLD boxed value before replacing it,
+            // else string-valued maps leak the prior value on every
+            // reassignment of the same key.
+            map_free_value(m->value_kind, e->value);
             e->value = value;
             mutex_unlock(&m->lock);
             return;
@@ -2103,7 +2488,16 @@ void volt_map_set(void* m_, char* key_ptr, i64 key_len, i64 value) {
     }
     map_entry_t* ne = (map_entry_t*)volt_alloc((i64)sizeof(map_entry_t));
     ne->next    = *bucket;
-    ne->key_ptr = key_ptr;
+    // The map OWNS its keys: copy the caller's key bytes into a fresh
+    // map-owned buffer. The caller's key (often a loop-local heap string
+    // freed by A3 at scope end, or a .rodata literal) must NOT be aliased
+    // — aliasing let freelist reuse corrupt the stored key. Freed in
+    // volt_map_delete / volt_map_free. Empty-key (len 0) still gets a
+    // 1-byte owned buffer so key_ptr is never a shared/NULL alias.
+    i64 kalloc = key_len > 0 ? key_len : 1;
+    char* kcopy = (char*)volt_alloc(kalloc);
+    for (i64 i = 0; i < key_len; i++) kcopy[i] = key_ptr[i];
+    ne->key_ptr = kcopy;
     ne->key_len = key_len;
     ne->value   = value;
     *bucket = ne;
@@ -2233,6 +2627,347 @@ volt_string_t volt_env_get(const char* name_ptr, i64 name_len) {
     return r;
 }
 
+// ---------------------------------------------------------------------
+// Process execution — raw fork/exec/wait/pipe syscall helpers (no libc),
+// used by volt_exec (the `exec` package engine). The child is created
+// with clone(SIGCHLD) (== fork; aarch64 has no raw fork). Between clone
+// and execve the child touches NOTHING that could take a lock (no
+// volt_alloc): argv/env/path buffers are built on the parent stack and
+// COW-inherited.
+// ---------------------------------------------------------------------
+
+// sys_clone_fork: clone(SIGCHLD, stack=0, ...) — fork semantics on both
+// arches. Returns the child pid in the parent, 0 in the child, -errno
+// on failure. With all pointer args 0 the per-arch clone arg-order
+// difference (CLONE_BACKWARDS on aarch64) is irrelevant.
+#if defined(__x86_64__)
+static i64 sys_clone_fork(void) {
+    register i64 rax __asm__("rax") = SYS_CLONE;
+    register i64 rdi __asm__("rdi") = 17;   // SIGCHLD
+    register i64 rsi __asm__("rsi") = 0;    // child stack (0 = share via COW)
+    register i64 rdx __asm__("rdx") = 0;    // parent_tid
+    register i64 r10 __asm__("r10") = 0;    // child_tid
+    register i64 r8  __asm__("r8")  = 0;    // tls
+    __asm__ volatile("syscall"
+        : "+r"(rax)
+        : "r"(rdi), "r"(rsi), "r"(rdx), "r"(r10), "r"(r8)
+        : "rcx", "r11", "memory");
+    return rax;
+}
+static i64 sys_execve(const char* path, char* const argv[], char* const envp[]) {
+    register i64 rax __asm__("rax") = SYS_EXECVE;
+    register i64 rdi __asm__("rdi") = (i64)path;
+    register i64 rsi __asm__("rsi") = (i64)argv;
+    register i64 rdx __asm__("rdx") = (i64)envp;
+    __asm__ volatile("syscall"
+        : "+r"(rax)
+        : "r"(rdi), "r"(rsi), "r"(rdx)
+        : "rcx", "r11", "memory");
+    return rax;
+}
+static i64 sys_wait4(i64 pid, i32* status, i64 options, void* ru) {
+    register i64 rax __asm__("rax") = SYS_WAIT4;
+    register i64 rdi __asm__("rdi") = pid;
+    register i64 rsi __asm__("rsi") = (i64)status;
+    register i64 rdx __asm__("rdx") = options;
+    register i64 r10 __asm__("r10") = (i64)ru;
+    __asm__ volatile("syscall"
+        : "+r"(rax)
+        : "r"(rdi), "r"(rsi), "r"(rdx), "r"(r10)
+        : "rcx", "r11", "memory");
+    return rax;
+}
+static i64 sys_pipe2(i32* fds, i64 flags) {
+    register i64 rax __asm__("rax") = SYS_PIPE2;
+    register i64 rdi __asm__("rdi") = (i64)fds;
+    register i64 rsi __asm__("rsi") = flags;
+    __asm__ volatile("syscall"
+        : "+r"(rax)
+        : "r"(rdi), "r"(rsi)
+        : "rcx", "r11", "memory");
+    return rax;
+}
+static i64 sys_dup3(i64 oldfd, i64 newfd, i64 flags) {
+    register i64 rax __asm__("rax") = SYS_DUP3;
+    register i64 rdi __asm__("rdi") = oldfd;
+    register i64 rsi __asm__("rsi") = newfd;
+    register i64 rdx __asm__("rdx") = flags;
+    __asm__ volatile("syscall"
+        : "+r"(rax)
+        : "r"(rdi), "r"(rsi), "r"(rdx)
+        : "rcx", "r11", "memory");
+    return rax;
+}
+static i64 sys_chdir(const char* path) {
+    register i64 rax __asm__("rax") = SYS_CHDIR;
+    register i64 rdi __asm__("rdi") = (i64)path;
+    __asm__ volatile("syscall"
+        : "+r"(rax)
+        : "r"(rdi)
+        : "rcx", "r11", "memory");
+    return rax;
+}
+static void sys_exit_raw(i64 code) {
+    register i64 rax __asm__("rax") = SYS_EXIT;
+    register i64 rdi __asm__("rdi") = code;
+    __asm__ volatile("syscall" : : "r"(rax), "r"(rdi) : "memory");
+    __builtin_unreachable();
+}
+#elif defined(__aarch64__)
+static i64 sys_clone_fork(void) {
+    register i64 x8 __asm__("x8") = SYS_CLONE;
+    register i64 x0 __asm__("x0") = 17;   // SIGCHLD
+    register i64 x1 __asm__("x1") = 0;
+    register i64 x2 __asm__("x2") = 0;
+    register i64 x3 __asm__("x3") = 0;
+    register i64 x4 __asm__("x4") = 0;
+    __asm__ volatile("svc #0"
+        : "+r"(x0)
+        : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4)
+        : "memory");
+    return x0;
+}
+static i64 sys_execve(const char* path, char* const argv[], char* const envp[]) {
+    register i64 x8 __asm__("x8") = SYS_EXECVE;
+    register i64 x0 __asm__("x0") = (i64)path;
+    register i64 x1 __asm__("x1") = (i64)argv;
+    register i64 x2 __asm__("x2") = (i64)envp;
+    __asm__ volatile("svc #0"
+        : "+r"(x0)
+        : "r"(x8), "r"(x1), "r"(x2)
+        : "memory");
+    return x0;
+}
+static i64 sys_wait4(i64 pid, i32* status, i64 options, void* ru) {
+    register i64 x8 __asm__("x8") = SYS_WAIT4;
+    register i64 x0 __asm__("x0") = pid;
+    register i64 x1 __asm__("x1") = (i64)status;
+    register i64 x2 __asm__("x2") = options;
+    register i64 x3 __asm__("x3") = (i64)ru;
+    __asm__ volatile("svc #0"
+        : "+r"(x0)
+        : "r"(x8), "r"(x1), "r"(x2), "r"(x3)
+        : "memory");
+    return x0;
+}
+static i64 sys_pipe2(i32* fds, i64 flags) {
+    register i64 x8 __asm__("x8") = SYS_PIPE2;
+    register i64 x0 __asm__("x0") = (i64)fds;
+    register i64 x1 __asm__("x1") = flags;
+    __asm__ volatile("svc #0"
+        : "+r"(x0)
+        : "r"(x8), "r"(x1)
+        : "memory");
+    return x0;
+}
+static i64 sys_dup3(i64 oldfd, i64 newfd, i64 flags) {
+    register i64 x8 __asm__("x8") = SYS_DUP3;
+    register i64 x0 __asm__("x0") = oldfd;
+    register i64 x1 __asm__("x1") = newfd;
+    register i64 x2 __asm__("x2") = flags;
+    __asm__ volatile("svc #0"
+        : "+r"(x0)
+        : "r"(x8), "r"(x1), "r"(x2)
+        : "memory");
+    return x0;
+}
+static i64 sys_chdir(const char* path) {
+    register i64 x8 __asm__("x8") = SYS_CHDIR;
+    register i64 x0 __asm__("x0") = (i64)path;
+    __asm__ volatile("svc #0"
+        : "+r"(x0)
+        : "r"(x8)
+        : "memory");
+    return x0;
+}
+static void sys_exit_raw(i64 code) {
+    register i64 x8 __asm__("x8") = SYS_EXIT;
+    register i64 x0 __asm__("x0") = code;
+    __asm__ volatile("svc #0" : : "r"(x8), "r"(x0) : "memory");
+    __builtin_unreachable();
+}
+#endif
+
+// wait_exit_code maps a wait4 status word to a conventional exit code:
+// normal exit → the child's code (0-255); killed by signal → 128 + sig.
+static i64 wait_exit_code(i32 status) {
+    if ((status & 0x7f) == 0) return (status >> 8) & 0xff;  // WIFEXITED
+    return 128 + (status & 0x7f);                            // WTERMSIG
+}
+
+// ---------------------------------------------------------------------
+// exec spawn support: no-shell, argv-based process launch backing the
+// `exec` stdlib package (a port of Go's os/exec). The single core is
+// volt_proc_spawn_fds (below): it execve's `path` directly with a literal
+// argv — no /bin/sh, no quoting/injection — optionally chdir's, replaces
+// the environment, dup3's the child's 0/1/2 to caller-supplied fds (-1 =
+// inherit), and returns the child pid; the volt-level helpers reap with
+// volt_exec_wait. Like volt_proc_*, the child touches nothing that could
+// take a lock between clone and execve — every C string is built on the
+// parent stack and COW-inherited. The shared argv/env packer
+// (volt_exec_pack) and size limits live here.
+// ---------------------------------------------------------------------
+
+#define VOLT_EXEC_NMAX     1024     // max argv / env entries
+#define VOLT_EXEC_ARGBYTES 65536    // scratch bytes for argv (and, separately, env)
+
+// volt_exec_pack copies `n` volt strings into `bytes` as NUL-terminated
+// C strings and fills `cv` (a NULL-terminated char* array). Returns 1 on
+// success, 0 on overflow (too many entries / not enough scratch).
+static int volt_exec_pack(volt_string_t* v, i64 n, char* bytes, i64 bytescap, char** cv, i64 cvmax) {
+    if (n < 0 || n > cvmax) return 0;
+    i64 off = 0;
+    for (i64 i = 0; i < n; i++) {
+        i64 m = v[i].len;
+        if (m < 0 || off + m + 1 > bytescap) return 0;
+        const char* s = (const char*)v[i].ptr;
+        for (i64 j = 0; j < m; j++) bytes[off + j] = s[j];
+        bytes[off + m] = 0;
+        cv[i] = &bytes[off];
+        off += m + 1;
+    }
+    cv[n] = 0;
+    return 1;
+}
+
+// volt_exec_wait reaps `pid` and returns its exit code (128+sig if killed,
+// -1 if wait4 failed). Blocking.
+i64 volt_exec_wait(i64 pid) {
+    i32 status = 0;
+    if (sys_wait4(pid, &status, 0, 0) < 0) return -1;
+    return wait_exit_code(status);
+}
+
+// sys_kill / sys_getpid: signal delivery + the caller's own pid, backing
+// Process.Stop / Process.Kill / Process.PPID.
+#if defined(__x86_64__)
+static i64 sys_kill(i64 pid, i64 sig) {
+    register i64 rax __asm__("rax") = SYS_KILL;
+    register i64 rdi __asm__("rdi") = pid;
+    register i64 rsi __asm__("rsi") = sig;
+    __asm__ volatile("syscall" : "+r"(rax) : "r"(rdi), "r"(rsi) : "rcx", "r11", "memory");
+    return rax;
+}
+static i64 sys_getpid(void) {
+    register i64 rax __asm__("rax") = SYS_GETPID;
+    __asm__ volatile("syscall" : "+r"(rax) : : "rcx", "r11", "memory");
+    return rax;
+}
+#elif defined(__aarch64__)
+static i64 sys_kill(i64 pid, i64 sig) {
+    register i64 x8 __asm__("x8") = SYS_KILL;
+    register i64 x0 __asm__("x0") = pid;
+    register i64 x1 __asm__("x1") = sig;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1) : "memory");
+    return x0;
+}
+static i64 sys_getpid(void) {
+    register i64 x8 __asm__("x8") = SYS_GETPID;
+    register i64 x0 __asm__("x0");
+    __asm__ volatile("svc #0" : "=r"(x0) : "r"(x8) : "memory");
+    return x0;
+}
+#endif
+
+// volt_kill sends signal `sig` to `pid` (SIGTERM=15 / SIGKILL=9); returns 0
+// or a negative errno. volt_getpid returns the caller's pid (a child's
+// parent is us → Process.PPID). volt_gettid returns the caller's kernel
+// thread id — unique per OS thread, used for collision-free temp names.
+i64 volt_kill(i64 pid, i64 sig) { return sys_kill(pid, sig); }
+i64 volt_getpid(void) { return sys_getpid(); }
+i64 volt_gettid(void) {
+#if defined(__x86_64__)
+    register i64 rax __asm__("rax") = SYS_GETTID;
+    __asm__ volatile("syscall" : "+r"(rax) : : "rcx", "r11", "memory");
+    return rax;
+#elif defined(__aarch64__)
+    register i64 x8 __asm__("x8") = SYS_GETTID;
+    register i64 x0 __asm__("x0") = 0;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8) : "memory");
+    return x0;
+#endif
+}
+
+// volt_proc_spawn_fds forks+execs `path` (no shell), wiring the child's
+// stdin/stdout/stderr to the given fds via dup3 — pass -1 for a stream to
+// leave it inherited (the parent's). No pipes, no pumping: the child does
+// I/O directly on the fds. Returns the child pid, or -1 on failure. Backs
+// exec.Cmd.Spawn (all -1) and SpawnWithStreams (real fds, e.g. files).
+i64 volt_proc_spawn_fds(char* path_ptr, i64 path_len,
+                        volt_string_t* argv, i64 argc,
+                        volt_string_t* env,  i64 envc,
+                        char* dir_ptr, i64 dir_len,
+                        i64 in_fd, i64 out_fd, i64 err_fd) {
+    if (path_len < 0 || path_len >= 4096) return -1;
+    char pathbuf[4096];
+    for (i64 i = 0; i < path_len; i++) pathbuf[i] = path_ptr[i];
+    pathbuf[path_len] = 0;
+
+    char dirbuf[4096];
+    int have_dir = (dir_len > 0);
+    if (have_dir) {
+        if (dir_len >= 4096) return -1;
+        for (i64 i = 0; i < dir_len; i++) dirbuf[i] = dir_ptr[i];
+        dirbuf[dir_len] = 0;
+    }
+
+    char  argbytes[VOLT_EXEC_ARGBYTES];
+    char* cargv[VOLT_EXEC_NMAX + 1];
+    char* fallback_argv[2];
+    char** cargv_final;
+    if (argc <= 0) {
+        fallback_argv[0] = pathbuf; fallback_argv[1] = 0;
+        cargv_final = fallback_argv;
+    } else {
+        if (!volt_exec_pack(argv, argc, argbytes, sizeof argbytes, cargv, VOLT_EXEC_NMAX)) return -1;
+        cargv_final = cargv;
+    }
+
+    char  envbytes[VOLT_EXEC_ARGBYTES];
+    char* cenvarr[VOLT_EXEC_NMAX + 1];
+    char** cenv;
+    if (envc > 0) {
+        if (!volt_exec_pack(env, envc, envbytes, sizeof envbytes, cenvarr, VOLT_EXEC_NMAX)) return -1;
+        cenv = cenvarr;
+    } else {
+        cenv = volt_envp;
+    }
+
+    i64 pid = sys_clone_fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        if (have_dir) { if (sys_chdir(dirbuf) < 0) sys_exit_raw(127); }
+        i64 dfl[4]; dfl[0] = 0; dfl[1] = 0; dfl[2] = 0; dfl[3] = 0;
+        sys_rt_sigaction(13, dfl, 0, 8);   // restore child's default SIGPIPE
+        // Redirect each stream whose fd was supplied (skip when it already
+        // sits at the target — dup3 of equal fds is EINVAL).
+        if (in_fd  >= 0 && in_fd  != 0) sys_dup3(in_fd,  0, 0);
+        if (out_fd >= 0 && out_fd != 1) sys_dup3(out_fd, 1, 0);
+        if (err_fd >= 0 && err_fd != 2) sys_dup3(err_fd, 2, 0);
+        sys_execve(pathbuf, cargv_final, cenv);
+        sys_exit_raw(127);
+    }
+    return pid;
+}
+
+// volt_read_some does a SINGLE read of up to `max` bytes from `fd` into a
+// fresh heap buffer, returning whatever that one read yielded. len 0 ⇒
+// EOF (or error). Unlike volt_read_all (which loops to EOF), this is the
+// primitive for streaming a pipe incrementally.
+volt_string_t volt_read_some(i64 fd, i64 max) {
+    volt_string_t r; r.ptr = 0; r.len = 0;
+    if (max <= 0) return r;
+    char* buf = (char*)volt_alloc(max);
+    i64 n = sys_read(fd, buf, max);
+    if (n <= 0) {           // EOF or error → empty string; return the
+        volt_free(buf);     // freshly-allocated buffer to the pool rather
+        return r;           // than orphaning it (every read ends in one
+    }                       // such EOF call, so this dominated exec leaks).
+    r.ptr = buf;
+    r.len = n;
+    return r;
+}
+
 // ---- Clock / time ---------------------------------------------------
 // volt_now_ns(): nanoseconds since the Unix epoch (CLOCK_REALTIME via
 // sys_clock_gettime). Used by `time.Now()` in the stdlib.
@@ -2349,9 +3084,14 @@ void volt_slice_grow(void* s_io, i64 elem_size, void* new_elem) {
 }
 
 // volt_map_clone allocates a fresh map and copies every entry from
-// `src`. Shallow: key bytes are reused (interned by the runtime
-// already) and values are copied as opaque i64s. Pointer-valued maps
-// will share whatever the values point at.
+// `src`. Keys are DEEP-COPIED so the clone owns its own key buffers —
+// required since the map now owns + frees its keys (volt_map_set /
+// _delete / _free); aliasing the source's keys here would double-free
+// each key when both maps are dropped. Kind-1 (boxed %string) VALUES are
+// likewise DEEP-COPIED via map_clone_value so the clone owns independent
+// value backings (else freeing both maps would double-free the shared
+// backing). Other value kinds (slice boxes) stay shallow — slice value
+// ownership is a documented follow-up.
 void* volt_map_clone(void* src_) {
     if (src_ == 0) return (void*)0;
     map_t* src = (map_t*)src_;
@@ -2359,13 +3099,20 @@ void* volt_map_clone(void* src_) {
     mutex_lock(&src->lock);
     dst->num_buckets = src->num_buckets;
     dst->buckets = (map_entry_t**)volt_alloc((i64)sizeof(map_entry_t*) * dst->num_buckets);
+    dst->value_kind = src->value_kind;
     for (i64 i = 0; i < src->num_buckets; i++) {
         for (map_entry_t* e = src->buckets[i]; e != 0; e = e->next) {
             map_entry_t* ne = (map_entry_t*)volt_alloc((i64)sizeof(map_entry_t));
             ne->next    = dst->buckets[i];
-            ne->key_ptr = e->key_ptr;
+            // Deep-copy the key: the clone owns an independent buffer.
+            i64 kalloc = e->key_len > 0 ? e->key_len : 1;
+            char* kc = (char*)volt_alloc(kalloc);
+            for (i64 j = 0; j < e->key_len; j++) kc[j] = e->key_ptr[j];
+            ne->key_ptr = kc;
             ne->key_len = e->key_len;
-            ne->value   = e->value;
+            // Deep-copy boxed values too (kind 1) so the clone owns them
+            // independently — otherwise freeing both maps double-frees.
+            ne->value   = map_clone_value(src->value_kind, e->value);
             dst->buckets[i] = ne;
             dst->count++;
         }
@@ -2920,11 +3667,8 @@ void volt_cond_broadcast(void* c_) {
 //
 // Public API (codegen emits these when `-race` is on):
 //   volt_race_enable()           — turn on globally (called from main).
-//   volt_race_thread_start()     — register the current OS thread (called
-//                                  from main + from the spawn trampoline
-//                                  before the user fn).
-//   volt_race_thread_end()       — deregister (currently a no-op; thread
-//                                  slots aren't reclaimed in a v1 detector).
+//                                  Per-thread slots are created on demand
+//                                  at the first instrumented access.
 //   volt_race_read (ptr, size)   — instrumented load barrier.
 //   volt_race_write(ptr, size)   — instrumented store barrier.
 //   volt_race_acquire(ptr)       — sync-acquire (chan recv / mutex Lock /
@@ -2946,8 +3690,7 @@ void volt_cond_broadcast(void* c_) {
 //
 // All data structures are striped-mutex hash tables — slow but correct.
 // The detector is OFF by default; the `-race` flag turns it on by
-// emitting a volt_race_enable() at the head of main + per-thread
-// volt_race_thread_start() in the spawn trampoline path.
+// emitting a volt_race_enable() at the head of main.
 
 #define VOLT_RACE_MAX_THREADS  64
 #define VOLT_RACE_SYNC_BUCKETS 1024
@@ -3129,15 +3872,6 @@ void volt_race_reset_violations(void) {
 void volt_race_enable(void) {
     __atomic_store_n(&g_race_enabled, 1, __ATOMIC_RELEASE);
     (void)race_current_slot();  // register main thread
-}
-
-void volt_race_thread_start(void) {
-    if (!__atomic_load_n(&g_race_enabled, __ATOMIC_RELAXED)) return;
-    (void)race_current_slot();
-}
-
-void volt_race_thread_end(void) {
-    // v1: no reclaim. Slots are stable for the life of the process.
 }
 
 // volt_runtime_thread_count surfaces the race-detector's registered

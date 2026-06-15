@@ -16,10 +16,12 @@ package main
 
 import "log"
 
-// Method-receiver forms mirror the three forms of a value:
-//   fun (c Cat)  m()   — method MOVES c (consumes; rare; for terminal ops)
-//   fun (c &Cat) m()   — method takes READ ACCESS (many readers OK)
-//   fun (c *Cat) m()   — method takes WRITE ACCESS (exclusive)
+// Method-receiver forms mirror the forms of a value:
+//   fun (c Cat)  m()   — method gets its own COPY of c; the caller keeps theirs
+//                        (writes inside touch only the copy)
+//   fun (c &Cat) m()   — a peek: read-only access to the caller's value
+//   fun (c *Cat) m()   — a pointer: changes fields in place (writes persist);
+//                        the form to use for owned objects
 
 type Greeter interface {
     Greet()

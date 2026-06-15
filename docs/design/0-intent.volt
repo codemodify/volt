@@ -1,6 +1,16 @@
-// volt:noformat — this file is the canonical spec; alignment is hand-tuned.
-//                  `volt fmt -w` will refuse to overwrite; use --force only
-//                  when you intentionally want to reformat (you almost never do).
+// volt:noformat
+//    — alignment is hand-tuned
+//    - `volt fmt -w` will refuse to overwrite (unless --force)
+
+// comments
+//    - // line comment to end of line
+//    - /* block comment, may span lines */
+//    - # line comment to end of line (shell-style)
+//    — # also enables a the shebang: `#!/usr/bin/env volt` at the top of the file
+//    - # a volt file starting with shebang can be `chmod +x` and run as a script directly
+
+// import
+//    - like in Go, one folder is one package
 
 // primitives - CAN fit in CPU register
 var v int8  = 127
@@ -39,22 +49,46 @@ var v waitgroup = new()                 // counter starts at 0; new(N) pre-loads
 var v once = new()                      // can't have a size, runs exactly once across threads
 var v condvar = new()                   // wait/signal/broadcast pair: c.Wait(m), c.Signal(), c.Broadcast()
 
-// borrows - shared (read) vs exclusive (read+write)
-// `&T` is a shared borrow. Multiple `&T` of the same source coexist (parallel readers).
-//   Mutating the source while a `&T` is held is REJECTED — the source is frozen.
-// `&mut T` is an exclusive borrow. Single `&mut T` blocks all other borrows.
-//   `*b = v` requires `&mut T`; `*b` reads through either form.
-//   Closures may capture borrows; they cannot escape the borrowed scope.
-fun read(p &int) int { ret p }          // sees source value (read-only access)
-fun bump(p &mut int) { *p = *p + 1 }   // exclusive write through the borrow
+// grouped declarations - Go-style parenthesized blocks for import / const / var.
+// `volt fmt` AUTO-GROUPS runs of adjacent single decls into these blocks and
+// aligns the columns; one decl stays single. Both forms parse identically.
+import (
+    "fmt"
+    "os"
+)
+const (                             // names + optional types align like gofmt
+    Red   int = 0
+    Green     = 1                   // type optional per-member
+    Blue  int = 2
+)
+var (
+    width  int    = 80
+    title  string = "volt"
+    ready  bool
+)
 
-// borrows - lifecycle is block-scoped; multiple shared OK in same block
+// Ownership model: "values own, borrows visit". `new T{}` hands you an
+// owned VALUE (never a pointer to keep); you free nothing — it's tidied
+// up at scope end. A function may BORROW it for the duration of the call:
+// `&T` - a peek: read-only; many peeks at once are fine; the value can't be
+//        CHANGED while a peek is held (you can still read it)
+// `*T` - a loan: change the value in place. While one `*T` is out,
+//        nothing else may touch the value — no other `*T` and no peeks.
+// Both are VISITS: a borrow lives only for the call/block that takes it —
+// it can't be returned, stored in a field/slice/map, or captured by an
+// escaping closure, so it can never dangle. Write `*b = v` needs a `*T`;
+// read `*b` works through either. To KEEP one: take it by value (move) or
+// clone it.
+fun read(p &int) int { ret p }         // reads the value (read-only access)
+fun bump(p *int) { *p = *p + 1 }       // writes in place through the loan
+
+// peeks & loans - they live to the end of their block; many peeks OK at once
 var x int = 5
 {
-    var b1 &int = &x                     // shared borrow
-    var b2 &int = &x                     // ALSO shared OK
+    var b1 &int = &x                     // a peek (read-only)
+    var b2 &int = &x                     // a second peek — many at once are fine
     var sum int = *b1 + *b2              // 10
-}                                         // both released at `}`; x is now writable again
+}                                         // both end at `}`; x is changeable again
 
 // runtime stdlib — observability + allocator control
 //   runtime.Compact()              — walk + merge adjacent free blocks

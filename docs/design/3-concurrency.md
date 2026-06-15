@@ -12,6 +12,10 @@
 	- writing on a closed channel is a runtime panic.
 	- writing on a buffered channel blocks once the buffer is full and the receiver is behind.
 	- reading from a closed-and-drained channel returns the zero value and `ok == false`.
+	- **lifetime is automatic — you never free a channel.** A channel is a shared reference handle, so it is reference-counted rather than single-owned: the creator holds one reference, each `run f(ch)` that captures it holds another for the goroutine, and the channel's buffer + handle are freed exactly once when the last reference is dropped (the creator's scope exits and every goroutine that captured it has finished). Plain `read`/`write`/`close` borrow the channel; they never transfer or consume it. A channel that escapes (returned, stored in a struct/slice/map, or sent over another channel) is conservatively kept alive.
+	- **deadlocks never hang silently — the no-deadlock guarantee is enforced in two layers.**
+		- *Compile time (sound static check):* an unbuffered channel is a rendezvous — a `read`/`write` blocks until a *different* thread performs the paired op. So a cap-0 channel the compiler can prove never leaves its creating thread (it's local, only ever appears as `read`/`write`/`close`, and is never spawned via `run` or passed/returned/stored anywhere) can never be serviced; using it is rejected at build time (`deadlock — unbuffered channel … never reaches another thread`). This only fires on programs guaranteed to hang, so it never rejects a valid one.
+		- *Runtime (all-blocked backstop):* cross-thread cycles the static check can't prove — two goroutines each waiting on the other, a never-signalled waitgroup, a self-deadlocked mutex — are caught while running. The runtime tracks how many threads are live versus parked in a blocking wait; when *every* live thread is blocked, no thread can ever wake another, so the program is deadlocked. Rather than hang forever it prints `volt: fatal: deadlock detected …` and exits non-zero (the same clean abort used for other unrecoverable runtime errors). Detection is deliberately confirmed across a short window (~1.25 s) so it can never fire on a program that is merely slow — a thread doing real work counts as live, not parked. Limitation: a thread blocked in a non-channel syscall (I/O) is not counted as parked.
 
 	**Multiplicity contracts (`chan11 T`, `chan1N T`, `chanN1 T`, `chanNN T`)** — declare the channel's intended reader/writer cardinality at the type level and let the compiler verify it. Notation: `chan<readers><writers>`, `1` = exactly one endpoint, `N` = one or more.
 
@@ -175,7 +179,7 @@ fun client(reqs chan Req, id int) int {
 ```
 
 #### concurrency patterns - mutating shared data
-The ownership model says that at any *instant* you can have either many readers `&T` **or** one writer `*T` — **never both at the same time**. This is the "many readers, one writer" rule (sometimes called *aliasing-XOR-mutation* in PL theory).
+The ownership model says that at any *instant* you can have either many peeks `&T` **or** one write-loan `*T` — **never both at the same time**. This is the "many readers, one writer" rule: while anyone is peeking, nothing can change it; while one loan can change it, nothing else may touch it.
 ***If reads and writes are mutually exclusive, how do you mutate something that other code is using?***
 
 - answer 1: cross-thread coordination using channels
@@ -186,11 +190,11 @@ The ownership model says that at any *instant* you can have either many readers 
 
 - answer 2: cross-thread shared state — `mutex`, `rwmutex`, `atomic`
 	- when message-passing is the wrong shape — multiple threads genuinely need to read and write
-	the same memory — the language adds keyword-shape wrapper types whose internals serialize access. All three are **reference-typed** like `chan T` — copying the handle gives another reference to the **same** primitive (otherwise threads would lock different copies and the serialization would be meaningless). Declared with the same `var <name> <kw> <T>` shape as channels:
+	the same memory — the language adds keyword-shape wrapper types whose internals serialize access. All three are **shared handles** like `chan T` — passing or copying the handle gives another handle to the **same** underlying object (otherwise threads would lock different copies and the serialization would be meaningless). Declared with the same `var <name> <kw> <T>` shape as channels:
 	- **`mutex T`** — wrapper around an owned `T` accessed through a guard
 		- `Lock()` blocks until the lock is acquired, then binds a guard to a local variable
 		- The guard reads/writes the protected `T` directly (no copy); field writes go straight into the mutex's storage
-		- The lock releases **automatically** when the guard variable goes out of scope (RAII — same machinery as struct `Drop`). There is no `Unlock` method.
+		- The lock releases **automatically** when the guard variable goes out of scope (the same automatic-cleanup-at-scope-end machinery as struct `Drop`). There is no `Unlock` method.
 		- The guard cannot escape its scope: it can't be passed to a function, returned, or aliased — the lock has to release where it was acquired.
 		- cost: ~10ns uncontested; ~1µs under contention
 		```go
@@ -358,7 +362,7 @@ fun ensure_loaded(o once, cfg atomic *Config) {
 
 What to notice:
 - `Do` is the only method on `once`. No `Begin`, no `Done`, no manual release. Anything that needs to happen "if I'm the first arriver" goes inside the closure — the closure runs only on the first arriver.
-- The closure must be a `fun()` value (named function or anonymous literal). Captures are by-move / by-copy (see [the function-value rules](#)). Borrow captures (`&T` / `*T`) are rejected — the closure could outlive the borrowed storage.
+- The closure must be a `fun()` value (named function or anonymous literal). Captures hand over or copy the value (see [the function-value rules](#)). Capturing a peek or loan (`&T` / `*T`) is rejected — the closure could outlive the value it points at.
 
 #### concurrency patterns - use the right tool
 when												| what

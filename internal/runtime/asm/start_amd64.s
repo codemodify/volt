@@ -44,6 +44,8 @@ _start:
     movq    %rdx,         volt_envp(%rip)
 
     andq    $-16, %rsp
+    // Set up this (main) thread's TLS block before entering user code.
+    call    volt_tls_init
     call    main
     // Preserve main's return value across the at-exit hook (which may
     // flush the memory profile). %rbx is callee-saved by the hook.
@@ -155,6 +157,13 @@ volt_spawn:
     ret
 
 .Lvolt_spawn_child:
+    // Set up this worker thread's TLS block before running fn. The
+    // fn + 6 args are still on the stack (untouched by the call); align
+    // rsp to 16 for the call, then restore. volt_tls_init clobbers only
+    // caller-saved regs, which we haven't loaded with args yet.
+    subq    $8, %rsp            // rsp%16: 8 -> 0 (aligned for the call)
+    call    volt_tls_init
+    addq    $8, %rsp            // restore: fn+args back at the top
     popq    %rax                // fn
     popq    %rdi                // arg1
     popq    %rsi                // arg2
@@ -163,6 +172,11 @@ volt_spawn:
     popq    %r8                 // arg5
     popq    %r9                 // arg6
     callq   *%rax
+    // Deadlock backstop (#7): drop the live-thread count now that this
+    // worker's function has returned. rsp is 16-aligned here (same as at
+    // the call above), so no extra alignment is needed. volt_thread_exit
+    // clobbers only caller-saved regs, which we no longer need.
+    call    volt_thread_exit
     xorq    %rdi, %rdi
     movq    $60, %rax           // sys_exit (this thread only)
     syscall

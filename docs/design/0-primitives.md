@@ -226,8 +226,8 @@ Perf: futex-based blocking. Uncontested send/recv is a CAS dance
 Storage: `ptr` (8 bytes). Opaque interface-shaped value.
 
 When interface dispatch lands, the layout will likely become
-`{ ptr_to_value, ptr_to_vtable }` — a fat pointer for trait objects
-(Rust's `dyn Trait` shape, or Go's `iface`).
+`{ ptr_to_value, ptr_to_vtable }` — a fat pointer carrying the value
+plus its method table (the same shape as Go's `iface`).
 
 ### User structs — LLVM struct, source-order fields
 
@@ -237,7 +237,7 @@ to satisfy the largest field's alignment.
 The optimizer:
 - Promotes small structs into registers when it can.
 - Lays out fields in source order — **does not** reorder for minimal
-  padding (Rust does; Go and C don't).
+  padding (same as Go and C; some languages do reorder).
 
 Example of how field order affects size:
 
@@ -247,18 +247,21 @@ struct { b int64; a int8; c int8 }   // 16 bytes: 8 + 1 + 1 + 6 pad
 ```
 
 Source-order layout matches user mental model. Reordering would
-require a `repr(volt)` vs `repr(c)` distinction.
+require a way to opt into a packed-vs-C layout per type, which volt
+does not have.
 
 ### `struct{}` — zero size
 
 LLVM treats anonymous-empty struct as zero-size. Useful for set
 semantics (`map[string]struct{}`) — no bytes consumed per element.
 
-### Borrows: `&T`, `*T`
+### Peeks & loans: `&T` (peek), `*T` (loan & owned pointer)
 
-Storage: `ptr` (8 bytes), regardless of `T`'s size. Same for both
-read access (`&T`) and write access (`*T`) — the distinction is purely
-compile-time. See [2-ownership.volt](2-ownership.volt) for the rules.
+Storage: `ptr` (8 bytes), regardless of `T`'s size. A peek (`&T`,
+read-only) and a loan (`*T`, write-in-place) are purely compile-time
+access markers over someone else's value. An owned pointer (`*T`) is a
+real handle to a heap object you made with `new` — read with `*p`, write
+through it directly. See [2-ownership.volt](2-ownership.volt) for the rules.
 
 ---
 

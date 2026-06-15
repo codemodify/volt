@@ -59,6 +59,14 @@ func (p *Parser) ParseFile() (*ast.File, error) {
 
 	// TopLevelDecls
 	for p.tok.Kind != lex.EOF {
+		// `const` may be a single decl or a `const ( ... )` group; the
+		// latter flattens to several decls, so handle it here rather than
+		// through parseTopLevelDecl (which returns a single Decl).
+		if p.tok.Kind == lex.KwConst {
+			f.Decls = append(f.Decls, p.parseConstDecls()...)
+			p.skipSemis()
+			continue
+		}
 		d := p.parseTopLevelDecl()
 		if d != nil {
 			f.Decls = append(f.Decls, d)
@@ -119,23 +127,66 @@ func (p *Parser) parseTopLevelDecl() ast.Decl {
 }
 
 func (p *Parser) parseConstDecl() *ast.ConstDecl {
-	start := p.tok.Pos
 	p.advance() // consume `const`
+	return p.parseConstSpec()
+}
+
+// parseConstSpec parses a single `Name [Type] = Value` const specification
+// (the body of a const decl, with the `const` keyword already consumed).
+// Used for both the single form and each line of a `const ( ... )` group.
+func (p *Parser) parseConstSpec() *ast.ConstDecl {
+	start := p.tok.Pos
 	if p.tok.Kind != lex.Ident {
 		p.errorf("expected const name, got %s", p.tok.Kind)
 		return nil
 	}
 	name := p.tok.Text
 	p.advance()
-	// Optional type annotation (consume but ignore for now).
+	// Optional type annotation: preserved on the AST so `volt fmt` can
+	// round-trip it; codegen substitutes the value and ignores the type.
+	var typ ast.Type
 	if p.tok.Kind != lex.Assign {
-		_ = p.parseType()
+		typ = p.parseType()
 	}
 	if !p.expect(lex.Assign) {
 		return nil
 	}
 	val := p.parseExpr()
-	return &ast.ConstDecl{P: start, Name: name, Value: val}
+	return &ast.ConstDecl{P: start, Name: name, Type: typ, Value: val}
+}
+
+// parseConstDecls handles a top-level const declaration in either form:
+//
+//	const Name [Type] = Value          // single
+//	const ( Name [Type] = Value; ... )  // grouped (flattened to N decls)
+//
+// A group is flattened into individual *ast.ConstDecl nodes so the rest of
+// the pipeline (checker, codegen) is unaffected; the printer re-groups
+// adjacent consts on output.
+func (p *Parser) parseConstDecls() []ast.Decl {
+	p.advance() // consume `const`
+	if p.tok.Kind == lex.LParen {
+		p.advance()
+		p.skipSemis()
+		var out []ast.Decl
+		for p.tok.Kind != lex.RParen && p.tok.Kind != lex.EOF {
+			cd := p.parseConstSpec()
+			if cd != nil {
+				out = append(out, cd)
+			} else if p.tok.Kind != lex.RParen && p.tok.Kind != lex.Semi {
+				// A malformed spec may leave the cursor parked; advance to
+				// guarantee forward progress and avoid spinning on errors.
+				p.advance()
+			}
+			p.skipSemis()
+		}
+		p.expect(lex.RParen)
+		return out
+	}
+	if cd := p.parseConstSpec(); cd != nil {
+		return []ast.Decl{cd}
+	}
+	return nil
 }
 
 func (p *Parser) parseTypeDecl() *ast.TypeDecl {
@@ -201,13 +252,8 @@ func (p *Parser) parseType() ast.Type {
 	case lex.Amp:
 		pos := p.tok.Pos
 		p.advance()
-		mut := false
-		if p.tok.Kind == lex.KwMut {
-			mut = true
-			p.advance()
-		}
 		inner := p.parseType()
-		return &ast.BorrowType{P: pos, Elem: inner, Mut: mut}
+		return &ast.BorrowType{P: pos, Elem: inner}
 	case lex.Star:
 		pos := p.tok.Pos
 		p.advance()
@@ -701,8 +747,11 @@ func (p *Parser) parseBlock() *ast.Block {
 	b := &ast.Block{P: startPos}
 	p.skipSemis()
 	for p.tok.Kind != lex.RBrace && p.tok.Kind != lex.EOF {
-		s := p.parseStmt()
-		if s != nil {
+		if p.tok.Kind == lex.KwVar {
+			for _, v := range p.parseVarDecls() {
+				b.Stmts = append(b.Stmts, v)
+			}
+		} else if s := p.parseStmt(); s != nil {
 			b.Stmts = append(b.Stmts, s)
 		}
 		// A trailing `}` on the same line as the last statement means
@@ -713,6 +762,7 @@ func (p *Parser) parseBlock() *ast.Block {
 		}
 		p.skipSemis()
 	}
+	b.End = p.tok.Pos // the `}` (or EOF on a malformed block)
 	p.expect(lex.RBrace)
 	return b
 }
@@ -802,8 +852,11 @@ func (p *Parser) parseCaseClause() *ast.CaseClause {
 	cc := &ast.CaseClause{P: start, Vals: vals}
 	for p.tok.Kind != lex.KwCase && p.tok.Kind != lex.KwDefault &&
 		p.tok.Kind != lex.RBrace && p.tok.Kind != lex.EOF {
-		s := p.parseStmt()
-		if s != nil {
+		if p.tok.Kind == lex.KwVar {
+			for _, v := range p.parseVarDecls() {
+				cc.Stmts = append(cc.Stmts, v)
+			}
+		} else if s := p.parseStmt(); s != nil {
 			cc.Stmts = append(cc.Stmts, s)
 		}
 		p.expect(lex.Semi)
@@ -846,10 +899,6 @@ func (p *Parser) parseSelectCase() *ast.SelectCase {
 		cs.IsDefault = true
 	case lex.KwCase:
 		p.advance()
-		if p.tok.Kind == lex.Arrow {
-			p.errorf("`<-ch` receive form removed in select; use `read(ch)`")
-			return nil
-		}
 		// Parse the first expression. Then dispatch on what follows.
 		{
 			first := p.parseExpr()
@@ -890,9 +939,6 @@ func (p *Parser) parseSelectCase() *ast.SelectCase {
 				}
 				cs.Channel = ch
 				cs.RecvNames = []string{id.Name}
-			case lex.Arrow:
-				p.errorf("`ch <- value` send form removed; use `case write(ch, value):` instead")
-				return nil
 			case lex.Colon:
 				// Either `case read(ch):` (recv-discard) or
 				// `case write(ch, v):` (send).
@@ -920,8 +966,11 @@ func (p *Parser) parseSelectCase() *ast.SelectCase {
 	p.skipSemis()
 	for p.tok.Kind != lex.KwCase && p.tok.Kind != lex.KwDefault &&
 		p.tok.Kind != lex.RBrace && p.tok.Kind != lex.EOF {
-		s := p.parseStmt()
-		if s != nil {
+		if p.tok.Kind == lex.KwVar {
+			for _, v := range p.parseVarDecls() {
+				cs.Body = append(cs.Body, v)
+			}
+		} else if s := p.parseStmt(); s != nil {
 			cs.Body = append(cs.Body, s)
 		}
 		if p.tok.Kind != lex.RBrace {
@@ -935,10 +984,6 @@ func (p *Parser) parseSelectCase() *ast.SelectCase {
 // parseSelectRecvSource parses the channel-source part of a select recv
 // case, after `:=`. The only accepted form is `read(ch)`.
 func (p *Parser) parseSelectRecvSource() ast.Expr {
-	if p.tok.Kind == lex.Arrow {
-		p.errorf("`<-ch` receive form removed; use `read(ch)`")
-		return nil
-	}
 	rhs := p.parseExpr()
 	if ch := extractReadChannel(rhs); ch != nil {
 		return ch
@@ -1043,10 +1088,6 @@ func (p *Parser) parseSimpleStmt() ast.Stmt {
 				LHS: first,
 				RHS: &ast.BinaryExpr{P: pos, Op: op, X: first, Y: one},
 			}
-		case lex.Arrow:
-			p.errorf("`ch <- value` send form removed; use `write(ch, value)` instead")
-			p.advance()
-			return nil
 		}
 		return &ast.ExprStmt{P: first.Pos(), Expr: first}
 	}
@@ -1240,8 +1281,15 @@ func (p *Parser) parseIfStmt() *ast.IfStmt {
 }
 
 func (p *Parser) parseVarStmt() *ast.VarStmt {
-	start := p.tok.Pos
 	p.advance() // consume `var`
+	return p.parseVarSpec()
+}
+
+// parseVarSpec parses a single `Name [Type] [= Value]` var specification
+// (the `var` keyword already consumed). Used for both the single form and
+// each line of a `var ( ... )` group.
+func (p *Parser) parseVarSpec() *ast.VarStmt {
+	start := p.tok.Pos
 	if p.tok.Kind != lex.Ident {
 		p.errorf("expected variable name, got %s", p.tok.Kind)
 		return nil
@@ -1258,6 +1306,40 @@ func (p *Parser) parseVarStmt() *ast.VarStmt {
 		value = p.parseExpr()
 	}
 	return &ast.VarStmt{P: start, Name: name, Type: typ, Value: value}
+}
+
+// parseVarDecls handles a var statement in either form:
+//
+//	var Name [Type] [= Value]            // single
+//	var ( Name [Type] [= Value]; ... )    // grouped (flattened to N stmts)
+//
+// Like const groups, a `var ( ... )` block is flattened into individual
+// *ast.VarStmt nodes so the checker/codegen see no new node type; the
+// printer re-groups adjacent var statements on output.
+func (p *Parser) parseVarDecls() []*ast.VarStmt {
+	p.advance() // consume `var`
+	if p.tok.Kind == lex.LParen {
+		p.advance()
+		p.skipSemis()
+		var out []*ast.VarStmt
+		for p.tok.Kind != lex.RParen && p.tok.Kind != lex.EOF {
+			v := p.parseVarSpec()
+			if v != nil {
+				out = append(out, v)
+			} else if p.tok.Kind != lex.RParen && p.tok.Kind != lex.Semi {
+				// A malformed spec may leave the cursor parked; advance to
+				// guarantee forward progress and avoid spinning on errors.
+				p.advance()
+			}
+			p.skipSemis()
+		}
+		p.expect(lex.RParen)
+		return out
+	}
+	if v := p.parseVarSpec(); v != nil {
+		return []*ast.VarStmt{v}
+	}
+	return nil
 }
 
 func (p *Parser) parseRetStmt() *ast.RetStmt {
@@ -1321,26 +1403,15 @@ func (p *Parser) parseUnary() ast.Expr {
 		p.advance()
 		x := p.parseUnary()
 		return &ast.UnaryExpr{P: opPos, Op: "-", X: x}
-	case lex.Arrow:
-		// `<-ch` as an expression is no longer accepted; use `read(ch)`.
-		p.errorf("`<-ch` receive form removed; use `read(ch)` instead")
-		p.advance()
-		return nil
 	case lex.Amp:
-		// C8: `&x` (shared borrow) or `&mut x` (exclusive borrow) as a
-		// value expression. Both lower to the same UnaryExpr with the
-		// alloca address; the "mut" form is distinguished by the Op
-		// string ("&mut" vs "&") so the checker can apply the right
-		// alias rules.
+		// C8: `&x` (address-of / borrow) as a value expression. The
+		// operator is always `&`; the binding-site TYPE decides read vs
+		// write — `&T` is a shared read borrow, `*T` the exclusive write
+		// borrow — and the checker applies the right alias rules from it.
 		opPos := p.tok.Pos
 		p.advance()
-		op := "&"
-		if p.tok.Kind == lex.KwMut {
-			op = "&mut"
-			p.advance()
-		}
 		x := p.parseUnary()
-		return &ast.UnaryExpr{P: opPos, Op: op, X: x}
+		return &ast.UnaryExpr{P: opPos, Op: "&", X: x}
 	case lex.Star:
 		// C8: `*p` as a value expression — dereference a held borrow.
 		// Symmetric to the LHS form `*p = v` which already works.

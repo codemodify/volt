@@ -3,7 +3,7 @@
 // `IntsXxx` / `StringsXxx` instead of `Xxx[T]`.
 //
 // Mutating helpers (`ReverseInts`, `ReverseStrings`) return the slice
-// so callers can rebind across the ownership move:
+// so callers can rebind after handing the slice over:
 //   a = slices.ReverseInts(a)
 
 package slices
@@ -2929,8 +2929,8 @@ fun PercentOfTotalInt(s []int, scale int) []int {
 }
 
 // ShuffleInts shuffles s in place using Fisher-Yates with a
-// crypto-strong random source. Returns the same slice for
-// rebinding across the move. Empty / single-element slices are
+// crypto-strong random source. Returns the same slice for rebinding
+// after handing it over. Empty / single-element slices are
 // returned unchanged.
 fun ShuffleInts(s []int) []int {
     var n int = len(s)
@@ -6430,34 +6430,33 @@ fun IsSetString(s []string) bool {
     ret true
 }
 
-// Swap2Ints exchanges the two int values addressed by `a` and `b`
-// in place. Both parameters take exclusive write access (`&mut`).
-// Because the borrows are "live for the duration of the call",
-// this rejects at the call site if either source already has an
-// active borrow elsewhere — that's the cross-package borrow check
-// at work.
-fun Swap2Ints(a &mut int, b &mut int) {
+// Swap2Ints exchanges the two int values that `a` and `b` point at, in
+// place. Both parameters are write borrows (`*int`). Each borrow is the
+// only thing allowed to touch its source for the whole call, so a call is
+// rejected if either source is already borrowed or being read at the call
+// site.
+fun Swap2Ints(a *int, b *int) {
     var t int = *a
     *a = *b
     *b = t
 }
 
-// AddIntInPlace adds `by` to the int addressed by `p`. The single
-// `&mut` parameter exercises the simplest cross-package borrow
-// shape: caller passes `&mut x` and the call-site checker enforces
-// that no other borrow of `x` is live.
-fun AddIntInPlace(p &mut int, by int) {
+// AddIntInPlace adds `by` to the int that `p` points at. The single write
+// borrow (`*int`) means the caller passes `&x`, and while the call runs
+// nothing else may touch `x` — the call is rejected if `x` is already
+// borrowed or being read.
+fun AddIntInPlace(p *int, by int) {
     *p = *p + by
 }
 
 // MaxAssignInt assigns max(*p, v) into *p. Useful for accumulating
 // a running maximum across a fold without a separate return value.
-fun MaxAssignInt(p &mut int, v int) {
+fun MaxAssignInt(p *int, v int) {
     if v > *p { *p = v }
 }
 
 // MinAssignInt is the dual of MaxAssignInt.
-fun MinAssignInt(p &mut int, v int) {
+fun MinAssignInt(p *int, v int) {
     if v < *p { *p = v }
 }
 

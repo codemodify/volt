@@ -28,7 +28,8 @@ fun main() int {
     log.Println(pretty)
 
     // Demonstrate the data is also accessible programmatically.
-    // doc.kind 5 = object; ObjectAt(i) returns the i-th *Value.
+    // doc.Kind() == json.KindObject (== 5); KeyAt(i) returns the i-th key,
+    // ValAt(i) the i-th value, and ObjectLen() the count.
     var keyCount int = doc.ObjectLen()
     log.Println("(decoded %d top-level keys)", keyCount)
 

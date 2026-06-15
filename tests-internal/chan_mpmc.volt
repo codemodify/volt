@@ -1,8 +1,6 @@
-// D.2 lock-free MPMC channel smoke test (default backend, mutex).
-// Verifies that buffered channels handle 3-producer × 2-consumer
-// concurrent traffic correctly under the regular mutex backend.
-// The same source runs under the lock-free backend via the dedicated
-// /tmp/lf_mpmc.volt smoke harness (--channels lockfree).
+// MPMC channel smoke test: 3 producers × 2 consumers over a buffered
+// channel, verifying concurrent traffic is delivered correctly (no lost
+// or duplicated values) under volt's channel implementation.
 package main
 import "log"
 

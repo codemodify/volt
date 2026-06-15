@@ -19,8 +19,17 @@ import "strconv"
 import "errors"
 import "bytes"
 
-// Kind tags.
-//   0 Null   1 Bool   2 Number (int)   3 String   4 Array   5 Object
+// Kind tags — the `kind` of a Value. Use these instead of raw ints:
+//   if v.Kind() == json.KindObject { ... }
+// (They can't be named Null/Bool/... because those are the constructor
+// function names; the `Kind` prefix keeps them distinct.)
+const KindNull   int = 0
+const KindBool   int = 1
+const KindNumber int = 2
+const KindString int = 3
+const KindArray  int = 4
+const KindObject int = 5
+
 type Value struct {
     kind  int
     boolV bool
@@ -34,33 +43,62 @@ type Value struct {
 // ---- Constructors ---------------------------------------------------
 
 fun Null() *Value {
-    var v *Value = new Value {kind: 0}
+    var v *Value = new Value {kind: KindNull}
     ret v
 }
 
 fun Bool(b bool) *Value {
-    var v *Value = new Value {kind: 1, boolV: b}
+    var v *Value = new Value {kind: KindBool, boolV: b}
     ret v
 }
 
 fun Int(n int) *Value {
-    var v *Value = new Value {kind: 2, numV: n}
+    var v *Value = new Value {kind: KindNumber, numV: n}
     ret v
 }
 
 fun String(s string) *Value {
-    var v *Value = new Value {kind: 3, strV: s}
+    var v *Value = new Value {kind: KindString, strV: s}
     ret v
 }
 
 fun Array(items []*Value) *Value {
-    var v *Value = new Value {kind: 4, arr: items}
+    var v *Value = new Value {kind: KindArray, arr: items}
     ret v
 }
 
 fun Object(keys []string, vals []*Value) *Value {
-    var v *Value = new Value {kind: 5, keys: keys, vals: vals}
+    var v *Value = new Value {kind: KindObject, keys: keys, vals: vals}
     ret v
+}
+
+// cloneValue deep-copies a Value recursively, so accessors that hand
+// back a sub-Value return an independent tree the caller owns. This is
+// what makes json.Value immutable-from-the-outside (like a string): you
+// can read a child or build a new doc, but you never get a handle that
+// mutates the original. Scalar leaves copy their fields; arrays/objects
+// rebuild fresh slices and recurse into every child.
+fun cloneValue(v *Value) *Value {
+    if v == nil { ret nil }
+    if v.kind == KindArray {
+        var n int = len(v.arr)
+        var out []*Value = new(0) []*Value{}
+        for i:=0; i < n; i++ {
+            out = append(out, cloneValue(v.arr[i]))
+        }
+        ret new Value {kind: KindArray, arr: out}
+    }
+    if v.kind == KindObject {
+        var n int = len(v.keys)
+        var ks []string = new(0) []string{}
+        var vs []*Value = new(0) []*Value{}
+        for i:=0; i < n; i++ {
+            ks = append(ks, "" + v.keys[i])
+            vs = append(vs, cloneValue(v.vals[i]))
+        }
+        ret new Value {kind: KindObject, keys: ks, vals: vs}
+    }
+    ret new Value {kind: v.kind, boolV: v.boolV, numV: v.numV, strV: "" + v.strV}
 }
 
 // ---- Accessors ------------------------------------------------------
@@ -72,7 +110,7 @@ fun (v *Value) AsString() string { ret v.strV }
 fun (v *Value) ArrayLen() int { ret len(v.arr) }
 fun (v *Value) ArrayAt(i int) *Value {
     var arr []*Value = v.arr
-    ret arr[i]
+    ret cloneValue(arr[i])
 }
 fun (v *Value) ObjectLen() int { ret len(v.keys) }
 fun (v *Value) KeyAt(i int) string {
@@ -81,7 +119,7 @@ fun (v *Value) KeyAt(i int) string {
 }
 fun (v *Value) ValAt(i int) *Value {
     var vals []*Value = v.vals
-    ret vals[i]
+    ret cloneValue(vals[i])
 }
 
 // ---- QuoteString: escape + wrap with double quotes -----------------
@@ -105,6 +143,48 @@ fun QuoteString(s string) string {
 }
 
 // ---- UnquoteString: parses "\"...\"" into the unescaped string -----
+// jsonHexVal returns the value of a hex digit (0-15), or -1 if `c`
+// isn't one.
+fun jsonHexVal(c byte) int {
+    if c >= 48 && c <= 57  { ret c - 48 }   // '0'-'9'
+    if c >= 97 && c <= 102 { ret c - 87 }   // 'a'-'f' -> 10..15
+    if c >= 65 && c <= 70  { ret c - 55 }   // 'A'-'F' -> 10..15
+    ret -1
+}
+
+// jsonWriteCodepoint appends the UTF-8 encoding of Unicode codepoint
+// `cp` to b. Uses chr() per byte (volt has no int->byte narrowing).
+fun jsonWriteCodepoint(b *bytes.Builder, cp int) {
+    if cp < 128 {
+        b.WriteString(chr(cp))
+    } else if cp < 2048 {
+        b.WriteString(chr(192 + cp / 64))
+        b.WriteString(chr(128 + cp % 64))
+    } else if cp < 65536 {
+        b.WriteString(chr(224 + cp / 4096))
+        b.WriteString(chr(128 + (cp / 64) % 64))
+        b.WriteString(chr(128 + cp % 64))
+    } else {
+        b.WriteString(chr(240 + cp / 262144))
+        b.WriteString(chr(128 + (cp / 4096) % 64))
+        b.WriteString(chr(128 + (cp / 64) % 64))
+        b.WriteString(chr(128 + cp % 64))
+    }
+}
+
+// jsonParseU4 reads 4 hex digits of a \uXXXX escape starting at s[at],
+// returning the codepoint and true, or 0/false on a malformed escape.
+fun jsonParseU4(s string, at int) (int, bool) {
+    if at + 4 > len(s) { ret 0, false }
+    var cp int = 0
+    for k := 0; k < 4; k++ {
+        var hv int = jsonHexVal(s[at + k])
+        if hv < 0 { ret 0, false }
+        cp = cp * 16 + hv
+    }
+    ret cp, true
+}
+
 fun UnquoteString(s string) (string, error) {
     var n int = len(s)
     if n < 2 { ret "", errors.New("json: too short") }
@@ -119,6 +199,28 @@ fun UnquoteString(s string) (string, error) {
                 ret "", errors.New("json: dangling escape")
             }
             var esc byte = s[i+1]
+            if esc == 117 {                // '\u' — Unicode escape
+                var cp int = 0
+                var ok bool = false
+                cp, ok = jsonParseU4(s, i + 2)
+                if !ok { ret "", errors.New("json: bad \\u escape") }
+                i = i + 6
+                // Surrogate pair: a high surrogate must be followed by
+                // a low surrogate \uDC00-\uDFFF to form one codepoint.
+                if cp >= 55296 && cp <= 56319 {   // 0xD800..0xDBFF (high)
+                    if i + 1 < n && s[i] == 92 && s[i+1] == 117 {
+                        var lo int = 0
+                        var ok2 bool = false
+                        lo, ok2 = jsonParseU4(s, i + 2)
+                        if ok2 && lo >= 56320 && lo <= 57343 {   // 0xDC00..0xDFFF
+                            cp = 65536 + (cp - 55296) * 1024 + (lo - 56320)
+                            i = i + 6
+                        }
+                    }
+                }
+                jsonWriteCodepoint(b, cp)
+                continue
+            }
             var matched bool = true
             if esc == 34       { b.WriteByte(34)  } else
             if esc == 92       { b.WriteByte(92)  } else
@@ -128,7 +230,6 @@ fun UnquoteString(s string) (string, error) {
             if esc == 110      { b.WriteByte(10)  } else
             if esc == 114      { b.WriteByte(13)  } else
             if esc == 116      { b.WriteByte(9)   } else
-            if esc == 117      { ret "", errors.New("json: \\u escapes not supported in v1") } else
                                { matched = false }
             if !matched { ret "", errors.New("json: bad escape") }
             i = i + 2
@@ -157,14 +258,14 @@ fun EncodePretty(v *Value, indent string) string {
 // string at the call site and keeps the parameter's `indent` alive
 // across iterations.
 fun encodePrettyInto(v *Value, indent string, depth int, b *bytes.Builder) {
-    if v.kind == 0 { b.WriteString("null"); ret }
-    if v.kind == 1 {
+    if v.kind == KindNull { b.WriteString("null"); ret }
+    if v.kind == KindBool {
         if v.boolV { b.WriteString("true") } else { b.WriteString("false") }
         ret
     }
-    if v.kind == 2 { b.WriteInt(v.numV); ret }
-    if v.kind == 3 { b.WriteString(QuoteString(v.strV)); ret }
-    if v.kind == 4 {
+    if v.kind == KindNumber { b.WriteInt(v.numV); ret }
+    if v.kind == KindString { b.WriteString(QuoteString(v.strV)); ret }
+    if v.kind == KindArray {
         var n int = len(v.arr)
         if n == 0 { b.WriteString("[]"); ret }
         b.WriteByte(91)    // '['
@@ -179,7 +280,7 @@ fun encodePrettyInto(v *Value, indent string, depth int, b *bytes.Builder) {
         b.WriteByte(93)    // ']'
         ret
     }
-    if v.kind == 5 {
+    if v.kind == KindObject {
         var n int = len(v.keys)
         if n == 0 { b.WriteString("{}"); ret }
         b.WriteByte(123)   // '{'
@@ -205,14 +306,14 @@ fun writeIndentNTimes(b *bytes.Builder, indent string, n int) {
 }
 
 fun Encode(v *Value) string {
-    if v.kind == 0 { ret "null" }
-    if v.kind == 1 {
+    if v.kind == KindNull { ret "null" }
+    if v.kind == KindBool {
         if v.boolV { ret "true" }
         ret "false"
     }
-    if v.kind == 2 { ret strconv.Itoa(v.numV) }
-    if v.kind == 3 { ret QuoteString(v.strV) }
-    if v.kind == 4 {
+    if v.kind == KindNumber { ret strconv.Itoa(v.numV) }
+    if v.kind == KindString { ret QuoteString(v.strV) }
+    if v.kind == KindArray {
         var b *bytes.Builder = bytes.NewBuilder()
         b.WriteByte(91)    // '['
         var n int = len(v.arr)
@@ -223,7 +324,7 @@ fun Encode(v *Value) string {
         b.WriteByte(93)    // ']'
         ret b.String()
     }
-    if v.kind == 5 {
+    if v.kind == KindObject {
         var b *bytes.Builder = bytes.NewBuilder()
         b.WriteByte(123)   // '{'
         var n int = len(v.keys)
@@ -307,7 +408,12 @@ fun decodeAt(s string, start int) (*Value, int, error) {
         }
         ret String(unq), j + 1, nil
     }
-    // number (integer only — leading '-' or digit)
+    // number. The value model is integer-only (no float kind yet), but
+    // the PARSER tolerates real-world floats (`1.5`, `2.0e9`): it
+    // consumes the whole numeric token so decoding succeeds, and stores
+    // the integer part (truncated toward zero) as the value. This lets
+    // json.Decode handle live JSON like the AUR RPC (Popularity floats)
+    // without erroring; full float values are a follow-up.
     var isNum bool = false
     if c == 45 { isNum = true }            // '-'
     if c >= 48 {
@@ -322,8 +428,32 @@ fun decodeAt(s string, start int) (*Value, int, error) {
             if d > 57 { break }
             j = j + 1
         }
+        var intEnd int = j                 // integer part is [i, intEnd)
+        // Fractional part: '.' digits
+        if j < n && s[j] == 46 {           // '.'
+            j = j + 1
+            for j < n {
+                var d byte = s[j]
+                if d < 48 { break }
+                if d > 57 { break }
+                j = j + 1
+            }
+        }
+        // Exponent: ('e'|'E') ('+'|'-')? digits
+        if j < n && (s[j] == 101 || s[j] == 69) {   // 'e' / 'E'
+            j = j + 1
+            if j < n && (s[j] == 43 || s[j] == 45) { j = j + 1 }   // '+' / '-'
+            for j < n {
+                var d byte = s[j]
+                if d < 48 { break }
+                if d > 57 { break }
+                j = j + 1
+            }
+        }
         var lit string = ""
-        for k:=i; k < j; k++ { lit = lit + chr(s[k]) }
+        for k:=i; k < intEnd; k++ { lit = lit + chr(s[k]) }
+        if lit == "" { lit = "0" }         // e.g. a bare "-" guard / ".5"
+        if lit == "-" { lit = "0" }
         var num int = 0
         var nerr error = nil
         num, nerr = strconv.Atoi(lit)

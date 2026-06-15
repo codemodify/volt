@@ -6,8 +6,9 @@
 //   IntsAreSorted(s) bool     — true iff s is non-decreasing
 //   StringsAreSorted(s) bool  — true iff s is non-decreasing
 //
-// Volt's ownership rules MOVE a slice when passed to a function, so
-// the mutating helpers return the slice for the caller to rebind:
+// Passing a slice to a function HANDS IT OVER (the caller can't use the
+// old name afterward), so the mutating helpers return the slice for the
+// caller to rebind:
 //
 //   a = sort.IntsAsc(a)
 //
@@ -22,8 +23,8 @@
 
 package sort
 
-// IntsAsc sorts `s` in ascending order, in place, and returns it
-// so the caller can rebind across the move:
+// IntsAsc sorts `s` in ascending order, in place, and returns it so the
+// caller can rebind after handing the slice over:
 //   a = sort.IntsAsc(a)
 fun IntsAsc(s []int) []int {
     var n int = len(s)

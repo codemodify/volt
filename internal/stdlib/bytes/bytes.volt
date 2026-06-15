@@ -8,6 +8,7 @@
 package bytes
 
 import "syscall"
+import "io"
 
 // Builder grows a []byte buffer geometrically as bytes are appended,
 // then converts the final contents to an immutable string in O(n).
@@ -68,6 +69,16 @@ fun (b *Builder) WriteString(s string) {
     }
     b.n = b.n + sn
 }
+
+// Write appends s and reports the bytes written, satisfying io.Writer so a
+// *Builder can be used directly as an in-memory output sink (collect via
+// io.Copy / exec.Cmd.Start, then read back with String()).
+fun (b *Builder) Write(s string) (int, error) {
+    b.WriteString(s)
+    ret len(s), nil
+}
+
+
 
 // WriteBytes appends every byte of s to the buffer. Parallel to
 // WriteString for []byte input.
@@ -2121,4 +2132,13 @@ fun RuneCount(s []byte) int {
         count = count + 1
     }
     ret count
+}
+
+// NewReader wraps b as an io.Reader (one-shot: the first Read returns the
+// whole content as a string, then "" = EOF). It returns the io.Reader
+// interface rather than a concrete `bytes.Reader` because volt's type
+// namespace is global and `Reader` is io's interface — the concrete impl
+// is io.StringReader. The []byte is read (copied to a string) at call time.
+fun NewReader(b []byte) io.Reader {
+    ret io.NewStringReader(syscall.BytesToString(b, len(b)))
 }

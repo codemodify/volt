@@ -198,17 +198,45 @@ func (p *printer) printFile(f *ast.File) {
 		}
 	}
 
-	for _, d := range f.Decls {
+	for i := 0; i < len(f.Decls); i++ {
+		d := f.Decls[i]
 		dl := d.Pos().Line
+		beforeFlush := p.lastLine
 		p.flushCommentsBefore(dl)
+		// Did a doc comment immediately above this decl just get flushed?
+		// If so it should HUG the declaration — never force a blank between
+		// them (the blank-between-decls belongs before the comment, which
+		// flushCommentsBefore already preserved from the source).
+		docHugs := p.lastLine != beforeFlush && dl-p.lastLine == 1
 		p.emitBlankIfGap(dl)
 		// Ensure a blank line between top-level decls even when there's
-		// no source gap (rare, but keeps output uniform).
-		if p.lastLine > 0 && p.b.Len() > 0 {
+		// no source gap (rare, but keeps output uniform) — but not when a
+		// doc comment hugs this decl.
+		if !docHugs && p.lastLine > 0 && p.b.Len() > 0 {
 			tail := p.b.String()
 			// If the last char isn't already a blank-line boundary, add one.
 			if !strings.HasSuffix(tail, "\n\n") {
 				p.b.WriteByte('\n')
+			}
+		}
+		// Fold a maximal run of adjacent consts into one `const ( ... )`
+		// block. Adjacency = consecutive source lines with no blank line or
+		// comment between (a gap leaves them as separate single decls).
+		if cd, ok := d.(*ast.ConstDecl); ok {
+			run := []*ast.ConstDecl{cd}
+			j := i + 1
+			for j < len(f.Decls) {
+				nd, ok := f.Decls[j].(*ast.ConstDecl)
+				if !ok || !p.groupAdjacent(run[len(run)-1].P.Line, nd.P.Line) {
+					break
+				}
+				run = append(run, nd)
+				j++
+			}
+			if len(run) >= 2 {
+				p.printConstGroup(run)
+				i = j - 1
+				continue
 			}
 		}
 		p.printDecl(d)
@@ -237,16 +265,36 @@ func (p *printer) printTypeDecl(d *ast.TypeDecl) {
 		}
 		p.line("type " + d.Name + " struct {")
 		p.indent++
-		// Align field types like gofmt.
+		// Pre-render each field's "name type" text so we can align both the
+		// type column and the trailing-comment column like gofmt.
+		texts := make([]string, len(st.Fields))
 		nameWidth := 0
 		for _, f := range st.Fields {
 			if len(f.Name) > nameWidth {
 				nameWidth = len(f.Name)
 			}
 		}
-		for _, f := range st.Fields {
+		textWidth := 0
+		for i, f := range st.Fields {
+			texts[i] = fmt.Sprintf("%-*s %s", nameWidth, f.Name, p.formatType(f.Type))
+			if len(texts[i]) > textWidth {
+				textWidth = len(texts[i])
+			}
+		}
+		for i, f := range st.Fields {
+			// Standalone comments ABOVE the field stay on their own lines.
 			p.flushCommentsBefore(f.P.Line)
-			p.line(fmt.Sprintf("%-*s %s", nameWidth, f.Name, p.formatType(f.Type)))
+			// A comment on the field's own source line is a TRAILING comment:
+			// keep it on the field line, aligned in a common column. (Without
+			// this it would be flushed before the next field — and the last
+			// field's comment would escape past the closing brace.)
+			if len(p.comments) > 0 && p.comments[0].Pos.Line == f.P.Line {
+				c := p.comments[0]
+				p.comments = p.comments[1:]
+				p.line(fmt.Sprintf("%-*s  %s", textWidth, texts[i], c.Text))
+			} else {
+				p.line(texts[i])
+			}
 			p.markLine(f.P.Line)
 		}
 		p.indent--
@@ -305,7 +353,194 @@ func (p *printer) printTypeDecl(d *ast.TypeDecl) {
 
 func (p *printer) printConstDecl(d *ast.ConstDecl) {
 	p.markLine(d.P.Line)
-	p.line("const " + d.Name + " = " + p.formatExpr(d.Value))
+	out := "const " + d.Name
+	if d.Type != nil {
+		out += " " + p.formatType(d.Type)
+	}
+	out += " = " + p.formatExpr(d.Value)
+	p.line(out)
+}
+
+// groupAdjacent reports whether a group member on source line `next`
+// should join a run whose previous member is on line `prev`. True when
+// they're on consecutive lines, OR when every line strictly between them
+// is occupied by a pending comment (so interior comments keep a block
+// together) — but never across a blank line, which separates groups.
+func (p *printer) groupAdjacent(prev, next int) bool {
+	if next <= prev {
+		return false
+	}
+	if next == prev+1 {
+		return true
+	}
+	covered := 0
+	for _, c := range p.comments {
+		if c.Pos.Line > prev && c.Pos.Line < next {
+			covered += 1 + strings.Count(c.Text, "\n")
+		}
+	}
+	return covered == next-prev-1
+}
+
+// groupCommentPad returns the column to which group members carrying a
+// trailing comment should be padded so their `//` line up gofmt-style: the
+// widest code part among members that actually have a trailing comment (0
+// if none do). `codes` are the rendered code parts; `lines` their source
+// lines (a trailing comment is a pending comment ON the member's own line).
+func (p *printer) groupCommentPad(codes []string, lines []int) int {
+	pad := 0
+	for i, ln := range lines {
+		for _, c := range p.comments {
+			if c.Pos.Line == ln {
+				pad = max(pad, len(codes[i]))
+				break
+			}
+			if c.Pos.Line > ln {
+				break
+			}
+		}
+	}
+	return pad
+}
+
+// groupSpecLine writes one member line of a const/var group, attaching any
+// trailing comment that sits on the member's own source line (so
+// `Name = val // note` round-trips and stays idempotent). When padTo > 0 the
+// code part is padded to that column first, so trailing comments align.
+func (p *printer) groupSpecLine(out string, padTo int, srcLine int) {
+	if len(p.comments) > 0 && p.comments[0].Pos.Line == srcLine {
+		c := p.comments[0]
+		p.comments = p.comments[1:]
+		if len(out) < padTo {
+			out += strings.Repeat(" ", padTo-len(out))
+		}
+		out += "  " + c.Text
+	}
+	p.line(out)
+	p.markLine(srcLine)
+}
+
+// printConstGroup emits a run of adjacent top-level consts as a single
+// `const ( ... )` block, gofmt-style: name and (optional) type columns are
+// aligned. The caller guarantees len(group) >= 2.
+func (p *printer) printConstGroup(group []*ast.ConstDecl) {
+	p.markLine(group[0].P.Line)
+	p.line("const (")
+	p.indent++
+	nameW, typeW := 0, 0
+	for _, d := range group {
+		nameW = max(nameW, len(d.Name))
+		if d.Type != nil {
+			typeW = max(typeW, len(p.formatType(d.Type)))
+		}
+	}
+	codes := make([]string, len(group))
+	lines := make([]int, len(group))
+	for i, d := range group {
+		out := fmt.Sprintf("%-*s", nameW, d.Name)
+		if typeW > 0 {
+			ts := ""
+			if d.Type != nil {
+				ts = p.formatType(d.Type)
+			}
+			out += " " + fmt.Sprintf("%-*s", typeW, ts)
+		}
+		out += " = " + p.formatExpr(d.Value)
+		codes[i] = out
+		lines[i] = d.P.Line
+	}
+	pad := p.groupCommentPad(codes, lines)
+	for i, d := range group {
+		p.flushCommentsBefore(d.P.Line)
+		p.groupSpecLine(codes[i], pad, lines[i])
+	}
+	p.indent--
+	p.line(")")
+}
+
+// isGroupableVar reports whether a var statement can be folded into a
+// `var ( ... )` block. Only the explicit-type form (`var x T [= v]`)
+// qualifies; the `:=` / inferred form (Type == nil) is printed as `x := v`
+// and has no valid place inside a var group.
+func isGroupableVar(s *ast.VarStmt) bool { return s.Type != nil }
+
+// printVarGroup emits a run of adjacent typed var statements as a single
+// `var ( ... )` block with aligned name/type columns. len(group) >= 2.
+func (p *printer) printVarGroup(group []*ast.VarStmt) {
+	p.markLine(group[0].P.Line)
+	p.line("var (")
+	p.indent++
+	nameW, typeW := 0, 0
+	for _, s := range group {
+		nameW = max(nameW, len(s.Name))
+		typeW = max(typeW, len(p.formatType(s.Type)))
+	}
+	codes := make([]string, len(group))
+	lines := make([]int, len(group))
+	for i, s := range group {
+		out := fmt.Sprintf("%-*s %-*s", nameW, s.Name, typeW, p.formatType(s.Type))
+		if s.Value != nil {
+			out += " = " + p.formatExpr(s.Value)
+		} else {
+			out = strings.TrimRight(out, " ")
+		}
+		codes[i] = out
+		lines[i] = s.P.Line
+	}
+	pad := p.groupCommentPad(codes, lines)
+	for i, s := range group {
+		p.flushCommentsBefore(s.P.Line)
+		p.groupSpecLine(codes[i], pad, lines[i])
+	}
+	p.indent--
+	p.line(")")
+}
+
+// printStmts prints a statement list, folding maximal runs of 2+ adjacent
+// groupable var statements into `var ( ... )` blocks (mirroring how the
+// import block groups adjacent imports). "Adjacent" means consecutive
+// source lines with nothing — blank line or comment — in between, so any
+// author-intended separation is preserved.
+func (p *printer) printStmts(stmts []ast.Stmt) {
+	i := 0
+	for i < len(stmts) {
+		if vs, ok := stmts[i].(*ast.VarStmt); ok && isGroupableVar(vs) {
+			run := []*ast.VarStmt{vs}
+			j := i + 1
+			for j < len(stmts) {
+				nv, ok := stmts[j].(*ast.VarStmt)
+				if !ok || !isGroupableVar(nv) {
+					break
+				}
+				if !p.groupAdjacent(run[len(run)-1].P.Line, nv.P.Line) {
+					break
+				}
+				run = append(run, nv)
+				j++
+			}
+			if len(run) >= 2 {
+				// Flush any own-line comment(s) before the group opens so a
+				// leading comment stays OUTSIDE the `var (` (matching the
+				// const path). flushCommentsBefore preserves a blank line
+				// *before* such a comment itself; we deliberately don't call
+				// emitBlankIfGap against the first member's line — in
+				// already-grouped input the `var (` line sits between, so the
+				// gap is off-by-one and would emit a spurious blank each pass
+				// (breaking idempotence). A lone blank line directly abutting
+				// the `(` is absorbed, mirroring the closing `)` side.
+				p.flushCommentsBefore(run[0].P.Line)
+				p.printVarGroup(run)
+				// Account for the closing `)` line (one past the last spec)
+				// so blank-line preservation after the group is stable —
+				// mirrors endLine()'s `+1` for a block's closing brace.
+				p.markLine(run[len(run)-1].P.Line + 1)
+				i = j
+				continue
+			}
+		}
+		p.printStmt(stmts[i])
+		i++
+	}
 }
 
 func (p *printer) printFuncDecl(d *ast.FuncDecl) {
@@ -338,15 +573,19 @@ func (p *printer) printFuncDecl(d *ast.FuncDecl) {
 	if d.Body != nil {
 		p.raw(" {\n")
 		p.indent++
-		for _, s := range d.Body.Stmts {
-			p.printStmt(s)
+		p.printStmts(d.Body.Stmts)
+		// Flush comments that sit inside THIS body before its closing `}`
+		// (e.g. a trailing comment after the last statement). Bound by the
+		// body's own `}` line so comments belonging to LATER declarations
+		// stay pending — they're emitted by the next decl's own
+		// flushCommentsBefore. (Previously this drained everything via a
+		// `+1000000` fudge, which hoisted later functions' comments up into
+		// the first function's body.)
+		closeLine := d.Body.End.Line
+		if closeLine <= 0 {
+			closeLine = p.lastLine + 1 // malformed/missing `}`: best effort
 		}
-		// Flush any trailing comments inside the body.
-		closeLine := d.Body.Pos().Line
-		if closeLine < p.lastLine {
-			closeLine = p.lastLine
-		}
-		p.flushCommentsBefore(closeLine + 1000000) // drain everything before the next decl; safer to drain in-body comments here
+		p.flushCommentsBefore(closeLine)
 		p.indent--
 		p.line("}")
 	} else {
@@ -361,11 +600,14 @@ func (p *printer) printFuncDecl(d *ast.FuncDecl) {
 func (p *printer) formatType(t ast.Type) string {
 	switch t := t.(type) {
 	case *ast.NamedType:
+		// Preserve a cross-package qualifier (`json.Value`); dropping it
+		// would silently rewrite the type to a different (or unresolvable)
+		// one.
+		if t.Package != "" {
+			return t.Package + "." + t.Name
+		}
 		return t.Name
 	case *ast.BorrowType:
-		if t.Mut {
-			return "&mut " + p.formatType(t.Elem)
-		}
 		return "&" + p.formatType(t.Elem)
 	case *ast.PointerType:
 		return "*" + p.formatType(t.Elem)
@@ -392,6 +634,8 @@ func (p *printer) formatType(t ast.Type) string {
 		return "waitgroup"
 	case *ast.OnceType:
 		return "once"
+	case *ast.CondvarType:
+		return "condvar"
 	case *ast.FuncType:
 		var sb strings.Builder
 		sb.WriteString("fun(")
@@ -508,11 +752,6 @@ func (p *printer) printStmt(s ast.Stmt) {
 		p.lineAt(p.formatExpr(s.LHS)+" = "+p.formatExpr(s.RHS), sl)
 	case *ast.MultiAssignStmt:
 		p.printMultiAssignStmt(s, sl)
-	case *ast.SendStmt:
-		// Render as the canonical write(ch, v) call. The SendStmt AST node
-		// is no longer produced by the parser (sends are CallExprs now) but
-		// any synthesized AST would round-trip parseably this way.
-		p.lineAt("write("+p.formatExpr(s.Channel)+", "+p.formatExpr(s.Value)+")", sl)
 	case *ast.RetStmt:
 		switch len(s.Values) {
 		case 0:
@@ -549,9 +788,7 @@ func (p *printer) printStmt(s ast.Stmt) {
 	case *ast.Block:
 		p.line("{")
 		p.indent++
-		for _, ss := range s.Stmts {
-			p.printStmt(ss)
-		}
+		p.printStmts(s.Stmts)
 		p.indent--
 		p.line("}")
 	}
@@ -598,9 +835,7 @@ func (p *printer) printIfStmt(s *ast.IfStmt, asElseIf bool) {
 	p.raw(head + p.formatExpr(s.Cond) + " {\n")
 	p.indent++
 	if s.Then != nil {
-		for _, ss := range s.Then.Stmts {
-			p.printStmt(ss)
-		}
+		p.printStmts(s.Then.Stmts)
 	}
 	p.indent--
 	if s.Else == nil {
@@ -614,9 +849,7 @@ func (p *printer) printIfStmt(s *ast.IfStmt, asElseIf bool) {
 		p.writeIndent()
 		p.raw("} else {\n")
 		p.indent++
-		for _, ss := range e.Stmts {
-			p.printStmt(ss)
-		}
+		p.printStmts(e.Stmts)
 		p.indent--
 		p.line("}")
 	}
@@ -653,9 +886,7 @@ func (p *printer) printForStmt(s *ast.ForStmt) {
 	p.raw("{\n")
 	p.indent++
 	if s.Body != nil {
-		for _, ss := range s.Body.Stmts {
-			p.printStmt(ss)
-		}
+		p.printStmts(s.Body.Stmts)
 	}
 	p.indent--
 	p.line("}")
@@ -679,9 +910,7 @@ func (p *printer) printSwitchStmt(s *ast.SwitchStmt) {
 			p.line("case " + strings.Join(parts, ", ") + ":")
 		}
 		p.indent++
-		for _, ss := range cc.Stmts {
-			p.printStmt(ss)
-		}
+		p.printStmts(cc.Stmts)
 		p.indent--
 	}
 	p.line("}")
@@ -703,9 +932,7 @@ func (p *printer) printSelectStmt(s *ast.SelectStmt) {
 			p.raw("case " + strings.Join(cs.RecvNames, ", ") + " := read(" + p.formatExpr(cs.Channel) + "):\n")
 		}
 		p.indent++
-		for _, ss := range cs.Body {
-			p.printStmt(ss)
-		}
+		p.printStmts(cs.Body)
 		p.indent--
 	}
 	p.line("}")
@@ -842,18 +1069,6 @@ func (p *printer) formatExpr(e ast.Expr) string {
 	case *ast.SelectorExpr:
 		return p.formatExpr(e.X) + "." + e.Sel
 	case *ast.UnaryExpr:
-		// Legacy `<-ch` receive form: render as the canonical `read(ch)`
-		// so any AST round-trip produces parseable output. Real parser
-		// output no longer contains UnaryExpr{Op:"<-"}.
-		if e.Op == "<-" {
-			return "read(" + p.formatExpr(e.X) + ")"
-		}
-		// `&mut` is a multi-character keyword-style operator — needs a
-		// space before the operand, else `&mut x` round-trips as the
-		// unparseable `&mutx`.
-		if e.Op == "&mut" {
-			return "&mut " + p.formatExpr(e.X)
-		}
 		return e.Op + p.formatExpr(e.X)
 	case *ast.BinaryExpr:
 		// Parenthesize each operand if it's a BinaryExpr whose
@@ -901,7 +1116,9 @@ func (p *printer) formatExpr(e ast.Expr) string {
 			sb.WriteString(p.formatType(e.Type))
 		}
 		if e.HasBraces {
-			sb.WriteByte('{')
+			// volt style puts a space before the brace: `new {...}` and
+			// `new(N) T {...}` (never `new{}`).
+			sb.WriteString(" {")
 			first := true
 			for _, kv := range e.Pairs {
 				if !first {

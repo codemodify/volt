@@ -1,4 +1,4 @@
-// C8 held-borrow phase 1: `var b &T = &x` declares a borrow that
+// C8 held-borrow phase 1: `var b *T = &x` declares a write borrow that
 // survives across statements. Read via `*b`, write via `*b = v`.
 // Both are observable through the original `x`. The borrow's
 // lifetime is bound to the declaration scope and the underlying
@@ -8,12 +8,12 @@ package main
 import "log"
 
 fun main() int {
-	// 1. Held mut borrow + read through *b. Scoped to its own block
-	// so the source `x` can be mutated directly afterward (C8 phase 5
+	// 1. Held write borrow (`*int`) + read through *b. Scoped to its own
+	// block so the source `x` can be mutated directly afterward (C8 phase 5
 	// rejects source mutation while a borrow is held).
 	var x int = 42
 	{
-		var b &mut int = &mut x
+		var b *int = &x
 		var v int = *b
 		if v != 42 { ret 1 }
 
@@ -31,7 +31,7 @@ fun main() int {
 	// the block close, so subsequent source mutation works).
 	var v3 int = 0
 	{
-		var b2 &mut int = &mut x
+		var b2 *int = &x
 		v3 = identity(b2)
 	}
 	if v3 != 7 { ret 4 }
@@ -50,7 +50,7 @@ fun main() int {
 	// the source can be moved (or used again) freely after.
 	var k int = 9
 	{
-		var bk &mut int = &mut k
+		var bk *int = &k
 		*bk = 99
 	}
 	if k != 99 { ret 6 }

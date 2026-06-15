@@ -1,10 +1,11 @@
-// Cross-function lifetime tracking: passing &x / &mut x to a
-// function is fine when no conflicting borrow is held. The borrow
-// is "live" for the duration of the call and released on return.
+// Cross-function lifetime tracking: passing &x (shared read borrow)
+// or &x bound to a *T param (write borrow) to a function is fine when
+// no conflicting borrow is held. The borrow is "live" for the
+// duration of the call and released on return.
 package main
 import "log"
 
-fun bump(p &mut int) {
+fun bump(p *int) {
 	*p = *p + 1
 }
 
@@ -17,11 +18,12 @@ fun sumTwo(a &int, b &int) int {
 }
 
 fun main() int {
-	// Sequential mut calls: each &mut x is released on return.
+	// Sequential write-borrow calls: each &x (bound to the *int
+	// param) is released on return.
 	var x int = 10
-	bump(&mut x)
-	bump(&mut x)
-	bump(&mut x)
+	bump(&x)
+	bump(&x)
+	bump(&x)
 	if x != 13 { ret 1 }
 
 	// Shared reads after writes complete.
@@ -36,7 +38,7 @@ fun main() int {
 	if t != 12 { ret 3 }
 
 	// Bare-name passing (volt auto-infers borrow): identical behavior.
-	bump(x)  // same as bump(&mut x) since param is &mut int
+	bump(x)  // same as bump(&x) since param is *int (write borrow)
 	if x != 14 { ret 4 }
 
 	log.Println("ok")

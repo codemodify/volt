@@ -50,7 +50,6 @@ const (
 	KwImport
 	KwInterface
 	KwMap
-	KwMut
 	KwMutex
 	KwNew
 	KwNil
@@ -102,7 +101,6 @@ const (
 	Caret         // ^
 	Shl           // <<
 	Shr           // >>
-	Arrow         // <-
 	Inc           // ++
 	Dec           // --
 	PlusAssign    // +=
@@ -147,7 +145,6 @@ var kindNames = [...]string{
 	KwImport:      "import",
 	KwInterface:   "interface",
 	KwMap:         "map",
-	KwMut:         "mut",
 	KwMutex:       "mutex",
 	KwNew:         "new",
 	KwNil:         "nil",
@@ -195,7 +192,6 @@ var kindNames = [...]string{
 	Caret:         "^",
 	Shl:           "<<",
 	Shr:           ">>",
-	Arrow:         "<-",
 	Inc:           "++",
 	Dec:           "--",
 	PlusAssign:    "+=",
@@ -239,7 +235,6 @@ var keywords = map[string]Kind{
 	"import":    KwImport,
 	"interface": KwInterface,
 	"map":       KwMap,
-	"mut":       KwMut,
 	"mutex":     KwMutex,
 	"new":       KwNew,
 	"nil":       KwNil,
@@ -579,7 +574,6 @@ func (l *Lexer) scanOp(start Pos) Token {
 		{'|', '|', LOr, "||"},
 		{'<', '<', Shl, "<<"},
 		{'>', '>', Shr, ">>"},
-		{'<', '-', Arrow, "<-"},
 		{'+', '+', Inc, "++"},
 		{'-', '-', Dec, "--"},
 		{'+', '=', PlusAssign, "+="},
@@ -668,6 +662,19 @@ func (l *Lexer) skipWhitespaceAndComments() bool {
 		case '\n':
 			saw = true
 			l.advance()
+		case '#':
+			// `#` line comment to end of line. Enables shell-style
+			// comments and, on line 1, a `#!/usr/bin/env volt` shebang
+			// (so a volt file can be chmod +x and run directly).
+			start := l.posHere()
+			startByte := l.pos
+			for l.pos < len(l.src) && l.src[l.pos] != '\n' {
+				l.advance()
+			}
+			l.comments = append(l.comments, Comment{
+				Pos:  start,
+				Text: string(l.src[startByte:l.pos]),
+			})
 		case '/':
 			if l.pos+1 < len(l.src) && l.src[l.pos+1] == '/' {
 				// line comment to end of line

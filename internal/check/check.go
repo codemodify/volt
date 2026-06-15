@@ -156,9 +156,9 @@ type state struct {
 	// SOURCE var's name so the source's borrowedBy / sharedBorrowCount
 	// can be updated if the borrow var goes out of scope.
 	borrowSource string
-	// C8 phase 4: true if this symbol is itself a `&mut T` (vs `&T`).
-	// Used by checkBlock to know which side of the borrow accounting
-	// to decrement at block end.
+	// C8 phase 4: true if this symbol is itself a write borrow (`*T`, vs
+	// a shared `&T`). Used by checkBlock to know which side of the borrow
+	// accounting to decrement at block end.
 	borrowIsMut bool
 	// C8 phase 6 (cross-statement alias): true if this borrow inherited
 	// its source from another borrow variable via `var b2 = b1`. The
@@ -166,6 +166,16 @@ type state struct {
 	// alias (the original `b1` already owns the slot), so end-of-block
 	// must NOT decrement either.
 	borrowIsAlias bool
+	// C8 phase 7 (disjoint field borrows): per-field borrow accounting on
+	// the SOURCE var. `&s.x` and `&s.y` (into `*T`) are allowed simultaneously
+	// (distinct fields don't alias); a conflict only arises on the SAME
+	// field, or against a whole-`s` borrow. Keyed by field name.
+	mutBorrowedFields    map[string]ast.Node
+	sharedBorrowedFields map[string]int
+	// borrowField records WHICH field-path this borrow var holds on its
+	// source ("" = whole var or an index borrow, which stay conservative).
+	// Used at end-of-block to release the right per-field slot.
+	borrowField string
 }
 
 // cloneSyms returns an independent copy of the ownership state.
@@ -206,10 +216,10 @@ func mergeSyms(dst, a, b map[string]*state) {
 func (c *Checker) checkFunc(fd *ast.FuncDecl) {
 	syms := make(map[string]*state)
 	for _, p := range fd.Params {
-		syms[p.Name] = &state{movable: isMovableType(p.Type), isParam: true, typ: p.Type}
+		syms[p.Name] = &state{movable: c.isMovableType(p.Type), isParam: true, typ: p.Type}
 	}
 	if fd.Receiver != nil {
-		syms[fd.Receiver.Name] = &state{movable: isMovableType(fd.Receiver.Type), isParam: true, typ: fd.Receiver.Type}
+		syms[fd.Receiver.Name] = &state{movable: c.isMovableType(fd.Receiver.Type), isParam: true, typ: fd.Receiver.Type}
 	}
 	if fd.Body == nil {
 		return
@@ -224,6 +234,10 @@ func (c *Checker) checkFunc(fd *ast.FuncDecl) {
 	// Channel multiplicity contracts (chanOROW / chanORMW / chanMROW /
 	// chanMRMW) — counted at the declaring scope by walking endpoints.
 	c.checkChanContracts(fd)
+	// #7 stage 1: reject provable single-threaded unbuffered-channel
+	// deadlocks at compile time (the sound, no-false-reject half of the
+	// hybrid model; the runtime all-blocked backstop is stage 2).
+	c.checkChanDeadlocks(fd)
 }
 
 // reportUnusedSince flags every variable that was declared inside the
@@ -264,6 +278,21 @@ func (c *Checker) checkBlock(b *ast.Block, syms map[string]*state) {
 	for _, s := range b.Stmts {
 		c.checkStmt(s, syms)
 	}
+	// Record end-of-scope move-state on each block-local's declaration, so
+	// codegen can precisely suppress its scope-end free (the foundation for
+	// safe recursive reclamation — this is the checker's type-aware move
+	// state, which knows movable-vs-Copy field extracts). Runs before the
+	// borrow-release loop below clears block-local entries.
+	for name, st := range syms {
+		if entry[name] {
+			continue
+		}
+		if st.moved != nil {
+			if vs, ok := st.decl.(*ast.VarStmt); ok {
+				vs.MovedAtEnd = true
+			}
+		}
+	}
 	c.reportUnusedSince(syms, entry)
 	// C8 phase 3 block-scoped borrow release: any held-borrow declared
 	// inside this block goes out of scope at `}`. Clear the borrowedBy
@@ -286,7 +315,18 @@ func (c *Checker) checkBlock(b *ast.Block, syms map[string]*state) {
 			continue
 		}
 		if src, ok := syms[st.borrowSource]; ok {
-			if st.borrowIsMut {
+			if st.borrowField != "" {
+				// C8 phase 7: release the per-field slot, not the whole var.
+				if st.borrowIsMut {
+					if src.mutBorrowedFields != nil && src.mutBorrowedFields[st.borrowField] == st.decl {
+						delete(src.mutBorrowedFields, st.borrowField)
+					}
+				} else {
+					if src.sharedBorrowedFields != nil && src.sharedBorrowedFields[st.borrowField] > 0 {
+						src.sharedBorrowedFields[st.borrowField]--
+					}
+				}
+			} else if st.borrowIsMut {
 				// Clear the mutable borrow flag if THIS borrow was the
 				// active one (defensive against re-assignment).
 				if src.borrowedBy == st.decl {
@@ -314,14 +354,24 @@ func (c *Checker) checkStmt(s ast.Stmt, syms map[string]*state) {
 		if _, ok := s.Value.(*ast.NewExpr); ok {
 			isHeap = true
 		}
-		// C8 phase 3+4: when the RHS is `&x` (shared) or `&mut x`
-		// (exclusive), the declared var is a held borrow. Apply the
-		// alias rules:
-		//   - `&x`: allowed if NO mut borrow active (sharedBorrowCount can be > 0)
-		//   - `&mut x`: allowed only if sharedBorrowCount == 0 AND no mut borrow active
+		// A pointer bound from a CALL result is an OWNED value, never a
+		// borrow into THIS function's frame: if the callee returned a
+		// dangling `&local`, the callee itself would have been rejected by
+		// this same check. So returning it later is safe — mark heap so the
+		// return-lifetime check doesn't false-positive on e.g.
+		// `var st *ExitStatus = c.Start(...); ret …, st`.
+		if _, ok := s.Value.(*ast.CallExpr); ok {
+			isHeap = true
+		}
+		// C8 phase 3+4: when the RHS is `&x`, the declared var is a held
+		// borrow. The binding type decides which: `&T` is a shared read
+		// borrow, `*T` the exclusive write borrow. Apply the alias rules:
+		//   - into `&T`: allowed if NO write borrow active (sharedBorrowCount can be > 0)
+		//   - into `*T`: allowed only if sharedBorrowCount == 0 AND no write borrow active
 		borrowSource := ""
 		borrowIsMut := false
 		borrowIsAlias := false
+		borrowField := "" // C8 phase 7: field-path for `&s.field` (write borrow)
 		// C8 phase 6 (cross-statement borrow alias): when the RHS is a
 		// plain identifier that names ANOTHER borrow variable, propagate
 		// the source-tracking metadata so end-of-block cleanup still
@@ -334,23 +384,23 @@ func (c *Checker) checkStmt(s ast.Stmt, syms map[string]*state) {
 				borrowIsAlias = true
 			}
 		}
-		// C8 reborrow: `var b2 &mut T = &mut *b1` / `&*b1`. Taking the
+		// C8 reborrow: `var b2 *T = &*b1` / `var b2 &T = &*b1`. Taking the
 		// address of a deref of an existing borrow produces a new borrow
 		// that shares b1's underlying storage. Rules:
-		//   - `&mut *b1` requires b1 to be `&mut` (can't get exclusive
-		//     access through a shared borrow).
+		//   - a `*T` (write) reborrow requires b1 to be a write borrow
+		//     (can't get exclusive access through a shared borrow).
 		//   - `&*b1` is always allowed (a shared reborrow; downgrade OK).
 		// The reborrow inherits b1's ultimate source and is marked as an
 		// alias so end-of-block cleanup doesn't double-count the source's
 		// borrow slot.
-		if un, ok := s.Value.(*ast.UnaryExpr); ok && (un.Op == "&" || un.Op == "&mut") {
+		if un, ok := s.Value.(*ast.UnaryExpr); ok && un.Op == "&" {
 			if deref, ok := un.X.(*ast.UnaryExpr); ok && deref.Op == "*" {
-				wantMut := un.Op == "&mut"
+				wantMut := isPointerType(s.Type)
 				if bid, ok := deref.X.(*ast.IdentExpr); ok {
 					if bsym, ok := syms[bid.Name]; ok && bsym.borrowSource != "" {
 						if wantMut && !bsym.borrowIsMut {
 							c.errs = append(c.errs, fmt.Sprintf(
-								"%s: cannot reborrow `&mut *%s` — %q is a shared borrow (`&T`); exclusive access can't be obtained through it",
+								"%s: cannot reborrow `*%s` as a write borrow — %q is a shared borrow (`&T`); exclusive access can't be obtained through it",
 								s.Pos(), bid.Name, bid.Name))
 						}
 						borrowSource = bsym.borrowSource
@@ -359,7 +409,7 @@ func (c *Checker) checkStmt(s ast.Stmt, syms map[string]*state) {
 					}
 				}
 				syms[s.Name] = &state{
-					movable:       isMovableType(s.Type),
+					movable:       c.isMovableType(s.Type),
 					typ:           s.Type,
 					decl:          s,
 					heap:          isHeap,
@@ -370,44 +420,93 @@ func (c *Checker) checkStmt(s ast.Stmt, syms map[string]*state) {
 				return
 			}
 		}
-		if un, ok := s.Value.(*ast.UnaryExpr); ok && (un.Op == "&" || un.Op == "&mut") {
-			isMut := un.Op == "&mut"
-			// Source can be a bare ident (`&mut x`) OR a partial borrow
-			// (`&mut s.field` / `&mut a[i]`). For partial borrows the
-			// borrow conservatively ties to the ROOT container — borrowing
-			// any part of s freezes all of s for the borrow's lifetime.
+		if un, ok := s.Value.(*ast.UnaryExpr); ok && un.Op == "&" {
+			isMut := isPointerType(s.Type)
+			// Source can be a bare ident (`&x`), a DIRECT struct-field
+			// partial borrow (`&s.field` — tracked per field so
+			// disjoint fields can be borrowed at once), or another partial
+			// shape (`&a[i]`, nested `s.a.b`) which stays conservative
+			// (ties to the whole root container).
 			srcName := ""
+			fieldPath := "" // non-empty only for `&s.field` (direct field)
 			if id, ok := un.X.(*ast.IdentExpr); ok {
 				srcName = id.Name
-			} else {
-				switch un.X.(type) {
-				case *ast.SelectorExpr, *ast.IndexExpr:
-					if root, ok := rootIdent(un.X); ok {
-						srcName = root
-					}
+			} else if sel, ok := un.X.(*ast.SelectorExpr); ok {
+				if rid, ok := sel.X.(*ast.IdentExpr); ok {
+					srcName = rid.Name
+					fieldPath = sel.Sel // direct field → disjoint-eligible
+				} else if root, ok := rootIdent(un.X); ok {
+					srcName = root // nested chain → conservative whole-var
+				}
+			} else if _, ok := un.X.(*ast.IndexExpr); ok {
+				if root, ok := rootIdent(un.X); ok {
+					srcName = root // index → conservative whole-var
 				}
 			}
 			if srcName != "" {
 				if src, ok := syms[srcName]; ok {
-					if isMut {
+					if fieldPath != "" {
+						// Disjoint field borrow path.
+						if src.mutBorrowedFields == nil {
+							src.mutBorrowedFields = map[string]ast.Node{}
+							src.sharedBorrowedFields = map[string]int{}
+						}
+						conflict := ""
+						if src.borrowedBy != nil {
+							conflict = fmt.Sprintf("the whole of %q is mutably borrowed (first at %s)", srcName, src.borrowedBy.Pos())
+						} else if src.sharedBorrowCount > 0 {
+							conflict = fmt.Sprintf("the whole of %q has %d shared borrow(s) active", srcName, src.sharedBorrowCount)
+						} else if prev := src.mutBorrowedFields[fieldPath]; prev != nil {
+							conflict = fmt.Sprintf("field %q is already mutably borrowed (first at %s)", srcName+"."+fieldPath, prev.Pos())
+						} else if isMut && src.sharedBorrowedFields[fieldPath] > 0 {
+							conflict = fmt.Sprintf("field %q has a shared borrow active", srcName+"."+fieldPath)
+						} else if !isMut && src.mutBorrowedFields[fieldPath] != nil {
+							conflict = fmt.Sprintf("field %q is mutably borrowed", srcName+"."+fieldPath)
+						}
+						if conflict != "" {
+							c.errs = append(c.errs, fmt.Sprintf(
+								"%s: cannot take `&%s.%s` — %s",
+								s.Pos(), srcName, fieldPath, conflict))
+						} else {
+							if isMut {
+								src.mutBorrowedFields[fieldPath] = s
+							} else {
+								src.sharedBorrowedFields[fieldPath]++
+							}
+							borrowSource = srcName
+							borrowIsMut = isMut
+							borrowField = fieldPath
+						}
+					} else if isMut {
+						// Whole-var mutable borrow: conflicts with ANY
+						// existing borrow, including individual field borrows.
 						if src.borrowedBy != nil {
 							c.errs = append(c.errs, fmt.Sprintf(
-								"%s: cannot take `&mut %s` — another mutable borrow is still active (first at %s)",
+								"%s: cannot take `&%s` as a write borrow — another write borrow is still active (first at %s)",
 								s.Pos(), srcName, src.borrowedBy.Pos()))
 						} else if src.sharedBorrowCount > 0 {
 							c.errs = append(c.errs, fmt.Sprintf(
-								"%s: cannot take `&mut %s` — %d shared borrow(s) are still active (mutable + shared borrows are mutually exclusive)",
+								"%s: cannot take `&%s` as a write borrow — %d shared borrow(s) are still active (write + shared borrows are mutually exclusive)",
 								s.Pos(), srcName, src.sharedBorrowCount))
+						} else if n := len(src.mutBorrowedFields) + nonzeroCount(src.sharedBorrowedFields); n > 0 {
+							c.errs = append(c.errs, fmt.Sprintf(
+								"%s: cannot take `&%s` as a write borrow — %d of its field(s) are still borrowed",
+								s.Pos(), srcName, n))
 						} else {
 							src.borrowedBy = s
 							borrowSource = srcName
 							borrowIsMut = true
 						}
 					} else {
+						// Whole-var shared borrow.
 						if src.borrowedBy != nil {
 							c.errs = append(c.errs, fmt.Sprintf(
-								"%s: cannot take `&%s` — a mutable borrow is still active (first at %s); shared and mutable borrows are mutually exclusive",
+								"%s: cannot take `&%s` — a write borrow (`*T`) is still active (first at %s); shared and write borrows are mutually exclusive",
 								s.Pos(), srcName, src.borrowedBy.Pos()))
+						} else if len(src.mutBorrowedFields) > 0 {
+							c.errs = append(c.errs, fmt.Sprintf(
+								"%s: cannot take `&%s` — %d of its field(s) are mutably borrowed",
+								s.Pos(), srcName, len(src.mutBorrowedFields)))
 						} else {
 							src.sharedBorrowCount++
 							borrowSource = srcName
@@ -418,13 +517,14 @@ func (c *Checker) checkStmt(s ast.Stmt, syms map[string]*state) {
 			}
 		}
 		syms[s.Name] = &state{
-			movable:       isMovableType(s.Type),
+			movable:       c.isMovableType(s.Type),
 			typ:           s.Type,
 			decl:          s,
 			heap:          isHeap,
 			borrowSource:  borrowSource,
 			borrowIsMut:   borrowIsMut,
 			borrowIsAlias: borrowIsAlias,
+			borrowField:   borrowField,
 		}
 	case *ast.AssignStmt:
 		// LHS reads happen BEFORE the RHS evaluation's side effects
@@ -447,17 +547,30 @@ func (c *Checker) checkStmt(s ast.Stmt, syms map[string]*state) {
 		}
 		c.checkExprUse(s.RHS, syms)
 		c.maybeMoveBareIdent(s.RHS, s, syms)
+		// move-on-insert: `s = append(s, v)` consumes the element values.
+		// Scoped to append — general by-value consumption of an assignment-
+		// RHS call arg is intentionally NOT done, so a string passed to a
+		// read-only stdlib call (`n = strings.Count(s, sub)`) stays reusable
+		// (strings are immutable: passing one shares, it doesn't hand over).
+		if call, ok := s.RHS.(*ast.CallExpr); ok {
+			c.moveOnInsert(call, syms)
+		}
 		if id, ok := s.LHS.(*ast.IdentExpr); ok {
 			if st, ok := syms[id.Name]; ok {
+				// Reassigning `x` gives it a fresh value, so it's valid again
+				// even if the RHS just consumed it — the `s = f(s)` /
+				// `s = append(s, …)` transform-and-reassign idiom. (Any
+				// use-after-move WITHIN the RHS was already caught above.)
+				st.moved = nil
 				// C8 phase 5: reject `x = v` when x has an active
 				// borrow. Mutating the borrow source while a borrow is
 				// held would invalidate the borrow's view (or, with
-				// &mut, alias the unique reference). Rust-style strict
+				// a `*T` write borrow, alias the unique reference). Strict
 				// rule: source becomes effectively frozen for the
 				// borrow's lifetime.
 				if st.borrowedBy != nil {
 					c.errs = append(c.errs, fmt.Sprintf(
-						"%s: cannot mutate %q — a `&mut` borrow is still active (first at %s); the source is frozen until the borrow ends",
+						"%s: cannot mutate %q — a write borrow (`*T`) is still active (first at %s); the source is frozen until the borrow ends",
 						s.Pos(), id.Name, st.borrowedBy.Pos()))
 				} else if st.sharedBorrowCount > 0 {
 					c.errs = append(c.errs, fmt.Sprintf(
@@ -481,20 +594,37 @@ func (c *Checker) checkStmt(s ast.Stmt, syms map[string]*state) {
 			if !isBorrowOrPointer(c.curResults[i]) {
 				continue
 			}
+			// `ret &x` / `ret &s.field` / `ret &a[i]` — returning the address
+			// of anything in THIS frame escapes a borrow; always rejected (a
+			// value you keep comes from `new`, never from `&`).
+			if un, ok := v.(*ast.UnaryExpr); ok && un.Op == "&" {
+				c.errs = append(c.errs, fmt.Sprintf(
+					"%s: cannot return a borrow (`&…`) — it points into this call and would dangle; return a value (move) or a copy (`.Clone()`)",
+					v.Pos()))
+				continue
+			}
 			id, ok := v.(*ast.IdentExpr)
 			if !ok {
 				continue
 			}
 			st, ok := syms[id.Name]
-			if !ok || st.isParam {
-				continue // unknown or a parameter — assume OK
+			if !ok {
+				continue // unknown — assume OK
 			}
 			if st.heap {
-				continue // pointer came from `new` — heap-backed, safe to return
+				continue // came from `new`/a call — an owned value, safe to return
+			}
+			// A borrow (peek/loan) may not leave the call that holds it
+			// ("values own, borrows visit"). This includes a borrow PARAMETER:
+			// the caller's value might die before the returned borrow is used,
+			// so the safe, lifetime-free rule is simply "borrows don't escape".
+			who := "local"
+			if st.isParam {
+				who = "borrowed parameter"
 			}
 			c.errs = append(c.errs, fmt.Sprintf(
-				"%s: cannot return read/write access to local %q — it would outlive the value it points at",
-				v.Pos(), id.Name))
+				"%s: cannot return %s %q — a borrow (`&T`/`*T`) can't outlive its call; return a value, or a copy (`.Clone()`)",
+				v.Pos(), who, id.Name))
 		}
 		// Returning a value can be a move; but our return values are i64
 		// for now (no string returns), so not actionable yet.
@@ -534,6 +664,34 @@ func (c *Checker) checkStmt(s ast.Stmt, syms map[string]*state) {
 				}
 			}
 		}
+	case *ast.SwitchStmt:
+		// A switch is an if/else chain over Tag: the tag is evaluated
+		// once, then exactly one case body (or default) runs. Mirror the
+		// IfStmt branch-join — every case sees a clone of the pre-switch
+		// state, and a variable is considered moved after the switch if
+		// it was moved in *any* case (conservative). Walking the bodies
+		// is also what makes a use inside a case count toward both move
+		// tracking and the "declared but not used" diagnostic; before
+		// this case existed, switch statements were skipped entirely.
+		if s.Tag != nil {
+			c.checkExprUse(s.Tag, syms)
+		}
+		acc := cloneSyms(syms) // the implicit "no case matched" path
+		for _, cc := range s.Cases {
+			if cc == nil {
+				continue
+			}
+			// Case match expressions are evaluated in the outer scope.
+			for _, v := range cc.Vals {
+				c.checkExprUse(v, syms)
+			}
+			caseSyms := cloneSyms(syms)
+			for _, st := range cc.Stmts {
+				c.checkStmt(st, caseSyms)
+			}
+			mergeSyms(acc, acc, caseSyms)
+		}
+		mergeSyms(syms, syms, acc)
 	case *ast.ForStmt:
 		// Loop body executes 0+ times. Treat as a branch: clone state,
 		// check the body, then merge back. A move inside the loop must
@@ -574,10 +732,6 @@ func (c *Checker) checkStmt(s ast.Stmt, syms map[string]*state) {
 			c.checkExprUse(s.Call, syms)
 			c.checkRun(s, syms)
 		}
-	case *ast.SendStmt:
-		c.checkExprUse(s.Channel, syms)
-		c.checkExprUse(s.Value, syms)
-		c.maybeMoveBareIdent(s.Value, s, syms)
 	case *ast.SelectStmt:
 		for _, cs := range s.Cases {
 			if cs == nil {
@@ -719,7 +873,7 @@ func (c *Checker) checkExprUse(e ast.Expr, syms map[string]*state) {
 		// so refs to them don't hit our outer entries.
 		child := cloneSyms(syms)
 		for _, p := range ex.Params {
-			child[p.Name] = &state{movable: isMovableType(p.Type), isParam: true, typ: p.Type}
+			child[p.Name] = &state{movable: c.isMovableType(p.Type), isParam: true, typ: p.Type}
 		}
 		if ex.Body != nil {
 			c.checkBlock(ex.Body, child)
@@ -740,9 +894,33 @@ func (c *Checker) checkExprUse(e ast.Expr, syms map[string]*state) {
 //  2. Aliasing-XOR-mutation: within a single call's args, if the same source
 //     variable is borrowed multiple times AND at least one borrow is mutable
 //     (`*T`), it's a borrow-check error.
+// moveOnInsert handles `append(s, v…)`: each ELEMENT value (args after the
+// slice at index 0) is handed INTO the slice, so a movable element passed by
+// value is consumed — using it after it lives in the slice would alias the
+// slice's storage. Only bare movable idents are consumed; a Copy element
+// (int/bool/…) duplicates, and a field/index element stays conservative.
+// No-op for any call that isn't `append`.
+func (c *Checker) moveOnInsert(call *ast.CallExpr, syms map[string]*state) {
+	id, ok := call.Fun.(*ast.IdentExpr)
+	if !ok || id.Name != "append" {
+		return
+	}
+	for i := 1; i < len(call.Args); i++ {
+		if a, ok := call.Args[i].(*ast.IdentExpr); ok {
+			if st, ok := syms[a.Name]; ok && st.movable && st.moved == nil {
+				st.moved = call
+			}
+		}
+	}
+}
+
 func (c *Checker) checkCallMoves(call *ast.CallExpr, syms map[string]*state) {
 	switch fn := call.Fun.(type) {
 	case *ast.IdentExpr:
+		if fn.Name == "append" {
+			c.moveOnInsert(call, syms)
+			return
+		}
 		if sig := c.funcs[fn.Name]; sig != nil {
 			c.checkCallArgs(call, sig, syms, true)
 		}
@@ -776,7 +954,7 @@ func (c *Checker) checkCallMoves(call *ast.CallExpr, syms map[string]*state) {
 // callee signature is `sig`. When trackMoves is true, movable-typed
 // by-value args mark their source (or root container) as moved; methods
 // pass false since a method argument doesn't transfer ownership of the
-// caller's aggregate. The `&`/`&mut` borrow-lifetime check and the
+// caller's aggregate. The `&` borrow-lifetime check and the
 // intra-call aliasing-XOR-mutation check run regardless.
 func (c *Checker) checkCallArgs(call *ast.CallExpr, sig *ast.FuncDecl, syms map[string]*state, trackMoves bool) {
 	type borrowInfo struct {
@@ -793,29 +971,29 @@ func (c *Checker) checkCallArgs(call *ast.CallExpr, sig *ast.FuncDecl, syms map[
 		argId, isIdent := arg.(*ast.IdentExpr)
 
 		// C8 phase 4+5: cross-function borrow tracking. When the arg is
-		// `&x` / `&mut x` (UnaryExpr), check the source's existing
-		// borrow state — passing &mut into a function that already has
-		// a borrow elsewhere conflicts the same as `var b = &mut x`
-		// would. The borrow is "live for the duration of the call" so
-		// any pre-existing borrow on the source rejects the call.
-		if un, ok := arg.(*ast.UnaryExpr); ok && (un.Op == "&" || un.Op == "&mut") {
-			isMut := un.Op == "&mut"
+		// `&x` (UnaryExpr), check the source's existing borrow state —
+		// passing a write borrow into a function that already has a
+		// borrow elsewhere conflicts the same as `var b *T = &x` would.
+		// The borrow is "live for the duration of the call" so any
+		// pre-existing borrow on the source rejects the call.
+		if un, ok := arg.(*ast.UnaryExpr); ok && un.Op == "&" {
+			isMut := isPointerType(paramType)
 			if srcId, ok := un.X.(*ast.IdentExpr); ok {
 				if src, ok := syms[srcId.Name]; ok {
 					if isMut {
 						if src.borrowedBy != nil {
 							c.errs = append(c.errs, fmt.Sprintf(
-								"%s: cannot pass `&mut %s` to %s — another mutable borrow is still active (first at %s)",
+								"%s: cannot pass `&%s` as a write borrow to %s — another write borrow is still active (first at %s)",
 								arg.Pos(), srcId.Name, fnLabel(call.Fun), src.borrowedBy.Pos()))
 						} else if src.sharedBorrowCount > 0 {
 							c.errs = append(c.errs, fmt.Sprintf(
-								"%s: cannot pass `&mut %s` to %s — %d shared borrow(s) are still active",
+								"%s: cannot pass `&%s` as a write borrow to %s — %d shared borrow(s) are still active",
 								arg.Pos(), srcId.Name, fnLabel(call.Fun), src.sharedBorrowCount))
 						}
 					} else {
 						if src.borrowedBy != nil {
 							c.errs = append(c.errs, fmt.Sprintf(
-								"%s: cannot pass `&%s` to %s — a mutable borrow is still active (first at %s)",
+								"%s: cannot pass `&%s` to %s — a write borrow (`*T`) is still active (first at %s)",
 								arg.Pos(), srcId.Name, fnLabel(call.Fun), src.borrowedBy.Pos()))
 						}
 					}
@@ -828,30 +1006,30 @@ func (c *Checker) checkCallArgs(call *ast.CallExpr, sig *ast.FuncDecl, syms map[
 
 		switch {
 		case isBorrowType(paramType):
-			// C8 phase 4: respect the `&mut T` flag.
-			isMut := false
-			if bt, ok := paramType.(*ast.BorrowType); ok {
-				isMut = bt.Mut
-			}
+			// `&T` params are always shared, read-only borrows.
 			if isIdent {
-				borrows[argId.Name] = append(borrows[argId.Name], borrowInfo{mutable: isMut, node: arg})
+				borrows[argId.Name] = append(borrows[argId.Name], borrowInfo{mutable: false, node: arg})
 			}
 		case isPointerType(paramType):
 			if isIdent {
 				borrows[argId.Name] = append(borrows[argId.Name], borrowInfo{mutable: true, node: arg})
 			}
-		case isMovableType(paramType) && isIdent:
+		case c.isMovableType(paramType) && isIdent:
 			if trackMoves {
 				if st, ok := syms[argId.Name]; ok && st.movable && st.moved == nil {
 					st.moved = call
 				}
 			}
-		case isMovableType(paramType):
+		case c.isMovableType(paramType):
 			// Field/index access argument: consume(p.a) / consume(s[i]).
 			// Mark the root container as moved (conservative). Methods
 			// skip this — a method arg doesn't consume the caller's
-			// aggregate.
-			if trackMoves {
+			// aggregate. EXCEPTION: a field read THROUGH A POINTER
+			// (`ptr.field` or `sliceOfPtrs[i].field`) only borrows the
+			// field — the container owns pointers, not the pointed-to
+			// values, so the read doesn't consume it. (codegen's
+			// extractvalue copies the field header; it isn't freed here.)
+			if trackMoves && !c.argReadsThroughPointer(arg, syms) {
 				if root, ok := rootIdent(arg); ok {
 					if st, ok := syms[root]; ok && st.movable && st.moved == nil {
 						st.moved = call
@@ -882,14 +1060,14 @@ func (c *Checker) checkCallArgs(call *ast.CallExpr, sig *ast.FuncDecl, syms map[
 
 // checkMethodReceiverBorrow validates `obj.Method(...)` against obj's
 // active-borrow state. Calling a method borrows the receiver for the
-// call's duration — the same lifetime rule as passing `&obj` / `&mut
-// obj` to a free function. Works for both local and cross-package
-// methods (item 9: the method registry is populated from AddExternal).
+// call's duration — the same lifetime rule as passing `&obj` to a free
+// function. Works for both local and cross-package methods (item 9: the
+// method registry is populated from AddExternal).
 //
 // Rules, given obj's declared type T and the method's receiver:
-//   - mutating receiver (`*T` / `&mut T`): reject if ANY borrow of obj
-//     is active (a held `&mut` or one-or-more shared `&`).
-//   - shared receiver (`&T`): reject only if a `&mut` borrow is active.
+//   - write receiver (`*T`): reject if ANY borrow of obj is active
+//     (a held write borrow or one-or-more shared `&`).
+//   - shared receiver (`&T`): reject only if a write borrow is active.
 // A receiver-less value type (`T`, by-copy) borrows nothing → no check.
 // lookupMethod resolves method `name` on the type of `recvType`
 // (a NamedType or pointer/borrow to one). Returns nil if unknown.
@@ -912,15 +1090,11 @@ func (c *Checker) checkMethodReceiverBorrow(call *ast.CallExpr, sel *ast.Selecto
 	}
 	mutating := false
 	shared := false
-	switch rt := m.Receiver.Type.(type) {
+	switch m.Receiver.Type.(type) {
 	case *ast.PointerType:
 		mutating = true
 	case *ast.BorrowType:
-		if rt.Mut {
-			mutating = true
-		} else {
-			shared = true
-		}
+		shared = true
 	default:
 		// Value receiver (`fun (r T)`) — by-copy, borrows nothing.
 		return
@@ -928,7 +1102,7 @@ func (c *Checker) checkMethodReceiverBorrow(call *ast.CallExpr, sel *ast.Selecto
 	if mutating {
 		if recv.borrowedBy != nil {
 			c.errs = append(c.errs, fmt.Sprintf(
-				"%s: cannot call %s.%s — it needs write access to %q but a mutable borrow is still active (first at %s)",
+				"%s: cannot call %s.%s — it needs write access to %q but a write borrow (`*T`) is still active (first at %s)",
 				call.Pos(), recvName, sel.Sel, recvName, recv.borrowedBy.Pos()))
 		} else if recv.sharedBorrowCount > 0 {
 			c.errs = append(c.errs, fmt.Sprintf(
@@ -938,7 +1112,7 @@ func (c *Checker) checkMethodReceiverBorrow(call *ast.CallExpr, sel *ast.Selecto
 	} else if shared {
 		if recv.borrowedBy != nil {
 			c.errs = append(c.errs, fmt.Sprintf(
-				"%s: cannot call %s.%s — a mutable borrow of %q is still active (first at %s); shared and mutable access are mutually exclusive",
+				"%s: cannot call %s.%s — a write borrow (`*T`) of %q is still active (first at %s); shared and write access are mutually exclusive",
 				call.Pos(), recvName, sel.Sel, recvName, recv.borrowedBy.Pos()))
 		}
 	}
@@ -946,6 +1120,18 @@ func (c *Checker) checkMethodReceiverBorrow(call *ast.CallExpr, sel *ast.Selecto
 
 // namedTypeName extracts the bare type name from a NamedType or a
 // pointer/borrow to one (`T`, `*T`, `&T` → "T"). Empty otherwise.
+// nonzeroCount returns how many entries in `m` have a value > 0.
+// Used to count active per-field shared borrows.
+func nonzeroCount(m map[string]int) int {
+	n := 0
+	for _, v := range m {
+		if v > 0 {
+			n++
+		}
+	}
+	return n
+}
+
 func namedTypeName(t ast.Type) string {
 	switch tt := t.(type) {
 	case *ast.NamedType:
@@ -976,14 +1162,14 @@ func (c *Checker) checkBorrowWrite(lhs ast.Expr, syms map[string]*state) {
 		if !ok {
 			return
 		}
-		if bt, ok := st.typ.(*ast.BorrowType); ok && !bt.Mut {
+		if _, ok := st.typ.(*ast.BorrowType); ok {
 			c.errs = append(c.errs, fmt.Sprintf(
-				"%s: cannot write to %q — you only have shared read access (`&T`). Declare it as `&mut T` to mutate.",
+				"%s: cannot write to %q — you only have shared read access (`&T`). Declare it as `*T` to mutate.",
 				e.Pos(), e.Name))
 		}
 	case *ast.UnaryExpr:
 		// `*p = v` — write through a held borrow. Allowed only if p is
-		// `&mut T` (or a raw `*T` pointer). Shared `&T` rejected.
+		// `*T` (the write borrow). Shared `&T` rejected.
 		if e.Op != "*" {
 			return
 		}
@@ -995,9 +1181,9 @@ func (c *Checker) checkBorrowWrite(lhs ast.Expr, syms map[string]*state) {
 		if !ok {
 			return
 		}
-		if bt, ok := st.typ.(*ast.BorrowType); ok && !bt.Mut {
+		if _, ok := st.typ.(*ast.BorrowType); ok {
 			c.errs = append(c.errs, fmt.Sprintf(
-				"%s: cannot write through `*%s` — %q is a shared borrow (`&T`). Declare it as `&mut T` to allow writes.",
+				"%s: cannot write through `*%s` — %q is a shared borrow (`&T`). Declare it as `*T` to allow writes.",
 				e.Pos(), id.Name, id.Name))
 		}
 	case *ast.SelectorExpr:
@@ -1053,6 +1239,12 @@ func (c *Checker) maybeMoveBareIdent(rhs ast.Expr, at ast.Node, syms map[string]
 						return
 					}
 				}
+				// `s.field[k]` where field is a map-with-Copy-value or a
+				// slice-of-Copy-element — the read copies a scalar out and
+				// doesn't consume the struct (`v := st.m["k"]`, `st.xs[i]`).
+				if c.indexedFieldYieldsCopy(r, st.typ) {
+					return
+				}
 				st.moved = at
 			}
 		}
@@ -1067,6 +1259,12 @@ func (c *Checker) maybeMoveBareIdent(rhs ast.Expr, at ast.Node, syms map[string]
 				if c.fieldIsCopy(st.typ, r) {
 					return
 				}
+				// `slice[i].copyField` — reading a Copy scalar out of a
+				// value-element slice copies it without consuming the slice
+				// (the linked-list-via-ids walk: `cur = nodes[cur].next`).
+				if c.sliceElemFieldIsCopy(st.typ, r) {
+					return
+				}
 				st.moved = at
 			}
 		}
@@ -1077,6 +1275,37 @@ func (c *Checker) maybeMoveBareIdent(rhs ast.Expr, at ast.Node, syms map[string]
 			}
 		}
 	}
+}
+
+// argReadsThroughPointer reports whether a call argument is a field read
+// whose receiver is reached via a pointer indirection — `ptr.field` or
+// `sliceOfPtrs[i].field`. Reading a field through a pointer BORROWS that
+// field; it doesn't consume the container (which owns the pointers, not the
+// pointed-to values), so the root must not be marked moved. Without this,
+// e.g. `print(hits[k].name)` would spuriously consume the whole `hits`
+// slice on the first read.
+func (c *Checker) argReadsThroughPointer(arg ast.Expr, syms map[string]*state) bool {
+	sel, ok := arg.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	switch x := sel.X.(type) {
+	case *ast.IdentExpr:
+		// `ptr.field` — ptr is a `*T` variable.
+		if st, ok := syms[x.Name]; ok {
+			return isPointerType(st.typ)
+		}
+	case *ast.IndexExpr:
+		// `sliceOfPtrs[i].field` — the slice element type is `*T`.
+		if root, ok := rootIdent(x.X); ok {
+			if st, ok := syms[root]; ok {
+				if sl, ok := st.typ.(*ast.SliceType); ok {
+					return isPointerType(sl.Elem)
+				}
+			}
+		}
+	}
+	return false
 }
 
 // fieldIsCopy returns true iff the SelectorExpr reads a field of a
@@ -1107,6 +1336,73 @@ func (c *Checker) fieldIsCopy(rootType ast.Type, sel *ast.SelectorExpr) bool {
 		}
 		nt, ok := f.Type.(*ast.NamedType)
 		return ok && isCopyPrimitive(nt.Name)
+	}
+	return false
+}
+
+// sliceElemFieldIsCopy reports whether `sel` is `s[i].field` where `s` is a
+// slice of VALUE structs (`[]T`, not `[]*T`) and `field` is a Copy primitive.
+// Reading such a field copies a scalar out and consumes nothing, so the slice
+// root must not be marked moved. rootType is the slice's declared type.
+func (c *Checker) sliceElemFieldIsCopy(rootType ast.Type, sel *ast.SelectorExpr) bool {
+	if _, ok := sel.X.(*ast.IndexExpr); !ok {
+		return false
+	}
+	slt, ok := rootType.(*ast.SliceType)
+	if !ok {
+		return false
+	}
+	nt, ok := slt.Elem.(*ast.NamedType)
+	if !ok {
+		return false
+	}
+	st, ok := c.structs[nt.Name]
+	if !ok {
+		return false
+	}
+	for _, f := range st.Fields {
+		if f.Name == sel.Sel {
+			ft, ok := f.Type.(*ast.NamedType)
+			return ok && isCopyPrimitive(ft.Name)
+		}
+	}
+	return false
+}
+
+// indexedFieldYieldsCopy reports whether `idx` is `root.field[k]` where the
+// struct field is a map with a Copy-primitive VALUE or a slice with a Copy
+// ELEMENT — reading it copies a scalar out and consumes nothing, so the root
+// struct must not be marked moved. rootType is the root ident's type; only the
+// direct `root.field[k]` shape is handled (nested chains stay conservative).
+func (c *Checker) indexedFieldYieldsCopy(idx *ast.IndexExpr, rootType ast.Type) bool {
+	sel, ok := idx.X.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	if _, ok := sel.X.(*ast.IdentExpr); !ok {
+		return false
+	}
+	structName := bareStructName(rootType)
+	if structName == "" {
+		return false
+	}
+	st, ok := c.structs[structName]
+	if !ok {
+		return false
+	}
+	for _, f := range st.Fields {
+		if f.Name != sel.Sel {
+			continue
+		}
+		switch ft := f.Type.(type) {
+		case *ast.MapType:
+			nt, ok := ft.Value.(*ast.NamedType)
+			return ok && isCopyPrimitive(nt.Name)
+		case *ast.SliceType:
+			nt, ok := ft.Elem.(*ast.NamedType)
+			return ok && isCopyPrimitive(nt.Name)
+		}
+		return false
 	}
 	return false
 }
@@ -1189,17 +1485,85 @@ func rootIdent(e ast.Expr) (string, bool) {
 //   - chan T (reference-typed by design — copying yields another handle)
 //   - borrows &T / *T (not owned values)
 //   - interface-shaped types `error`, `any` (reference-typed, nilable)
-func isMovableType(t ast.Type) bool {
+// isMovableType reports whether a value of type t has MOVE semantics
+// (passing it by value transfers ownership). Movable: string, slices,
+// maps, and named structs that own a movable field. NOT movable (Copy):
+// the primitives in isCopyPrimitive AND — new in this pass — a struct
+// ALL of whose fields are themselves Copy. Such a struct owns no heap
+// backing, so copying it bit-for-bit is sound and reuse-after-pass is
+// safe; the old blanket "every named struct moves" was false
+// conservatism (it forced value-like structs such as Style/Rect to be
+// single-use after being handed to a function). Consulting c.structs
+// makes this a method.
+func (c *Checker) isMovableType(t ast.Type) bool {
 	if t == nil {
 		return false
 	}
 	switch tt := t.(type) {
 	case *ast.NamedType:
-		return !isCopyPrimitive(tt.Name)
+		if isCopyPrimitive(tt.Name) {
+			return false
+		}
+		// A struct whose fields are all Copy is itself Copy.
+		if c.structIsCopy(tt.Name, map[string]bool{}) {
+			return false
+		}
+		return true
 	case *ast.SliceType, *ast.MapType, *ast.StructType:
 		return true
 	}
 	return false
+}
+
+// structIsCopy reports whether typeName is a known struct whose fields
+// are ALL Copy (recursively). Unknown names / non-struct types are not
+// Copy. Recursive-by-value structs are rejected upstream, so the visited
+// set is only a guard against pathological input.
+func (c *Checker) structIsCopy(typeName string, visited map[string]bool) bool {
+	if visited[typeName] {
+		return true
+	}
+	st, ok := c.structs[typeName]
+	if !ok {
+		return false
+	}
+	// Copy and Drop are mutually exclusive (as in Rust): a type with a
+	// Drop method has resource-cleanup semantics, so bit-copying it and
+	// then dropping each copy would double-free / use-after-drop. The
+	// canonical case is os.File — all-Copy fields {fd, closed, pinned}
+	// but a Drop that closes the fd; it must keep MOVE semantics so the
+	// auto-close fires exactly once. c.methods carries both local and
+	// external (AddExternal) methods, so this catches imported types too.
+	if m := c.methods[typeName]; m != nil {
+		if _, hasDrop := m["Drop"]; hasDrop {
+			return false
+		}
+	}
+	visited[typeName] = true
+	for _, f := range st.Fields {
+		if !c.typeIsCopy(f.Type, visited) {
+			visited[typeName] = false
+			return false
+		}
+	}
+	visited[typeName] = false
+	return true
+}
+
+// typeIsCopy is the field-level Copy predicate used by structIsCopy: a
+// field is Copy iff it's a Copy primitive or another all-Copy struct.
+// Pointers, borrows, slices, maps, channels, and strings are NOT Copy
+// (a pointer/borrow owns or aliases heap storage — copying it would
+// double-own — so a struct containing one stays movable).
+func (c *Checker) typeIsCopy(t ast.Type, visited map[string]bool) bool {
+	nt, ok := t.(*ast.NamedType)
+	if !ok {
+		return false
+	}
+	if isCopyPrimitive(nt.Name) {
+		return true
+	}
+	return c.structIsCopy(nt.Name, visited)
 }
 
 // isSliceType reports whether t is a `[]T` slice type.

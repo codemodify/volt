@@ -16,10 +16,10 @@ ones, but each is independently runnable:
 | `0-intent.volt`      | One-page schematic of every type and concurrency primitive — the language's "what fits where" overview. |
 | `0-primitives.volt`  | Every built-in primitive: int{8,16,32,64}, uint{8,16,32,64}, byte, bool, string, slice, map, empty struct |
 | `1-allocation.volt`  | The `new` keyword: `new T {…}` / `new T {}` for structs, `new(cap) chan T` for channels, `new(cap) map[K]V {…}` for maps, `new(N) []T {…}` for slices. Size always comes immediately after `new`, before the type. Short form `new(…)` / `new {…}` allowed when LHS provides the type. |
-| `2-ownership.volt`   | The three forms of a value: `T` (owned), `&T` (read access — many readers OK), `*T` (write access — exclusive). Method dispatch on each. |
+| `2-ownership.volt`   | "Values own, borrows visit": `T` (you own it — `new T{}` makes a value), `&T` (a peek — read-only, many at once), `*T` (a loan to change it in place, only one). Borrows are visits — they never escape the call. Method dispatch on each. |
 | `3-concurrency.volt` | `run f()` launches a real OS thread; channels (unbuffered by default), direction (`chan read T` / `chan write T`), multiplicity contracts (`chan11`/`chan1N`/`chanN1`/`chanNN`), `select`, `mutex T`, `rwmutex T`, `atomic T`, `waitgroup`, `once`. |
-| `multi-return.volt`  | Multi-value return + `a, b := f()` short decl. The `(T, bool)` "maybe-absent" pattern that replaces `Option<T>`. |
-| `move.volt`          | Move semantics: passing `T` consumes it; use-after-move is a compile error. Read access (`&T`) or write access (`*T`) avoids the move. |
+| `multi-return.volt`  | Multi-value return + `a, b := f()` short decl. The `(T, bool)` "maybe-absent" pattern for returning a value plus whether it's present. |
+| `move.volt`          | Handing a value over: passing a hand-over type (string/slice/map/most structs) makes the original unusable — use-after-hand-over is a compile error; small/Copy values pass by copy instead. Passing a peek (`&T`) or a loan (`*T`) avoids handing it over. |
 | `errors.volt`        | The `(T, error)` pattern — multi-return; caller checks `err != nil` first, reads the value only when error is nil. |
 | `interfaces.volt`    | Structural interfaces — any type with matching methods satisfies. No `impl` keyword. |
 | `timers.volt`        | `time.Sleep(ns int)` and the duration unit constants `time.{Nanosecond, Microsecond, Millisecond, Second}` (compile-time integers). |

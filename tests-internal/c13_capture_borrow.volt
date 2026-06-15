@@ -12,12 +12,12 @@ import "log"
 
 fun main() int {
 	// 1. Basic read through captured borrow + mutation through the
-	// captured (mut) borrow is observable on the source. C8 phase 5
-	// freezes the source during the borrow's life — we mutate via
-	// the borrow itself rather than directly.
+	// captured write borrow (`*int`) is observable on the source. C8
+	// phase 5 freezes the source during the borrow's life — we mutate
+	// via the borrow itself rather than directly.
 	var x int = 5
 	{
-		var b &mut int = &mut x
+		var b *int = &x
 		var get fun() int = fun() int { ret *b }
 		var setX fun(int) = fun(v int) { *b = v }
 		if get() != 5 { ret 1 }
@@ -27,14 +27,14 @@ fun main() int {
 
 	// 3. Closure that writes through the borrow.
 	var p int = 0
-	var bp &mut int = &mut p
+	var bp *int = &p
 	var setNine fun() = fun() { *bp = 9 }
 	setNine()
 	if p != 9 { ret 3 }
 
 	// 4. Two closures sharing the same captured borrow.
 	var q int = 100
-	var bq &mut int = &mut q
+	var bq *int = &q
 	var getQ fun() int = fun() int { ret *bq }
 	var addToQ fun(int) = fun(d int) { *bq = *bq + d }
 	addToQ(50)
@@ -47,7 +47,7 @@ fun main() int {
 	// while bm is alive).
 	var m int = 7
 	{
-		var bm &mut int = &mut m
+		var bm *int = &m
 		var k int = 3
 		var add fun() int = fun() int { ret *bm + k }
 		var setM fun(int) = fun(v int) { *bm = v }

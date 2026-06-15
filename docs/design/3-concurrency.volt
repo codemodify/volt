@@ -31,7 +31,7 @@
 //   v, ok := read(ch)    — receive-or-closed (ok=false once drained+closed)
 //   close(ch)            — signal "no more sends"
 //
-// Only OWNED `T` values cross channels — borrows (&T, *T) cannot
+// Only OWNED `T` values cross channels — peeks (&T) and write/heap pointers (*T) cannot
 // cross threads.
 //
 //   volt run docs/design/3-concurrency.volt

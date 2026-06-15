@@ -188,9 +188,6 @@ func (c *Checker) walkChanUsesStmt(s ast.Stmt, contracts map[string]*chanCheck, 
 		if s.Call != nil {
 			c.handleCallArgs(s.Call, contracts, inLoop, true)
 		}
-	case *ast.SendStmt:
-		c.markAsWrite(s.Channel, contracts)
-		c.walkChanUsesExpr(s.Value, contracts, inLoop)
 	case *ast.SelectStmt:
 		for _, cs := range s.Cases {
 			if cs == nil {

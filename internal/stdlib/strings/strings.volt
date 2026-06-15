@@ -14,6 +14,7 @@ package strings
 import "bytes"
 import "errors"
 import "strconv"
+import "io"
 
 // ---- Scan operations -------------------------------------------------
 
@@ -5675,4 +5676,13 @@ fun JustifyCenter(s string, width int) string {
     b.WriteString(s)
     for i := 0; i < right; i++ { b.WriteByte(32) }
     ret b.String()
+}
+
+// NewReader wraps s as an io.Reader (one-shot: the first Read returns the
+// whole string, then "" = EOF). It returns the io.Reader interface rather
+// than a concrete `strings.Reader` because volt's type namespace is global
+// and `Reader` is io's interface — the concrete impl is io.StringReader.
+// Feed it anywhere an io.Reader is wanted (io.Copy, exec stdin, ...).
+fun NewReader(s string) io.Reader {
+    ret io.NewStringReader(s)
 }

@@ -1,14 +1,16 @@
 # volt — implementation status
 
-_Last updated: 2026-06-02 (pass 759). Branch: `dev`._
+_Last updated: 2026-06-03 (pass 764). Branch: `dev`._
 
 **volt** is a systems language with **Go-flavored syntax** and a **Rust-style
 ownership/borrow memory model**. It compiles to **LLVM IR**, targets **Linux
 amd64 + arm64**, and ships **no libc** — the runtime is a self-contained
 `runtime.c` + hand-written `_start` assembly.
 
-Health snapshot: **749 buildable regression programs**, **50 expected-negative
-(intentional compile-fail) tests**, **0 runtime crashes**.
+Health snapshot: **762 buildable regression programs**, **50 expected-negative
+(intentional compile-fail) tests**, **0 runtime crashes**, **719/719
+correctness-asserting tests** returning their success sentinel, and **`volt fmt`
+round-trips all 762 with 0 behavior changes**.
 
 ---
 
@@ -25,11 +27,18 @@ Health snapshot: **749 buildable regression programs**, **50 expected-negative
 
 ### Syntax / surface
 - `fun name(params) ret { ... }`; method receivers `fun (r *T) M()`.
-- Declarations: `var x T = v`, `x := v` (no spaces), `const`.
+- Declarations: `var x T = v`, `x := v` (no spaces), `const`; Go-style grouped
+  blocks `import ( … )` / `const ( … )` / `var ( … )` (`volt fmt` auto-groups
+  adjacent decls into aligned blocks).
 - Composite literals: `new {…}` (no size), `new(N) T {…}` (sized), `T{a: 1}`.
 - Control flow: `if/else`, `for` (C-style + `for k, v := range`), `switch`,
   `break`/`continue`, bare blocks `{ … }`, `ret`.
 - `def` (deferred calls), `import`, `package`.
+- Comments: `//` line, `/* … */` block, and `#` line (shell-style).
+- **Scriptable:** a `#!/usr/bin/env volt` shebang + `chmod +x` runs a file
+  directly; `volt <file|dir>` with no subcommand defaults to `run` (build to a
+  temp binary + execute, args forwarded); a single file that needs siblings
+  falls back to building its directory as a package.
 - Unary `&` / `&mut` / `*`; `i++` / `i--`.
 - Keywords: `atomic break case chan condvar const continue def default else
   false for fun if import interface map mut mutex new nil once package range
@@ -46,8 +55,9 @@ Health snapshot: **749 buildable regression programs**, **50 expected-negative
   - Block-scoped borrow release; source frozen for the borrow's lifetime.
   - Cross-function call-site lifetime tracking.
   - Cross-statement alias tracking (`var b2 = b1`).
-- **Reborrow:** `&mut *b`, `&*b`, `&mut s.field`, `&mut a[i]` (partial borrows;
-  conservative whole-container freeze).
+- **Reborrow:** `&mut *b`, `&*b`, `&mut s.field`, `&mut a[i]` (partial borrows).
+- **Disjoint field borrows:** `&mut s.x` and `&mut s.y` simultaneously
+  (per-field tracking); whole-`s` borrow while a field is live still rejected.
 - **Cross-package borrow checks:** free-function args, method **receivers**, and
   method **arguments**.
 - **C13 closure-capture escape proofs:** a closure capturing a borrow can't
@@ -113,7 +123,8 @@ Health snapshot: **749 buildable regression programs**, **50 expected-negative
 - mmap-backed bump + freelist allocator with iterative compaction; tunable
   per-arena chunk size; 12 size classes (16 B … 32 KiB) + mmap-direct huge.
 - futex-based mutex/condvar; `clone()`-based thread spawn; TCP sockets;
-  file I/O syscalls; argv/envp capture. **No TLS** (bare `_start`).
+  file I/O syscalls; argv/envp capture; per-thread TLS block (`arch_prctl`
+  on amd64 / `tpidr_el0` on arm64), set up per thread in `_start`/`volt_spawn`.
 
 ---
 
@@ -166,22 +177,41 @@ init/get/tidy/verify`.
 
 ## 5. Known issues
 
-- **Map-key lifetime bug (open, fix queued).** String-keyed maps with
-  loop-local heap keys (`var k = strconv.Itoa(x); m[k]=…` in a loop) corrupt
-  under A3 auto-free: the key buffer is freed while the map still references it,
-  then freelist-reused. Silently affects existing `slices.IntersectInt` /
-  `UnionInt` / `DifferenceInt` / `IsSetInt`. Proper fix = map insertion must
-  **copy** keys (and `volt_map_free` free them). New set-style helpers are
-  written map-free to avoid it.
+- **Slice-valued map leak (open).** `map[string][]T` values are heap-boxed and
+  not freed on delete/`map_free`, and clone is value-shallow for them. (String
+  values are now fully owned — see below.) Leak only, no corruption. Needs a
+  `value_kind=2` per-value drop + deep-copy.
+- **Transient string-temp leak (open).** Intermediate `strconv.Itoa(...)` /
+  concat temporaries that feed another call aren't always A3-freed. Bounded;
+  surfaced while measuring the map-value leak.
+
+### Recently fixed (pass 760–761)
+- **Map KEY lifetime bug — FIXED (760).** Maps copy + own keys; delete/free/
+  clone handle them (clone deep-copies). Cured silent wrong answers in
+  `slices.Intersect/Union/Difference/IsSet/SameMultiset` + `maps.*`.
+- **Map string-VALUE ownership — FIXED (761).** `map[string]string` now owns +
+  frees its boxed values (delete/free/overwrite); clone deep-copies; map-get
+  deep-copies so the map stays sole owner (fixes a double-free / use-after-free
+  where a read-out value aliased the map's backing).
+- **A3 drop-depth bug — FIXED (761).** A heap string/slice declared with a
+  non-heap initializer then built in a loop was freed every iteration (drop
+  bound to loop-body scope instead of declaration scope). Surfaced by the new
+  correctness harness via `strconv` pad functions.
+- **`os.Args()` / `os.GetenvOr()` — FIXED (761).** They called the
+  `os.Argc/ArgAt/Getenv` intrinsics intra-package and hit zero-returning stubs
+  (`os.Args()` silently returned an empty slice).
 
 ---
 
 ## 6. TODO — not yet implemented
 
 ### High priority (correctness)
-- **Fix the map-key lifetime bug** (§5) — map owns its keys.
-- **Audit stdlib** for the same `m[loop-local-key]` pattern; add
-  correctness (not just crash) tests for affected set operations.
+- **Slice-valued map ownership** (§5) — extend the string-value work (done) to
+  `map[string][]T` (`value_kind=2`: free `[]T` box+backing, clone deep-copy).
+- **Transient string-temp frees** (§5) — A3-free `strconv.Itoa`/concat
+  intermediates that feed another call.
+- _Done pass 761:_ correctness harness (`scripts/correctness.sh`, asserts the
+  `ret 42` sentinel across 713 tests) — already caught + fixed 2 codegen bugs.
 
 ### Borrow / ownership polish
 - **Disjoint field borrows** — `&mut s.x` currently freezes all of `s`;
@@ -193,8 +223,10 @@ init/get/tidy/verify`.
 ### Platform
 - **macOS port (D.3, READY)** — Darwin syscall ABI for amd64+arm64. Both
   `start_*.s` entry paths are currently parallel, lowering friction.
-- **TLS support** — minimal thread-local storage setup (`arch_prctl`) to unlock
-  per-thread state (e.g. precise per-thread memprofile line attribution).
+- _Done pass 761:_ **TLS** — per-thread storage via `arch_prctl(ARCH_SET_FS)`
+  (amd64) / `tpidr_el0` (arm64); the memprofile current-line is now exact
+  per-thread. amd64 verified; arm64 mirrored but untested on hardware. General
+  C `__thread` support could build on this if needed.
 
 ### Major architectural items (strategic)
 - **Async / lightweight tasks** — M:N scheduling on top of OS threads;

@@ -18,7 +18,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 
 	"github.com/codemodify/volt/internal/ast"
 	"github.com/codemodify/volt/internal/check"
@@ -65,6 +64,15 @@ func main() {
 	case "help", "--help", "-h":
 		usage()
 	default:
+		// No subcommand: if the first arg names an existing file or
+		// directory, default to `run` logic. This is what makes
+		// `volt path/to/script.volt` work, and — via a `#!/usr/bin/env
+		// volt` shebang — `./script.volt` run directly by the kernel.
+		if info, err := os.Stat(cmd); err == nil {
+			_ = info
+			runBuild(os.Args[1:], true)
+			return
+		}
 		fmt.Fprintf(os.Stderr, "volt: unknown command %q\n", cmd)
 		usage()
 		os.Exit(2)
@@ -159,10 +167,12 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "usage: volt <command> [args...]")
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "Build & run:")
-	fmt.Fprintln(os.Stderr, "  build [-g] [-strict] [-race] [--target arch] [--channels mutex|lockfree] <file>")
+	fmt.Fprintln(os.Stderr, "  build [-g] [-strict] [-race] [--target arch] <file>")
 	fmt.Fprintln(os.Stderr, "                                                compile to executable")
-	fmt.Fprintln(os.Stderr, "  run   [-g] [-strict] [-race] [--target arch] [--channels mutex|lockfree] <file>")
-	fmt.Fprintln(os.Stderr, "                                                build + execute")
+	fmt.Fprintln(os.Stderr, "  run   [-g] [-strict] [-race] [--target arch] <file|dir>")
+	fmt.Fprintln(os.Stderr, "                                                build (to temp) + execute")
+	fmt.Fprintln(os.Stderr, "  <file|dir> [args...]                          no command → defaults to `run`")
+	fmt.Fprintln(os.Stderr, "                                                (also lets `#!/usr/bin/env volt` scripts run directly)")
 	fmt.Fprintln(os.Stderr, "  test  <file>                                  build + run as a test")
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "Source tools:")
@@ -216,76 +226,73 @@ func parseSource(name string, src []byte) (*parsedUnit, error) {
 	return &parsedUnit{pkg: file.Package, name: name, file: file, imports: imps}, nil
 }
 
-// loadExternalPackage reads the source for a non-stdlib import path.
-// Looks first in the current module (./<path>/<lastseg>.volt) then in
-// the user package cache (~/.volt/pkg/<path>/<lastseg>.volt). Returns
-// (source, file-name-for-errors, err). When the import isn't found in
-// either location, the error message hints at `volt mod get`.
+// resolveExternalPackageDir locates the on-disk directory holding a
+// non-stdlib import path. Resolution order: a `replace` target in
+// volt.mod, then the local module (./<path>), then the user package
+// cache (~/.volt/pkg/<path>). The chosen directory must exist and contain
+// at least one .volt file; the caller then merges EVERY .volt file in it
+// (one folder = one package), so an imported library may span files with
+// arbitrary names. Returns (dir, err); on failure the message hints at
+// `volt mod get`.
 //
 // `replace` directive: if `./volt.mod` redirects the import path, the
-// lookup uses the redirect target (a literal directory) and skips the
-// cache + sum verification — replace points at code under development.
+// lookup uses the redirect target directory and skips cache + sum
+// verification — replace points at code under development.
 //
 // Cache-resolved packages get their content hash verified against any
-// matching entry in `./volt.sum`. Mismatches print a warning by default;
-// the `-strict` build flag escalates to a hard error.
-func loadExternalPackage(importPath string) ([]byte, string, error) {
-	last := importPath
-	if i := strings.LastIndex(importPath, "/"); i >= 0 {
-		last = importPath[i+1:]
-	}
-
-	// 0. Replace directive: if the project's volt.mod redirects this
-	// path, resolve against the target directory and skip cache/sum
-	// (a replace target is "trust me, use what's on disk").
+// matching entry in `./volt.sum` (HashPackageDir covers all files in the
+// directory). Mismatches print a warning by default; `-strict` escalates
+// to a hard error.
+func resolveExternalPackageDir(importPath string) (string, error) {
+	// 0. Replace directive: redirect to the target directory, skip sum.
 	if target := replaceTarget(importPath); target != "" {
-		for _, name := range []string{last + ".volt", importPath + ".volt"} {
-			c := filepath.Join(target, name)
-			if data, err := os.ReadFile(c); err == nil {
-				return data, c, nil
-			}
+		if dirHasVoltSource(target) {
+			return target, nil
 		}
-		return nil, "", fmt.Errorf(
+		return "", fmt.Errorf(
 			"volt: %q replaced to %q but no .volt source found there",
 			importPath, target)
 	}
 
-	// 1. Local module: relative to CWD.
-	localCandidates := []string{
-		filepath.Join(importPath, last+".volt"),
-		filepath.Join(importPath, importPath+".volt"),
-	}
-	for _, c := range localCandidates {
-		if data, err := os.ReadFile(c); err == nil {
-			return data, c, nil
-		}
+	// 1. Local module: ./<importPath> relative to CWD.
+	if dirHasVoltSource(importPath) {
+		return importPath, nil
 	}
 
-	// 2. User package cache.
+	// 2. User package cache: ~/.volt/pkg/<importPath>.
 	home, _ := os.UserHomeDir()
-	cacheRoots := []string{}
 	if home != "" {
-		cacheRoots = append(cacheRoots, filepath.Join(home, ".volt", "pkg"))
-	}
-	for _, root := range cacheRoots {
-		base := filepath.Join(root, importPath)
-		for _, name := range []string{last + ".volt", importPath + ".volt"} {
-			c := filepath.Join(base, name)
-			if data, err := os.ReadFile(c); err == nil {
-				verifyAgainstSum(importPath, base)
-				return data, c, nil
-			}
+		base := filepath.Join(home, ".volt", "pkg", importPath)
+		if dirHasVoltSource(base) {
+			verifyAgainstSum(importPath, base)
+			return base, nil
 		}
 	}
 
 	if guess := suggestStdlibImport(importPath); guess != "" {
-		return nil, "", fmt.Errorf(
+		return "", fmt.Errorf(
 			"volt: unknown package %q (did you mean %q? — or try: volt mod get %s)",
 			importPath, guess, importPath)
 	}
-	return nil, "", fmt.Errorf(
+	return "", fmt.Errorf(
 		"volt: unknown package %q (try: volt mod get %s)",
 		importPath, importPath)
+}
+
+// dirHasVoltSource reports whether dir is an existing directory holding at
+// least one .volt file directly inside it (subdirectories are ignored —
+// one folder is one package).
+func dirHasVoltSource(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".volt") {
+			return true
+		}
+	}
+	return false
 }
 
 // suggestStdlibImport returns the stdlib package path closest to
@@ -440,21 +447,118 @@ func verifyAgainstSum(importPath, pkgDir string) {
 	}
 }
 
-func resolveAndCompile(srcPath string) ([]*compiledUnit, error) {
-	src, err := os.ReadFile(srcPath)
+// parsePackageDir implements Go's "one folder is one package" model:
+// every *.volt file directly in `dir` is parsed and merged into a single
+// compilation unit. All files must declare the same package name. The
+// merged unit's declarations, comments and (deduplicated) imports are
+// the union of the files'. Not recursive — sub-directories are their own
+// packages, exactly like Go.
+func parsePackageDir(dir string) (*parsedUnit, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("volt: cannot read directory %q: %v", dir, err)
+	}
+	var files []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if strings.HasSuffix(e.Name(), ".volt") {
+			files = append(files, filepath.Join(dir, e.Name()))
+		}
+	}
+	sort.Strings(files) // deterministic decl order across builds
+	if len(files) == 0 {
+		return nil, fmt.Errorf("volt: no .volt files in directory %q", dir)
+	}
+	srcs := make([]namedSource, 0, len(files))
+	for _, f := range files {
+		data, rerr := os.ReadFile(f)
+		if rerr != nil {
+			return nil, fmt.Errorf("volt: cannot read %q: %v", f, rerr)
+		}
+		srcs = append(srcs, namedSource{name: f, data: data})
+	}
+	return mergeSources(dir, srcs)
+}
+
+// namedSource is one source file feeding a multi-file package merge: its
+// display name (a path used in diagnostics + DWARF) and its raw bytes.
+type namedSource struct {
+	name string
+	data []byte
+}
+
+// mergeSources parses every file in `srcs` (the caller supplies them in a
+// deterministic, sorted order) and merges them into ONE compilation unit:
+// the union of their declarations, comments, and deduplicated imports.
+// All files must declare the same package name ("one folder = one
+// package"). `unitName` becomes the unit's name (the source label used
+// for DWARF / diagnostics). Shared by real-FS package dirs
+// (parsePackageDir) and the embedded stdlib (a stdlib package may now
+// span several files, e.g. exec/exec.volt + exec/process.volt).
+func mergeSources(unitName string, srcs []namedSource) (*parsedUnit, error) {
+	var merged *ast.File
+	pkgName := ""
+	firstFile := ""
+	impSeen := map[string]bool{}
+	var imports []string
+	for _, s := range srcs {
+		u, perr := parseSource(s.name, s.data)
+		if perr != nil {
+			return nil, perr
+		}
+		if merged == nil {
+			pkgName = u.pkg
+			firstFile = s.name
+			merged = &ast.File{P: u.file.P, Package: u.pkg}
+		} else if u.pkg != pkgName {
+			return nil, fmt.Errorf(
+				"volt: %s declares package %q but %s declares %q — all files in a directory must share one package (one folder = one package)",
+				s.name, u.pkg, firstFile, pkgName)
+		}
+		merged.Decls = append(merged.Decls, u.file.Decls...)
+		merged.Comments = append(merged.Comments, u.file.Comments...)
+		for _, im := range u.file.Imports {
+			if !impSeen[im.Path] {
+				impSeen[im.Path] = true
+				merged.Imports = append(merged.Imports, im)
+				imports = append(imports, im.Path)
+			}
+		}
+	}
+	return &parsedUnit{pkg: pkgName, name: unitName, file: merged, imports: imports}, nil
+}
+
+// buildEntryUnit parses the build entry, which is either a single .volt
+// file or a directory (compiled as one package, Go-style).
+func buildEntryUnit(srcPath string) (*parsedUnit, error) {
+	info, err := os.Stat(srcPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("volt: source file %q does not exist", srcPath)
+			return nil, fmt.Errorf("volt: %q does not exist", srcPath)
 		}
-		return nil, fmt.Errorf("volt: cannot read %q: %v", srcPath, err)
+		return nil, fmt.Errorf("volt: cannot stat %q: %v", srcPath, err)
 	}
-	// Catch a common mistake: the user passed something that doesn't
-	// end in `.volt`. Hint at the expected extension rather than
-	// letting the parser stumble through random bytes.
-	if !strings.HasSuffix(srcPath, ".volt") {
-		return nil, fmt.Errorf("volt: %q does not have a .volt extension — expected a volt source file", srcPath)
+	if info.IsDir() {
+		return parsePackageDir(srcPath)
 	}
-	root, err := parseSource(srcPath, src)
+	data, rerr := os.ReadFile(srcPath)
+	if rerr != nil {
+		return nil, fmt.Errorf("volt: cannot read %q: %v", srcPath, rerr)
+	}
+	// Single-file build. A non-.volt path is allowed only when it's a
+	// shebang script (`#!...` on line 1, e.g. `#!/usr/bin/env volt`) —
+	// otherwise it's almost certainly a mistake (`volt build foo.txt`).
+	isShebang := len(data) >= 2 && data[0] == '#' && data[1] == '!'
+	if !strings.HasSuffix(srcPath, ".volt") && !isShebang {
+		return nil, fmt.Errorf("volt: %q does not have a .volt extension — expected a volt source file (or a `#!` shebang script) or a package directory", srcPath)
+	}
+	return parseSource(srcPath, data)
+}
+
+func resolveAndCompile(srcPath string) ([]*compiledUnit, error) {
+	root, err := buildEntryUnit(srcPath)
 	if err != nil {
 		return nil, err
 	}
@@ -511,19 +615,37 @@ func resolveAndCompile(srcPath string) ([]*compiledUnit, error) {
 		//      populated by `volt mod get`.
 		// We use the last path segment as the file basename, matching
 		// the stdlib convention.
-		src, ok := stdlib.Source(path)
-		filePath := path + "/" + path + ".volt"
-		if !ok {
-			s, p, err := loadExternalPackage(path)
-			if err != nil {
-				return nil, err
+		// Resolve the import to its source unit:
+		//   - embedded stdlib: a single .volt file
+		//   - external (local module / cache / replace): EVERY .volt file
+		//     in the package's directory, merged into one unit (one folder
+		//     = one package), so an imported library may span files.
+		var u *parsedUnit
+		if srcs, ok := stdlib.Sources(path); ok {
+			// A stdlib package may span several embedded files (one
+			// folder = one package), merged exactly like an external
+			// package directory.
+			ns := make([]namedSource, len(srcs))
+			for i, s := range srcs {
+				ns[i] = namedSource{name: s.Name, data: s.Data}
 			}
-			src = s
-			filePath = p
-		}
-		u, err := parseSource(filePath, src)
-		if err != nil {
-			return nil, err
+			pu, perr := mergeSources(path, ns)
+			if perr != nil {
+				return nil, perr
+			}
+			u = pu
+		} else {
+			// External package: locate its directory, then merge EVERY
+			// .volt file in it (any filenames — one folder = one package).
+			dir, derr := resolveExternalPackageDir(path)
+			if derr != nil {
+				return nil, derr
+			}
+			pu, perr := parsePackageDir(dir)
+			if perr != nil {
+				return nil, perr
+			}
+			u = pu
 		}
 		parsed = append(parsed, u)
 		queue = append(queue, u.imports...)
@@ -562,7 +684,6 @@ func resolveAndCompile(srcPath string) ([]*compiledUnit, error) {
 		g.SetTarget(triple)
 		g.SetSourceFile(u.name)
 		g.SetRaceEnabled(buildRace)
-		g.SetChannelsBackend(buildChannels)
 		g.SetMemProfilePath(buildMemProfile)
 		// Give codegen cross-package signature visibility so it can
 		// produce correct shapes for `os.Open(...)` style calls that
@@ -607,13 +728,6 @@ var buildStrict bool
 // recompile of the volt driver.
 var buildRace bool
 
-// buildChannels selects the channel-queue backend: "mutex" (default,
-// current implementation) or "lockfree" (D.2 on the roadmap — an
-// MPMC ring/Michael-Scott queue). Any other value is rejected at
-// flag parse time. Like -race, the value is plumbed to codegen now
-// so the choice can be honored once the lock-free backend lands.
-var buildChannels string
-
 // buildMemProfile, when non-empty, enables memory-profile auto-dump:
 // codegen injects a path-register call at main entry and the runtime
 // flushes an allocation profile (JSON) to this path at process exit.
@@ -625,7 +739,6 @@ func runBuild(args []string, andRun bool) {
 	buildTarget = "amd64"
 	buildStrict = false
 	buildRace = false
-	buildChannels = "mutex"
 	buildMemProfile = ""
 	for len(args) > 0 && len(args[0]) > 0 && args[0][0] == '-' {
 		switch args[0] {
@@ -644,19 +757,6 @@ func runBuild(args []string, andRun bool) {
 				os.Exit(2)
 			}
 			buildTarget = args[1]
-			args = args[2:]
-		case "--channels":
-			if len(args) < 2 {
-				fmt.Fprintln(os.Stderr, "volt: --channels needs a value (mutex|lockfree)")
-				os.Exit(2)
-			}
-			switch args[1] {
-			case "mutex", "lockfree":
-				buildChannels = args[1]
-			default:
-				fmt.Fprintf(os.Stderr, "volt: --channels=%q is not one of: mutex, lockfree\n", args[1])
-				os.Exit(2)
-			}
 			args = args[2:]
 		case "--memprofile":
 			if len(args) < 2 {
@@ -680,10 +780,48 @@ done:
 	}
 	srcPath := args[0]
 
-	units, err := resolveAndCompile(srcPath)
+	var units []*compiledUnit
+	var err error
+	if andRun {
+		units, err = resolveForRun(srcPath)
+	} else {
+		units, err = resolveAndCompile(srcPath)
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
+	}
+
+	if andRun {
+		// Compile to a throwaway binary in a temp dir and execute it,
+		// forwarding the script's own args. We deliberately do NOT use
+		// defaultOutputPath here: a shebang script frequently has no
+		// `.volt` extension, so that would write the binary OVER the
+		// script. Clean up the temp dir and propagate the child's exit
+		// code (we run via exec, not syscall.Exec, so cleanup can happen).
+		tmpDir, terr := os.MkdirTemp("", "volt-run-*")
+		if terr != nil {
+			fmt.Fprintf(os.Stderr, "volt run: %v\n", terr)
+			os.Exit(1)
+		}
+		binPath := filepath.Join(tmpDir, "a.out")
+		if err := assembleAndLink(units, binPath); err != nil {
+			os.RemoveAll(tmpDir)
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		proc := exec.Command(binPath, args[1:]...)
+		proc.Stdin, proc.Stdout, proc.Stderr = os.Stdin, os.Stdout, os.Stderr
+		runErr := proc.Run()
+		os.RemoveAll(tmpDir)
+		if runErr != nil {
+			if exitErr, ok := runErr.(*exec.ExitError); ok {
+				os.Exit(exitErr.ExitCode())
+			}
+			fmt.Fprintf(os.Stderr, "volt run: %v\n", runErr)
+			os.Exit(1)
+		}
+		return
 	}
 
 	outPath := defaultOutputPath(srcPath)
@@ -691,13 +829,26 @@ done:
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
 
-	if andRun {
-		if err := syscall.Exec(outPath, append([]string{outPath}, args[1:]...), os.Environ()); err != nil {
-			fmt.Fprintf(os.Stderr, "volt run: %v\n", err)
-			os.Exit(1)
+// resolveForRun compiles srcPath for `volt run`. If srcPath is a single
+// file that doesn't compile on its own, it may be one file of a multi-file
+// package — retry with its directory before giving up, so
+// `volt run pkg/main.volt` behaves like `volt run pkg`. The original
+// single-file error is reported if the package attempt also fails.
+func resolveForRun(srcPath string) ([]*compiledUnit, error) {
+	units, err := resolveAndCompile(srcPath)
+	if err == nil {
+		return units, nil
+	}
+	if info, statErr := os.Stat(srcPath); statErr == nil && !info.IsDir() {
+		if dir := filepath.Dir(srcPath); dir != "" && dir != srcPath {
+			if pkgUnits, pkgErr := resolveAndCompile(dir); pkgErr == nil {
+				return pkgUnits, nil
+			}
 		}
 	}
+	return nil, err
 }
 
 // assembleAndLink writes each unit's IR + the runtime asm to temp files,
@@ -767,6 +918,36 @@ func assembleAndLink(units []*compiledUnit, outPath string) error {
 }
 
 func defaultOutputPath(srcPath string) string {
+	// Directory target (Go-style `volt build .` / `volt build ./pkg`): name
+	// the binary after the package directory, like `go build`. The literal
+	// path can't be used as the output name — `filepath.Base(".")` is `"."`,
+	// yielding `./.` which IS the directory, so the linker fails with
+	// "cannot open ./: Is a directory".
+	if info, err := os.Stat(srcPath); err == nil && info.IsDir() {
+		// Resolve `.`/`./`/`..` to a real directory name. A degenerate base
+		// (root `/`, `.`, `..`, or empty) isn't a usable filename — fall back
+		// to "a.out" so we never build an output named `/` or `.`.
+		base := "a.out"
+		if abs, aerr := filepath.Abs(srcPath); aerr == nil {
+			if b := filepath.Base(abs); b != "" && b != "." && b != ".." && b != string(filepath.Separator) {
+				base = b
+			}
+		}
+		// Pick the first candidate that does NOT resolve to an existing
+		// directory — the whole point of this function is to never hand the
+		// linker a directory as its `-o` target. Preference order: cwd-relative
+		// (matches `go build`), then inside the package dir (for the
+		// `volt build ./pkg` case where `./pkg` is itself that dir), then a
+		// `.out`-suffixed name as a last resort (e.g. cwd contains a subdir
+		// named exactly like cwd, so even `./<base>` collides).
+		for _, cand := range []string{"./" + base, filepath.Join(srcPath, base), "./" + base + ".out"} {
+			if oi, oerr := os.Stat(cand); oerr == nil && oi.IsDir() {
+				continue
+			}
+			return cand
+		}
+		return filepath.Join(srcPath, base+".out")
+	}
 	base := filepath.Base(srcPath)
 	if ext := filepath.Ext(base); ext != "" {
 		base = strings.TrimSuffix(base, ext)
@@ -784,7 +965,6 @@ func runDumpIR(args []string) {
 	buildRace = false
 	buildEmitDebug = false
 	buildTarget = "amd64"
-	buildChannels = "mutex"
 	buildMemProfile = ""
 	for len(args) > 0 && len(args[0]) > 0 && args[0][0] == '-' {
 		switch args[0] {
@@ -1950,25 +2130,35 @@ func runDoc(args []string) {
 		os.Exit(2)
 	}
 	srcPath := args[0]
-	// First try: stdlib lookup. If arg doesn't end in .volt and
-	// resolves via stdlib.Source (directly or via shortname), use
-	// the embedded source.
-	var src []byte
-	var resolved string
+	// First try: stdlib lookup. A stdlib package may span several files
+	// (one folder = one package), so resolve + MERGE all of them — else
+	// exported decls in sibling files (e.g. exec's ExitStatus / LookPath)
+	// would be missed. `volt doc <file.volt>` still reads the one file.
+	var u *parsedUnit
 	if !strings.HasSuffix(srcPath, ".volt") {
-		if data, ok := stdlib.Source(srcPath); ok {
-			src = data
-			resolved = srcPath + " (stdlib)"
-		} else if full, ok := docStdlibShortName(srcPath); ok {
-			if data, ok := stdlib.Source(full); ok {
-				src = data
-				resolved = full + " (stdlib)"
+		path := srcPath
+		srcs, ok := stdlib.Sources(path)
+		if !ok {
+			if full, ok2 := docStdlibShortName(srcPath); ok2 {
+				path = full
+				srcs, ok = stdlib.Sources(full)
 			}
 		}
+		if ok {
+			ns := make([]namedSource, len(srcs))
+			for i, s := range srcs {
+				ns[i] = namedSource{name: s.Name, data: s.Data}
+			}
+			mu, err := mergeSources(path+" (stdlib)", ns)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			u = mu
+		}
 	}
-	if src == nil {
-		var err error
-		src, err = os.ReadFile(srcPath)
+	if u == nil {
+		src, err := os.ReadFile(srcPath)
 		if err != nil {
 			// If the user clearly meant a stdlib package (no .volt
 			// extension, no slash) but it didn't resolve, surface a
@@ -1984,12 +2174,12 @@ func runDoc(args []string) {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
-		resolved = srcPath
-	}
-	u, err := parseSource(resolved, src)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		pu, perr := parseSource(srcPath, src)
+		if perr != nil {
+			fmt.Fprintln(os.Stderr, perr)
+			os.Exit(1)
+		}
+		u = pu
 	}
 	fmt.Printf("package %s\n\n", u.pkg)
 	for _, d := range u.file.Decls {
