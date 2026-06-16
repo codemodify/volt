@@ -1,0 +1,38 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go build:*)",
+      "Bash(go test:*)",
+      "Bash(go vet:*)",
+      "Bash(ls:*)",
+      "Bash(cat:*)",
+      "Bash(grep:*)",
+      "Bash(rg:*)",
+      "Bash(find:*)",
+      "Bash(wc:*)",
+      "Bash(.tempbins/volt:*)",
+      "Bash(.tempbins/*)",
+      "Bash(mv:*)",
+      "Bash(cp:*)",
+      "Bash(mkdir:*)",
+      "Bash(rm -f *.volt)",
+      "Bash(rm -f .tempbins/*)",
+      "Bash(timeout:*)",
+      "Bash(/tmp/smoke.sh)",
+      "Bash(/tmp/run_smoke2.sh)",
+      "Read",
+      "Edit",
+      "Write(tests-internal/*)",
+      "Write(internal/*)",
+      "Write(docs/design/*.md)",
+      "Write(TODO.md)"
+    ],
+    "deny": [
+      "Bash(git push:*)",
+      "Bash(git reset --hard:*)",
+      "Bash(git branch -D:*)",
+      "Bash(git commit:*)",
+      "Bash(rm -rf:*)"
+    ]
+  }
+}
