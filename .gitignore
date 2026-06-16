@@ -9,3 +9,7 @@
 volt
 showcase
 producer-consumer
+
+# Stray local build artifacts / temp test outputs (never commit these).
+*.rt
+/docs/design/andmut
