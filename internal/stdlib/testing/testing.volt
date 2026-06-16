@@ -219,7 +219,7 @@ fun RunBenchmark(name string, fn fun(b *B)) BenchResult {
 //   * gate on ps_per_op regression
 //   * track historical trends
 fun WriteBenchResultsJSON(results []BenchResult, path string) int {
-    var buf *bytes.Builder = bytes.NewBuilder()
+    var buf bytes.Builder = new bytes.Builder{}
     buf.WriteByte(91)        // '['
     var n int = len(results)
     for i := 0; i < n; i++ {

@@ -237,7 +237,7 @@ fun MkdirAll(path string, mode int) int {
 		if !isSlash {
 			continue
 		}
-		var b *bytes.Builder = bytes.NewBuilder()
+		var b bytes.Builder = new bytes.Builder{}
 		for j := 0; j < i; j = j + 1 {
 			b.WriteByte(path[j])
 		}

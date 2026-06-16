@@ -233,7 +233,7 @@ fun word32le(w int) string {
 // SumHex returns the 32-char lowercase-hex MD5 digest.
 fun SumHex(msg string) string {
     var d string = Sum(msg)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var n int = len(d)
     for i:=0; i < n; i++ {
         var by int = d[i] & 255

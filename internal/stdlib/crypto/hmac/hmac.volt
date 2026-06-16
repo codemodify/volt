@@ -146,7 +146,7 @@ fun Equal(a string, b string) bool {
 // hexDigest is the shared inline hex encoder for the *Hex helpers.
 // O(n) via bytes.Builder (Pass 108).
 fun hexDigest(d string) string {
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var n int = len(d)
     for i:=0; i < n; i++ {
         var by int = d[i] & 255

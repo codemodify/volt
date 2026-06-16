@@ -43,7 +43,7 @@ fun alphaVal(c byte) int {
 // `=` padding. Output length is always a multiple of 4. O(n) via
 // bytes.Builder (Pass 108) — was O(n²) naive concat.
 fun EncodeToString(src string) string {
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var n int = len(src)
     var i int = 0
     for i+3 <= n {
@@ -84,7 +84,7 @@ fun EncodeToString(src string) string {
 fun EncodeToStringURL(src string) string {
     var s string = EncodeToString(src)
     var n int = len(s)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < n; i++ {
         var c byte = s[i]
         if c == 43 { b.WriteByte(45); continue }    // '+' → '-'
@@ -101,7 +101,7 @@ fun EncodeToStringURL(src string) string {
 // inputs propagate the standard decode error.
 fun DecodeStringURL(src string) (string, error) {
     var n int = len(src)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < n; i++ {
         var c byte = src[i]
         if c == 45 { b.WriteByte(43); continue }    // '-' → '+'
@@ -141,7 +141,7 @@ fun DecodeString(src string) (string, error) {
     if pad > 2 {
         ret "", errors.New("base64: too much padding")
     }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var i int = 0
     var limit int = n - 4
     for i <= limit {

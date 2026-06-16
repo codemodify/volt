@@ -25,7 +25,7 @@ fun Bytes(n int) string {
 // bytes. Convenient for session IDs and one-shot tokens.
 fun Hex(n int) string {
     var d string = Bytes(n)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var dn int = len(d)
     for i:=0; i < dn; i++ {
         var by int = d[i] & 255
@@ -92,7 +92,7 @@ fun String(n int, alphabet string) string {
     var randBytes string = Bytes(n)
     var rn int = len(randBytes)
     if rn == 0 { ret "" }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < rn; i++ {
         var byteVal int = randBytes[i] & 255
         var idx int = byteVal % alen

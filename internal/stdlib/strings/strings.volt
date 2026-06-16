@@ -95,7 +95,7 @@ fun LongestCommonPrefix(strs []string) string {
         var lj int = len(strs[i])
         if lj < maxLen { maxLen = lj }
     }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for k := 0; k < maxLen; k++ {
         var c byte = first[k]
         var match bool = true
@@ -136,7 +136,7 @@ fun LongestCommonSuffix(strs []string) string {
     }
     if matched == 0 { ret "" }
     // Slice the last `matched` bytes of first into a new string.
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for k := firstLen - matched; k < firstLen; k++ {
         b.WriteByte(first[k])
     }
@@ -418,7 +418,7 @@ fun Count(s string, sub string) int {
 // ToLower returns s with all ASCII uppercase letters folded to lowercase.
 // Non-ASCII bytes pass through unchanged.
 fun ToLower(s string) string {
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var n int = len(s)
     for i:=0; i < n; i++ {
         var c byte = s[i]
@@ -434,7 +434,7 @@ fun ToLower(s string) string {
 
 // ToUpper returns s with all ASCII lowercase letters folded to uppercase.
 fun ToUpper(s string) string {
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var n int = len(s)
     for i:=0; i < n; i++ {
         var c byte = s[i]
@@ -470,7 +470,7 @@ fun TrimSpace(s string) string {
         if !isSpace(s[hi - 1]) { break }
         hi = hi - 1
     }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i:=lo; i < hi; i++ {
         b.WriteByte(s[i])
     }
@@ -483,7 +483,7 @@ fun Replace(s string, old string, repl string) string {
     var lold int = len(old)
     if lold == 0 { ret s }
     var n int = len(s)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var i int = 0
     var last int = n - lold
     for i <= last {
@@ -537,7 +537,7 @@ fun Excerpt(s string, at int, radius int) string {
     } else {
         if hi < n { hiTrunc = true }
     }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     if loTrunc { b.WriteString("…") }
     for i := lo; i < pos; i++ { b.WriteByte(s[i]) }
     b.WriteString("|<=here|")
@@ -561,7 +561,7 @@ fun LineRange(s string, from int, to int) string {
     var hi int = to
     if hi > n { hi = n }
     if lo > n { ret "" }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := lo; i <= hi; i++ {
         b.WriteString(ls[i - 1])
         if i < hi { b.WriteByte(10) }
@@ -583,7 +583,7 @@ fun CaretLine(s string, lineNo int, col int) string {
     var line string = "" + ls[lineNo - 1]
     var c int = col
     if c < 1 { c = 1 }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     b.WriteString(line)
     b.WriteByte(10)   // '\n'
     for i := 0; i < c - 1; i++ { b.WriteByte(32) }   // space pad
@@ -623,7 +623,7 @@ fun LineColAt(s string, at int) (int, int) {
 fun Hexdump(s string) string {
     if len(s) == 0 { ret "" }
     var n int = len(s)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var off int = 0
     for off < n {
         // Offset (8 hex digits).
@@ -667,7 +667,7 @@ fun Hexdump(s string) string {
 fun FormatHexPad2(n int) string {
     var hi int = (n >> 4) & 15
     var lo int = n & 15
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     b.WriteByte(hexNibbleByte(hi))
     b.WriteByte(hexNibbleByte(lo))
     ret b.String()
@@ -676,7 +676,7 @@ fun FormatHexPad2(n int) string {
 // FormatHexPad8 is an inlined 8-digit zero-padded lowercase-hex
 // helper for Hexdump's offset column.
 fun FormatHexPad8(n int) string {
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 7; i >= 0; i-- {
         var nib int = (n >> (i * 4)) & 15
         b.WriteByte(hexNibbleByte(nib))
@@ -697,7 +697,7 @@ fun hexNibbleByte(n int) byte {
 //   AsciiHistogramRow("alice", 10, 7, 20, 35, 46)
 //   →  "alice      | #######.............              "
 fun AsciiHistogramRow(label string, labelWidth int, count int, barWidth int, fill byte, empty byte) string {
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     b.WriteString(PadRight(label, labelWidth, 32))
     b.WriteString(" | ")
     b.WriteString(AsciiBar(count, barWidth, fill, empty))
@@ -714,7 +714,7 @@ fun AsciiBar(count int, width int, fill byte, empty byte) string {
     var c int = count
     if c < 0 { c = 0 }
     if c > width { c = width }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < c; i++ { b.WriteByte(fill) }
     for i := c; i < width; i++ { b.WriteByte(empty) }
     ret b.String()
@@ -741,7 +741,7 @@ fun Banner(text string, fill byte) string {
     }
     var inner int = maxW + 2  // one space pad on each side
     var border string = RepeatByte(fill, inner + 2)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     b.WriteString(border)
     if nLines == 0 || (nLines == 1 && len(lines[0]) == 0) {
         // Empty content — just an empty middle row.
@@ -771,7 +771,7 @@ fun Banner(text string, fill byte) string {
 // byte intermediate from chr(). Useful for ASCII borders / fills.
 fun RepeatByte(c byte, n int) string {
     if n <= 0 { ret "" }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < n; i++ { b.WriteByte(c) }
     ret b.String()
 }
@@ -798,7 +798,7 @@ fun Sparkline(values []int) string {
         if v < 0 { v = 0 }
         if v > maxV { maxV = v }
     }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     if maxV == 0 {
         // Flat-zero series — emit n copies of the lowest ramp char.
         for i := 0; i < n; i++ { b.WriteByte(ramp[0]) }
@@ -837,7 +837,7 @@ fun AsciiHistogram(labels []string, counts []int, barWidth int, fill byte, empty
         if v < 0 { v = 0 }
         if v > maxCount { maxCount = v }
     }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < n; i++ {
         var raw int = counts[i]
         if raw < 0 { raw = 0 }
@@ -857,7 +857,7 @@ fun AsciiHistogram(labels []string, counts []int, barWidth int, fill byte, empty
 fun BulletList(items []string, marker string) string {
     var n int = len(items)
     if n == 0 { ret "" }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < n; i++ {
         if len(marker) > 0 {
             b.WriteString(marker)
@@ -875,7 +875,7 @@ fun BulletList(items []string, marker string) string {
 fun NumberedList(items []string) string {
     var n int = len(items)
     if n == 0 { ret "" }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < n; i++ {
         b.WriteString(intDecimalStr(i + 1))
         b.WriteString(". ")
@@ -911,7 +911,7 @@ fun Tabularize(rows [][]string, sep string) string {
             if w > widths[j] { widths[j] = w }
         }
     }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < nr; i++ {
         var rn int = len(rows[i])
         for j := 0; j < ncols; j++ {
@@ -987,7 +987,7 @@ fun Split(s string, sep string) []string {
         }
         if match {
             // Build s[startPos:i] char by char into a Builder.
-            var pb *bytes.Builder = bytes.NewBuilder()
+            var pb bytes.Builder = new bytes.Builder{}
             for k:=startPos; k < i; k++ {
                 pb.WriteByte(s[k])
             }
@@ -1000,7 +1000,7 @@ fun Split(s string, sep string) []string {
         }
     }
     // Trailing piece.
-    var tb *bytes.Builder = bytes.NewBuilder()
+    var tb bytes.Builder = new bytes.Builder{}
     for k:=startPos; k < n; k++ {
         tb.WriteByte(s[k])
     }
@@ -1012,7 +1012,7 @@ fun Split(s string, sep string) []string {
 fun Join(parts []string, sep string) string {
     var n int = len(parts)
     if n == 0 { ret "" }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i:=0; i < n; i++ {
         if i > 0 { b.WriteString("" + sep) }
         b.WriteString("" + parts[i])
@@ -1027,7 +1027,7 @@ fun Join(parts []string, sep string) string {
 // wrap in quotes — see JsonQuote for the full string-literal form.
 fun JsonEscape(s string) string {
     var n int = len(s)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < n; i++ {
         var c byte = s[i]
         if c == 92 { b.WriteString("\\\\"); continue }    // backslash
@@ -1056,7 +1056,7 @@ fun JsonEscape(s string) string {
 // 3-byte sequence). Bad / unknown escapes pass through literally.
 fun JsonUnescape(s string) string {
     var n int = len(s)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var i int = 0
     for i < n {
         var c byte = s[i]
@@ -1126,7 +1126,7 @@ fun JsonUnescape(s string) string {
 // produces a JSON-string literal suitable for inclusion in JSON
 // output. The full form for emitting a string value.
 fun JsonQuote(s string) string {
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     b.WriteByte(34)
     b.WriteString(JsonEscape(s))
     b.WriteByte(34)
@@ -1140,7 +1140,7 @@ fun JsonQuote(s string) string {
 fun ExpandTabs(s string, tabSize int) string {
     if tabSize <= 0 { ret s }
     var n int = len(s)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var col int = 0
     var i int = 0
     for i < n {
@@ -1175,7 +1175,7 @@ fun ExpandTabs(s string, tabSize int) string {
 // output before logging or width measurement.
 fun StripAnsi(s string) string {
     var n int = len(s)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var i int = 0
     for i < n {
         var c byte = s[i]
@@ -1214,7 +1214,7 @@ fun StripAnsi(s string) string {
 fun CsvJoinRow(cells []string) string {
     var n int = len(cells)
     if n == 0 { ret "" }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < n; i++ {
         if i > 0 { b.WriteByte(44) }
         b.WriteString(CsvEscape(cells[i]))
@@ -1287,7 +1287,7 @@ fun CsvEscape(s string) string {
         if c == 13 { needsQuoting = true; break }    // '\r'
     }
     if !needsQuoting { ret "" + s }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     b.WriteByte(34)
     for i := 0; i < n; i++ {
         var c byte = s[i]
@@ -1307,7 +1307,7 @@ fun CsvUnescape(s string) string {
     if n < 2 { ret "" + s }
     if s[0] != 34 { ret "" + s }                     // not quoted at start
     if s[n - 1] != 34 { ret "" + s }                 // not quoted at end
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var i int = 1
     for i < n - 1 {
         var c byte = s[i]
@@ -1356,7 +1356,7 @@ fun urlHexChar(n int) byte {
 // query-string value encoding, URL path-segment safety.
 fun UrlEscape(s string) string {
     var n int = len(s)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < n; i++ {
         var c byte = s[i]
         if urlIsUnreserved(c) {
@@ -1377,7 +1377,7 @@ fun UrlEscape(s string) string {
 // decoding.
 fun UrlUnescape(s string) string {
     var n int = len(s)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var i int = 0
     for i < n {
         if s[i] == 37 {
@@ -1406,7 +1406,7 @@ fun UrlUnescape(s string) string {
 // HTML-attribute / text-node content emission.
 fun HtmlEscape(s string) string {
     var n int = len(s)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < n; i++ {
         var c byte = s[i]
         if c == 38 { b.WriteString("&amp;"); continue }
@@ -1425,7 +1425,7 @@ fun HtmlEscape(s string) string {
 // through unchanged.
 fun HtmlUnescape(s string) string {
     var n int = len(s)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var i int = 0
     for i < n {
         if s[i] == 38 {
@@ -1603,7 +1603,7 @@ fun SplitToIntsLossy(s string, sep string) []int {
 fun JoinInts(s []int, sep string) string {
     var n int = len(s)
     if n == 0 { ret "" }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < n; i++ {
         if i > 0 { b.WriteString("" + sep) }
         b.WriteString(strconv.Itoa(s[i]))
@@ -1614,7 +1614,7 @@ fun JoinInts(s []int, sep string) string {
 // JoinIntsBracket wraps JoinInts in `open`/`close` markers, useful
 // for "[1, 2, 3]" / "{1; 2; 3}" style pretty-printing.
 fun JoinIntsBracket(s []int, sep string, open string, close string) string {
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     b.WriteString(open)
     b.WriteString(JoinInts(s, sep))
     b.WriteString(close)
@@ -1629,7 +1629,7 @@ fun JoinIntsBracket(s []int, sep string, open string, close string) string {
 fun JoinNonEmpty(parts []string, sep string) string {
     var n int = len(parts)
     if n == 0 { ret "" }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var first bool = true
     for i := 0; i < n; i++ {
         if len(parts[i]) == 0 { continue }
@@ -1664,13 +1664,13 @@ fun JoinLast(parts []string, sep string, lastSep string) string {
     if n == 0 { ret "" }
     if n == 1 { ret "" + parts[0] }
     if n == 2 {
-        var b *bytes.Builder = bytes.NewBuilder()
+        var b bytes.Builder = new bytes.Builder{}
         b.WriteString(parts[0])
         b.WriteString(lastSep)
         b.WriteString(parts[1])
         ret b.String()
     }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < n - 1; i++ {
         if i > 0 { b.WriteString("" + sep) }
         b.WriteString("" + parts[i])
@@ -1687,7 +1687,7 @@ fun JoinLast(parts []string, sep string, lastSep string) string {
 fun PadLeft(s string, n int, c byte) string {
     var sn int = len(s)
     if sn >= n { ret s }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var pad int = n - sn
     for i := 0; i < pad; i++ {
         b.WriteByte(c)
@@ -1701,7 +1701,7 @@ fun PadLeft(s string, n int, c byte) string {
 fun PadRight(s string, n int, c byte) string {
     var sn int = len(s)
     if sn >= n { ret s }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     b.WriteString(s)
     var pad int = n - sn
     for i := 0; i < pad; i++ {
@@ -1715,7 +1715,7 @@ fun PadRight(s string, n int, c byte) string {
 // parsing line-oriented text from Windows / classic-Mac origins.
 fun NormalizeNewlines(s string) string {
     var n int = len(s)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var i int = 0
     for i < n {
         var c byte = s[i]
@@ -1743,7 +1743,7 @@ fun NormalizeNewlines(s string) string {
 // same as Fields/TrimSpace (space, tab, newline, CR, VT, FF).
 fun NormalizeWhitespace(s string) string {
     var n int = len(s)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var pendingSpace bool = false
     var hasOut bool = false
     for i := 0; i < n; i++ {
@@ -1791,7 +1791,7 @@ fun nibbleFromHex(c byte) int {
 // (which is form-URL-encoded query semantics, not RFC 3986).
 fun URLEncode(s string) string {
     var n int = len(s)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < n; i++ {
         var c byte = s[i]
         if c >= 65 {
@@ -1821,7 +1821,7 @@ fun URLEncode(s string) string {
 // can distinguish malformed input from valid encodings.
 fun URLDecode(s string) (string, error) {
     var n int = len(s)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var i int = 0
     for i < n {
         var c byte = s[i]
@@ -1851,7 +1851,7 @@ fun URLDecode(s string) (string, error) {
 // user-controlled text into HTML body / attribute contexts.
 fun EscapeHTML(s string) string {
     var n int = len(s)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < n; i++ {
         var c byte = s[i]
         if c == 60 {
@@ -1887,7 +1887,7 @@ fun EscapeHTML(s string) string {
 // entities) is out of scope.
 fun UnescapeHTML(s string) string {
     var n int = len(s)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var i int = 0
     for i < n {
         if s[i] != 38 {                                // not '&'
@@ -2123,7 +2123,7 @@ fun WordWrap(s string, width int) string {
     var words []string = Fields(s)
     var n int = len(words)
     if n == 0 { ret "" }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     b.WriteString(words[0])
     var col int = len(words[0])
     for i := 1; i < n; i++ {
@@ -2178,7 +2178,7 @@ fun Dedent(s string) string {
     }
     if minWs <= 0 { ret "" + s }
     // Pass 2: strip minWs leading bytes from each line.
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     i = 0
     for i < n {
         var lineStart int = i
@@ -2236,7 +2236,7 @@ fun LineAt(s string, idx int) string {
     for i := 0; i < n; i++ {
         if s[i] == 10 {
             if cur == idx {
-                var b *bytes.Builder = bytes.NewBuilder()
+                var b bytes.Builder = new bytes.Builder{}
                 for j := start; j < i; j++ {
                     b.WriteByte(s[j])
                 }
@@ -2249,7 +2249,7 @@ fun LineAt(s string, idx int) string {
     // Final line that lacks a trailing newline.
     if cur == idx {
         if start >= n { ret "" }
-        var b *bytes.Builder = bytes.NewBuilder()
+        var b bytes.Builder = new bytes.Builder{}
         for j := start; j < n; j++ {
             b.WriteByte(s[j])
         }
@@ -2266,7 +2266,7 @@ fun LineAt(s string, idx int) string {
 fun Indent(s string, prefix string) string {
     var n int = len(s)
     if n == 0 { ret "" }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var atLineStart bool = true
     for i := 0; i < n; i++ {
         if atLineStart {
@@ -2370,7 +2370,7 @@ fun Truncate(s string, maxBytes int, ellipsis string) string {
     var n int = len(s)
     if n <= maxBytes { ret "" + s }
     var eLen int = len(ellipsis)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     if eLen >= maxBytes {
         var i int = 0
         for i < maxBytes {
@@ -2407,7 +2407,7 @@ fun AbbreviateLeft(s string, maxBytes int, ellipsis string) string {
     var n int = len(s)
     if n <= maxBytes { ret "" + s }
     var eLen int = len(ellipsis)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     if eLen >= maxBytes {
         for i := eLen - maxBytes; i < eLen; i++ {
             b.WriteByte(ellipsis[i])
@@ -2428,14 +2428,14 @@ fun AbbreviateMiddle(s string, maxBytes int, ellipsis string) string {
     if n <= maxBytes { ret "" + s }
     var eLen int = len(ellipsis)
     if eLen >= maxBytes {
-        var b *bytes.Builder = bytes.NewBuilder()
+        var b bytes.Builder = new bytes.Builder{}
         for i := 0; i < maxBytes; i++ { b.WriteByte(s[i]) }
         ret b.String()
     }
     var available int = maxBytes - eLen
     var leftLen int = available / 2 + (available % 2)   // prefix gets the extra
     var rightLen int = available - leftLen
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < leftLen; i++ { b.WriteByte(s[i]) }
     b.WriteString(ellipsis)
     for i := n - rightLen; i < n; i++ { b.WriteByte(s[i]) }
@@ -2451,7 +2451,7 @@ fun AbbreviateMiddle(s string, maxBytes int, ellipsis string) string {
 fun Pluralize(word string, n int) string {
     if n == 1 { ret "" + word }
     if n == -1 { ret "" + word }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     b.WriteString(word)
     b.WriteByte(115)   // 's'
     ret b.String()
@@ -2479,7 +2479,7 @@ fun OrdinalSuffix(n int) string {
 // "3rd", "11th", "21st", "-3rd", etc. Useful for rendering ranks
 // (place finishes, paginated displays).
 fun Ordinal(n int) string {
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     b.WriteString(intDecimalStr(n))
     b.WriteString(OrdinalSuffix(n))
     ret b.String()
@@ -2496,7 +2496,7 @@ fun ReplaceRune(s string, old string, repl string) string {
     if ol == 0 { ret "" + s }
     var n int = len(s)
     if n == 0 { ret "" }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var i int = 0
     for i < n {
         var c int = s[i] & 255
@@ -2718,7 +2718,7 @@ fun RuneSplit(s string) []string {
         }
         var lim int = i + step
         if lim > n { lim = n }
-        var b *bytes.Builder = bytes.NewBuilder()
+        var b bytes.Builder = new bytes.Builder{}
         for j := i; j < lim; j++ {
             b.WriteByte(s[j])
         }
@@ -2780,7 +2780,7 @@ fun RuneReverse(s string) string {
         }
         i = i + step
     }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var ns int = len(starts)
     var k int = ns - 1
     for k >= 0 {
@@ -2873,7 +2873,7 @@ fun WithCommas(n int) string {
     var raw string = strconv.Itoa(n)
     var nlen int = len(raw)
     if nlen <= 3 { ret raw }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var lead int = nlen % 3
     if lead == 0 { lead = 3 }
     for i := 0; i < lead; i++ { b.WriteByte(raw[i]) }
@@ -2905,7 +2905,7 @@ fun CommaInt(n int) string {
     if n < 1000 { ret strconv.Itoa(n) }
     var digits string = strconv.Itoa(n)
     var dl int = len(digits)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < dl; i++ {
         if i > 0 {
             // Insert a comma when the remaining digit count from this
@@ -2956,7 +2956,7 @@ fun Slice(s string, lo int, hi int) string {
     if lo < 0 { lo = 0 }
     if hi > n { hi = n }
     if hi <= lo { ret "" }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := lo; i < hi; i++ {
         b.WriteByte(s[i])
     }
@@ -3016,7 +3016,7 @@ fun RuneSlice(s string, lo int, hi int) string {
     }
     if startByte < 0 { ret "" }
     if endByte < 0 { endByte = n }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := startByte; i < endByte; i++ {
         b.WriteByte(s[i])
     }
@@ -3046,7 +3046,7 @@ fun TruncateRunes(s string, maxRunes int, ellipsis string) string {
         runeCount = runeCount + 1
     }
     if bytePos >= n { ret "" + s }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < bytePos; i++ {
         b.WriteByte(s[i])
     }
@@ -3074,7 +3074,7 @@ fun RuneAt(s string, idx int) string {
         if runeCount == idx {
             var lim int = i + step
             if lim > n { lim = n }
-            var b *bytes.Builder = bytes.NewBuilder()
+            var b bytes.Builder = new bytes.Builder{}
             for j := i; j < lim; j++ {
                 b.WriteByte(s[j])
             }
@@ -3100,7 +3100,7 @@ fun FirstRune(s string) string {
         if c >= 240 { step = 4 }
     }
     if step > n { step = n }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < step; i++ {
         b.WriteByte(s[i])
     }
@@ -3120,7 +3120,7 @@ fun LastRune(s string) string {
         if c >= 192 { break }
         i = i - 1
     }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for j := i; j < n; j++ {
         b.WriteByte(s[j])
     }
@@ -3336,7 +3336,7 @@ fun Center(s string, n int, c byte) string {
     var total int = n - sn
     var left int = total / 2
     var right int = total - left
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < left; i++ {
         b.WriteByte(c)
     }
@@ -3354,7 +3354,7 @@ fun Center(s string, n int, c byte) string {
 fun RepeatRune(r string, n int) string {
     if n <= 0 { ret "" }
     if len(r) == 0 { ret "" }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < n; i++ {
         b.WriteString("" + r)
     }
@@ -3365,7 +3365,7 @@ fun RepeatRune(r string, n int) string {
 // for n <= 0.
 fun Repeat(s string, n int) string {
     if n <= 0 { ret "" }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i:=0; i < n; i++ {
         b.WriteString("" + s)
     }
@@ -3382,7 +3382,7 @@ fun RepeatTo(s string, totalLen int) string {
     if totalLen <= 0 { ret "" }
     var ls int = len(s)
     if ls == 0 { ret "" }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < totalLen; i++ {
         b.WriteByte(s[i % ls])
     }
@@ -3399,7 +3399,7 @@ fun ReplaceFirst(s string, old string, repl string) string {
     if lold == 0 { ret s }
     var idx int = Index(s, old)
     if idx < 0 { ret s }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < idx; i++ {
         b.WriteByte(s[i])
     }
@@ -3421,7 +3421,7 @@ fun ReplaceN(s string, old string, repl string, n int) string {
     var nMax int = n
     if n < 0 { nMax = -1 }   // sentinel: unlimited
     var ls int = len(s)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var i int = 0
     var replaced int = 0
     var last int = ls - lold
@@ -3459,7 +3459,7 @@ fun TrimPrefix(s string, prefix string) string {
     if !HasPrefix(s, prefix) { ret s }
     var lp int = len(prefix)
     var ls int = len(s)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i:=lp; i < ls; i++ {
         b.WriteByte(s[i])
     }
@@ -3471,7 +3471,7 @@ fun TrimPrefix(s string, prefix string) string {
 fun TrimSuffix(s string, suffix string) string {
     if !HasSuffix(s, suffix) { ret s }
     var lend int = len(s) - len(suffix)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i:=0; i < lend; i++ {
         b.WriteByte(s[i])
     }
@@ -3491,19 +3491,19 @@ fun TrimNewline(s string) string {
     if n >= 2 {
         if s[n-2] == 13 {
             if s[n-1] == 10 {
-                var b *bytes.Builder = bytes.NewBuilder()
+                var b bytes.Builder = new bytes.Builder{}
                 for i := 0; i < n - 2; i++ { b.WriteByte(s[i]) }
                 ret b.String()
             }
         }
     }
     if s[n-1] == 10 {
-        var b *bytes.Builder = bytes.NewBuilder()
+        var b bytes.Builder = new bytes.Builder{}
         for i := 0; i < n - 1; i++ { b.WriteByte(s[i]) }
         ret b.String()
     }
     if s[n-1] == 13 {
-        var b *bytes.Builder = bytes.NewBuilder()
+        var b bytes.Builder = new bytes.Builder{}
         for i := 0; i < n - 1; i++ { b.WriteByte(s[i]) }
         ret b.String()
     }
@@ -3517,7 +3517,7 @@ fun TrimNewline(s string) string {
 // a path starts with `/`, or any "add header iff missing" need.
 fun EnsurePrefix(s string, prefix string) string {
     if HasPrefix(s, prefix) { ret "" + s }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     b.WriteString(prefix)
     b.WriteString(s)
     ret b.String()
@@ -3529,7 +3529,7 @@ fun EnsurePrefix(s string, prefix string) string {
 // `.txt`", or trailing-newline-on-output style normalizations.
 fun EnsureSuffix(s string, suffix string) string {
     if HasSuffix(s, suffix) { ret "" + s }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     b.WriteString(s)
     b.WriteString(suffix)
     ret b.String()
@@ -3540,7 +3540,7 @@ fun EnsureSuffix(s string, suffix string) string {
 // `[item]`, `(arg)`, `{ obj }`, `<tag>`, and CLI-style optional-arg
 // notation. For string-literal-quoting, use strconv.Quote.
 fun Bracket(s string, open string, close string) string {
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     b.WriteString(open)
     b.WriteString(s)
     b.WriteString(close)
@@ -3634,7 +3634,7 @@ fun SplitN(s string, sep string, n int) []string {
             }
         }
         if match {
-            var pb *bytes.Builder = bytes.NewBuilder()
+            var pb bytes.Builder = new bytes.Builder{}
             for k:=startPos; k < i; k++ {
                 pb.WriteByte(s[k])
             }
@@ -3647,7 +3647,7 @@ fun SplitN(s string, sep string, n int) []string {
         }
     }
     // Remainder from startPos to end of s.
-    var tb *bytes.Builder = bytes.NewBuilder()
+    var tb bytes.Builder = new bytes.Builder{}
     for k:=startPos; k < ls; k++ {
         tb.WriteByte(s[k])
     }
@@ -3697,7 +3697,7 @@ fun TrimLeft(s string, cutset string) string {
         if !containsByte(cutset, s[lo]) { break }
         lo = lo + 1
     }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := lo; i < n; i++ {
         b.WriteByte(s[i])
     }
@@ -3714,7 +3714,7 @@ fun TrimRight(s string, cutset string) string {
         if !containsByte(cutset, s[hi - 1]) { break }
         hi = hi - 1
     }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < hi; i++ {
         b.WriteByte(s[i])
     }
@@ -3732,7 +3732,7 @@ fun Translate(s string, from string, to string) string {
     if len(from) == 0 { ret "" + s }
     var nt int = len(to)
     var n int = len(s)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < n; i++ {
         var c byte = s[i]
         var idx int = IndexByte(from, c)
@@ -3754,7 +3754,7 @@ fun Translate(s string, from string, to string) string {
 fun RemoveChars(s string, chars string) string {
     if len(chars) == 0 { ret "" + s }
     var n int = len(s)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < n; i++ {
         if containsByte(chars, s[i]) { continue }
         b.WriteByte(s[i])
@@ -3778,7 +3778,7 @@ fun KeepOnly(s string, chars string) string {
         var c int = chars[i] & 255
         member[c] = true
     }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < n; i++ {
         var c int = s[i] & 255
         if member[c] { b.WriteByte(s[i]) }
@@ -3801,7 +3801,7 @@ fun Trim(s string, cutset string) string {
         if !containsByte(cutset, s[hi - 1]) { break }
         hi = hi - 1
     }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i:=lo; i < hi; i++ {
         b.WriteByte(s[i])
     }
@@ -3946,7 +3946,7 @@ fun Fields(s string) []string {
     for i := 0; i < n; i++ {
         if isWhitespace(s[i]) {
             if inField {
-                var b *bytes.Builder = bytes.NewBuilder()
+                var b bytes.Builder = new bytes.Builder{}
                 for j := start; j < i; j++ {
                     b.WriteByte(s[j])
                 }
@@ -3962,7 +3962,7 @@ fun Fields(s string) []string {
         }
     }
     if inField {
-        var b *bytes.Builder = bytes.NewBuilder()
+        var b bytes.Builder = new bytes.Builder{}
         for j := start; j < n; j++ {
             b.WriteByte(s[j])
         }
@@ -4001,7 +4001,7 @@ fun NthField(s string, n int) string {
         } else {
             if start >= 0 {
                 if idx == n {
-                    var b *bytes.Builder = bytes.NewBuilder()
+                    var b bytes.Builder = new bytes.Builder{}
                     for k := start; k < i; k++ { b.WriteByte(s[k]) }
                     ret b.String()
                 }
@@ -4012,7 +4012,7 @@ fun NthField(s string, n int) string {
     }
     if start >= 0 {
         if idx == n {
-            var b *bytes.Builder = bytes.NewBuilder()
+            var b bytes.Builder = new bytes.Builder{}
             for k := start; k < ns; k++ { b.WriteByte(s[k]) }
             ret b.String()
         }
@@ -4034,7 +4034,7 @@ fun NthFieldSep(s string, sep byte, n int) string {
     for i := 0; i < ns; i++ {
         if s[i] == sep {
             if idx == n {
-                var b *bytes.Builder = bytes.NewBuilder()
+                var b bytes.Builder = new bytes.Builder{}
                 for k := start; k < i; k++ { b.WriteByte(s[k]) }
                 ret b.String()
             }
@@ -4043,7 +4043,7 @@ fun NthFieldSep(s string, sep byte, n int) string {
         }
     }
     if idx == n {
-        var b *bytes.Builder = bytes.NewBuilder()
+        var b bytes.Builder = new bytes.Builder{}
         for k := start; k < ns; k++ { b.WriteByte(s[k]) }
         ret b.String()
     }
@@ -4141,7 +4141,7 @@ fun FieldsFunc(s string, fn fun(byte) bool) []string {
     for i := 0; i < n; i++ {
         if fn(s[i]) {
             if inField {
-                var b *bytes.Builder = bytes.NewBuilder()
+                var b bytes.Builder = new bytes.Builder{}
                 for j := start; j < i; j++ {
                     b.WriteByte(s[j])
                 }
@@ -4157,7 +4157,7 @@ fun FieldsFunc(s string, fn fun(byte) bool) []string {
         }
     }
     if inField {
-        var b *bytes.Builder = bytes.NewBuilder()
+        var b bytes.Builder = new bytes.Builder{}
         for j := start; j < n; j++ {
             b.WriteByte(s[j])
         }
@@ -4174,8 +4174,8 @@ fun Cut(s string, sep string) (string, string, bool) {
     var n int = len(s)
     var nsep int = len(sep)
     if nsep == 0 {
-        var before *bytes.Builder = bytes.NewBuilder()
-        var after *bytes.Builder = bytes.NewBuilder()
+        var before bytes.Builder = new bytes.Builder{}
+        var after bytes.Builder = new bytes.Builder{}
         for i := 0; i < n; i++ {
             after.WriteByte(s[i])
         }
@@ -4183,17 +4183,17 @@ fun Cut(s string, sep string) (string, string, bool) {
     }
     var idx int = Index(s, sep)
     if idx < 0 {
-        var bld *bytes.Builder = bytes.NewBuilder()
+        var bld bytes.Builder = new bytes.Builder{}
         for i := 0; i < n; i++ {
             bld.WriteByte(s[i])
         }
         ret bld.String(), "", false
     }
-    var before *bytes.Builder = bytes.NewBuilder()
+    var before bytes.Builder = new bytes.Builder{}
     for i := 0; i < idx; i++ {
         before.WriteByte(s[i])
     }
-    var after *bytes.Builder = bytes.NewBuilder()
+    var after bytes.Builder = new bytes.Builder{}
     var off int = idx + nsep
     for i := off; i < n; i++ {
         after.WriteByte(s[i])
@@ -4210,19 +4210,19 @@ fun CutLast(s string, sep string) (string, string, bool) {
     var n int = len(s)
     var nsep int = len(sep)
     if nsep == 0 {
-        var before *bytes.Builder = bytes.NewBuilder()
+        var before bytes.Builder = new bytes.Builder{}
         for i := 0; i < n; i++ { before.WriteByte(s[i]) }
         ret before.String(), "", true
     }
     var idx int = LastIndex(s, sep)
     if idx < 0 {
-        var bld *bytes.Builder = bytes.NewBuilder()
+        var bld bytes.Builder = new bytes.Builder{}
         for i := 0; i < n; i++ { bld.WriteByte(s[i]) }
         ret bld.String(), "", false
     }
-    var before *bytes.Builder = bytes.NewBuilder()
+    var before bytes.Builder = new bytes.Builder{}
     for i := 0; i < idx; i++ { before.WriteByte(s[i]) }
-    var after *bytes.Builder = bytes.NewBuilder()
+    var after bytes.Builder = new bytes.Builder{}
     var off int = idx + nsep
     for i := off; i < n; i++ { after.WriteByte(s[i]) }
     ret before.String(), after.String(), true
@@ -4233,7 +4233,7 @@ fun CutLast(s string, sep string) (string, string, bool) {
 // false). Mirrors Go 1.20's strings.CutPrefix.
 fun CutPrefix(s string, prefix string) (string, bool) {
     if !HasPrefix(s, prefix) {
-        var bld *bytes.Builder = bytes.NewBuilder()
+        var bld bytes.Builder = new bytes.Builder{}
         var n int = len(s)
         for i := 0; i < n; i++ {
             bld.WriteByte(s[i])
@@ -4242,7 +4242,7 @@ fun CutPrefix(s string, prefix string) (string, bool) {
     }
     var off int = len(prefix)
     var n int = len(s)
-    var bld *bytes.Builder = bytes.NewBuilder()
+    var bld bytes.Builder = new bytes.Builder{}
     for i := off; i < n; i++ {
         bld.WriteByte(s[i])
     }
@@ -4254,7 +4254,7 @@ fun CutPrefix(s string, prefix string) (string, bool) {
 // false). Mirrors Go 1.20's strings.CutSuffix.
 fun CutSuffix(s string, suffix string) (string, bool) {
     if !HasSuffix(s, suffix) {
-        var bld *bytes.Builder = bytes.NewBuilder()
+        var bld bytes.Builder = new bytes.Builder{}
         var n int = len(s)
         for i := 0; i < n; i++ {
             bld.WriteByte(s[i])
@@ -4262,7 +4262,7 @@ fun CutSuffix(s string, suffix string) (string, bool) {
         ret bld.String(), false
     }
     var n int = len(s) - len(suffix)
-    var bld *bytes.Builder = bytes.NewBuilder()
+    var bld bytes.Builder = new bytes.Builder{}
     for i := 0; i < n; i++ {
         bld.WriteByte(s[i])
     }
@@ -4282,7 +4282,7 @@ fun ContainsAny(s string, chars string) bool {
 // case transforms, ROT-13, byte-level character substitution.
 fun Map(fn fun(byte) byte, s string) string {
     var n int = len(s)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < n; i++ {
         b.WriteByte(fn(s[i]))
     }
@@ -4323,7 +4323,7 @@ fun TrimFunc(s string, fn fun(byte) bool) string {
         if !fn(s[hi - 1]) { break }
         hi = hi - 1
     }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := lo; i < hi; i++ {
         b.WriteByte(s[i])
     }
@@ -4347,7 +4347,7 @@ fun SplitAfter(s string, sep string) []string {
     var nsep int = len(sep)
     var out []string = new(0) []string{}
     if nsep == 0 {
-        var b *bytes.Builder = bytes.NewBuilder()
+        var b bytes.Builder = new bytes.Builder{}
         for i := 0; i < n; i++ { b.WriteByte(s[i]) }
         out = append(out, b.String())
         ret out
@@ -4362,7 +4362,7 @@ fun SplitAfter(s string, sep string) []string {
         }
         if match {
             var end int = i + nsep
-            var b *bytes.Builder = bytes.NewBuilder()
+            var b bytes.Builder = new bytes.Builder{}
             for k := start; k < end; k++ {
                 b.WriteByte(s[k])
             }
@@ -4375,7 +4375,7 @@ fun SplitAfter(s string, sep string) []string {
     }
     // Tail: any unmatched remainder.
     if start < n {
-        var b *bytes.Builder = bytes.NewBuilder()
+        var b bytes.Builder = new bytes.Builder{}
         for k := start; k < n; k++ {
             b.WriteByte(s[k])
         }
@@ -4416,7 +4416,7 @@ fun NGrams(s string, n int) []string {
     var cnt int = ls - n + 1
     var out []string = new(cnt) []string {}
     for i := 0; i < cnt; i++ {
-        var bld *bytes.Builder = bytes.NewBuilder()
+        var bld bytes.Builder = new bytes.Builder{}
         for k := 0; k < n; k++ {
             bld.WriteByte(s[i + k])
         }
@@ -4460,7 +4460,7 @@ fun SortChars(s string) string {
         var c int = s[i] & 255
         hist[c] = hist[c] + 1
     }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for k := 0; k < 256; k++ {
         var c int = hist[k]
         var kb byte = k
@@ -4510,7 +4510,7 @@ fun MostCommonByte(s string) byte {
 // preprocessing.
 fun OnlyLetters(s string) string {
     var n int = len(s)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < n; i++ {
         var c byte = s[i]
         if c >= 65 {
@@ -4537,7 +4537,7 @@ fun MaskMiddle(s string, keepStart int, keepEnd int, mask byte) string {
     if ke < 0 { ke = 0 }
     if (ks + ke) >= n { ret "" + s }
     var midLen int = n - ks - ke
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < ks; i++ { b.WriteByte(s[i]) }
     for i := 0; i < midLen; i++ { b.WriteByte(mask) }
     for i := n - ke; i < n; i++ { b.WriteByte(s[i]) }
@@ -4550,7 +4550,7 @@ fun MaskMiddle(s string, keepStart int, keepEnd int, mask byte) string {
 // sanitizing hash strings that mix in separators.
 fun OnlyHex(s string) string {
     var n int = len(s)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < n; i++ {
         var c byte = s[i]
         if c >= 48 {
@@ -4572,7 +4572,7 @@ fun OnlyHex(s string) string {
 // stripping decoration from "$1,234.50" → "123450".
 fun OnlyDigits(s string) string {
     var n int = len(s)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < n; i++ {
         var c byte = s[i]
         if c >= 48 {
@@ -4587,7 +4587,7 @@ fun OnlyDigits(s string) string {
 // search-token normalization, ID sanitization.
 fun OnlyAlphanumeric(s string) string {
     var n int = len(s)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < n; i++ {
         var c byte = s[i]
         if c >= 48 {
@@ -4613,7 +4613,7 @@ fun OnlyAlphanumeric(s string) string {
 // uses `& 255` to widen to int before the bound check.
 fun OnlyAscii(s string) string {
     var n int = len(s)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < n; i++ {
         var c int = s[i] & 255
         if c < 128 {
@@ -4775,7 +4775,7 @@ fun Levenshtein(a string, b string) int {
 fun Capitalize(s string) string {
     var n int = len(s)
     if n == 0 { ret "" }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var c byte = s[0]
     if c >= 97 {
         if c <= 122 { c = c - 32 }
@@ -4834,7 +4834,7 @@ fun LongestRunFunc(s string, pred fun(byte) bool) int {
 fun Title(s string) string {
     var n int = len(s)
     if n == 0 { ret "" }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var atWordStart bool = true
     for i := 0; i < n; i++ {
         var c byte = s[i]
@@ -4884,7 +4884,7 @@ fun Title(s string) string {
 fun TitleCase(s string) string {
     var n int = len(s)
     if n == 0 { ret "" }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var atWordStart bool = true
     for i := 0; i < n; i++ {
         var c byte = s[i]
@@ -4910,7 +4910,7 @@ fun TitleCase(s string) string {
 
 fun PascalCase(s string) string {
     var n int = len(s)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var nextUpper bool = true
     for i := 0; i < n; i++ {
         var c byte = s[i]
@@ -4962,7 +4962,7 @@ fun KebabCase(s string) string {
 // KebabCase. `sep` is the byte to insert at word boundaries.
 fun caseConvert(s string, sep byte) string {
     var n int = len(s)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < n; i++ {
         var c byte = s[i]
         var isUpper bool = false
@@ -5011,7 +5011,7 @@ fun caseConvert(s string, sep byte) string {
 fun Decapitalize(s string) string {
     var n int = len(s)
     if n == 0 { ret "" }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var c byte = s[0]
     if c >= 65 {
         if c <= 90 { c = c + 32 }
@@ -5028,7 +5028,7 @@ fun Decapitalize(s string) string {
 // for novelty / puzzle effects, accessibility test data.
 fun SwapCase(s string) string {
     var n int = len(s)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < n; i++ {
         var c byte = s[i]
         if c >= 65 {
@@ -5065,7 +5065,7 @@ fun CommonPrefix(a string, b string) string {
         k = k + 1
     }
     if k == 0 { ret "" }
-    var bld *bytes.Builder = bytes.NewBuilder()
+    var bld bytes.Builder = new bytes.Builder{}
     for i := 0; i < k; i++ {
         bld.WriteByte(a[i])
     }
@@ -5086,7 +5086,7 @@ fun CommonSuffix(a string, b string) string {
         k = k + 1
     }
     if k == 0 { ret "" }
-    var bld *bytes.Builder = bytes.NewBuilder()
+    var bld bytes.Builder = new bytes.Builder{}
     for i := na - k; i < na; i++ {
         bld.WriteByte(a[i])
     }
@@ -5157,7 +5157,7 @@ fun CommonSuffixAll(strs []string) string {
 fun Reverse(s string) string {
     var n int = len(s)
     if n == 0 { ret "" }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := n - 1; i >= 0; i = i - 1 {
         b.WriteByte(s[i])
     }
@@ -5187,7 +5187,7 @@ fun ReverseWords(s string) string {
     var parts []string = Fields(s)
     var n int = len(parts)
     if n == 0 { ret "" }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := n - 1; i >= 0; i = i - 1 {
         if i < n - 1 { b.WriteByte(32) }
         b.WriteString(parts[i])
@@ -5211,7 +5211,7 @@ fun Lines(s string) []string {
             if end > start {
                 if s[end - 1] == 13 { end = end - 1 }   // strip '\r'
             }
-            var b *bytes.Builder = bytes.NewBuilder()
+            var b bytes.Builder = new bytes.Builder{}
             for k := start; k < end; k++ {
                 b.WriteByte(s[k])
             }
@@ -5222,7 +5222,7 @@ fun Lines(s string) []string {
     if start < n {
         var end int = n
         if s[end - 1] == 13 { end = end - 1 }
-        var b *bytes.Builder = bytes.NewBuilder()
+        var b bytes.Builder = new bytes.Builder{}
         for k := start; k < end; k++ {
             b.WriteByte(s[k])
         }
@@ -5247,7 +5247,7 @@ fun intDecimalStr(n int) string {
         x = x / 10
         k = k + 1
     }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     if neg { b.WriteByte(45) }
     for i := k - 1; i >= 0; i-- { b.WriteByte(buf[i]) }
     ret b.String()
@@ -5262,7 +5262,7 @@ fun NumberLines(s string) string {
     var ls []string = Lines(s)
     var n int = len(ls)
     if n == 0 { ret "" }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < n; i++ {
         b.WriteString(intDecimalStr(i + 1))
         b.WriteByte(9)   // tab
@@ -5280,7 +5280,7 @@ fun ReverseLines(s string) string {
     var ls []string = Lines(s)
     var n int = len(ls)
     if n == 0 { ret "" }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := n - 1; i >= 0; i-- {
         b.WriteString(ls[i])
         if i > 0 { b.WriteByte(10) }
@@ -5299,7 +5299,7 @@ fun MapLines(s string, fn fun(string) string) string {
     var ls []string = Lines(s)
     var n int = len(ls)
     if n == 0 { ret "" }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < n; i++ {
         b.WriteString(fn(ls[i]))
         if i < n - 1 { b.WriteByte(10) }
@@ -5316,7 +5316,7 @@ fun FilterLines(s string, keep fun(string) bool) string {
     var ls []string = Lines(s)
     var n int = len(ls)
     if n == 0 { ret "" }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var first bool = true
     for i := 0; i < n; i++ {
         if keep(ls[i]) {
@@ -5339,7 +5339,7 @@ fun GrepLines(s string, pat string) string {
     var ls []string = Lines(s)
     var n int = len(ls)
     if n == 0 { ret "" }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var first bool = true
     for i := 0; i < n; i++ {
         if Contains(ls[i], pat) {
@@ -5360,7 +5360,7 @@ fun GrepLinesNot(s string, pat string) string {
     var ls []string = Lines(s)
     var n int = len(ls)
     if n == 0 { ret "" }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var first bool = true
     for i := 0; i < n; i++ {
         if !Contains(ls[i], pat) {
@@ -5384,7 +5384,7 @@ fun UniqueLines(s string) string {
     var n int = len(ls)
     if n == 0 { ret "" }
     var seen []string = new(0) []string {}
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var first bool = true
     for i := 0; i < n; i++ {
         var dup bool = false
@@ -5423,7 +5423,7 @@ fun SortLines(s string) string {
         }
         ls[j + 1] = key
     }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < n; i++ {
         b.WriteString(ls[i])
         if i < n - 1 { b.WriteByte(10) }
@@ -5443,7 +5443,7 @@ fun HeadLines(s string, n int) string {
     var nl int = len(ls)
     if n > nl { n = nl }
     if n == 0 { ret "" }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < n; i++ {
         b.WriteString(ls[i])
         if i < n - 1 { b.WriteByte(10) }
@@ -5460,7 +5460,7 @@ fun TailLines(s string, n int) string {
     var nl int = len(ls)
     if n > nl { n = nl }
     if n == 0 { ret "" }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var off int = nl - n
     for i := 0; i < n; i++ {
         b.WriteString(ls[off + i])
@@ -5482,7 +5482,7 @@ fun TrimSpaceEachLine(s string) string {
     var hadTrailingNL bool = false
     if s[n - 1] == 10 { hadTrailingNL = true }
     var ls []string = Lines(s)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var nl int = len(ls)
     for i := 0; i < nl; i++ {
         var t string = TrimSpace(ls[i])
@@ -5597,7 +5597,7 @@ fun WrapAt(s string, width int) string {
     if width <= 0 { ret s }
     var n int = len(s)
     if n == 0 { ret "" }
-    var out *bytes.Builder = bytes.NewBuilder()
+    var out bytes.Builder = new bytes.Builder{}
     var lineStart int = -1                  // -1 = no current line
     var lineLen int = 0
     var firstLine bool = true
@@ -5647,7 +5647,7 @@ fun WrapAt(s string, width int) string {
 fun JustifyLeft(s string, width int) string {
     var n int = len(s)
     if n >= width { ret "" + s }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     b.WriteString(s)
     for i := 0; i < width - n; i++ { b.WriteByte(32) }
     ret b.String()
@@ -5657,7 +5657,7 @@ fun JustifyLeft(s string, width int) string {
 fun JustifyRight(s string, width int) string {
     var n int = len(s)
     if n >= width { ret "" + s }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < width - n; i++ { b.WriteByte(32) }
     b.WriteString(s)
     ret b.String()
@@ -5671,7 +5671,7 @@ fun JustifyCenter(s string, width int) string {
     var deficit int = width - n
     var left int = deficit / 2
     var right int = deficit - left
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < left; i++ { b.WriteByte(32) }
     b.WriteString(s)
     for i := 0; i < right; i++ { b.WriteByte(32) }

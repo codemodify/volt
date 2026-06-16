@@ -614,7 +614,7 @@ fun (t Time) Format() string {
     var h int = t.Hour()
     var mi int = t.Minute()
     var s int = t.Second()
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     b.WriteString(pad4(y))
     b.WriteByte(45)   // '-'
     b.WriteString(pad2(mo))
@@ -634,7 +634,7 @@ fun (t Time) Format() string {
 // "Weekday, Month Day, Year" (e.g. "Saturday, June 15, 2024").
 // Uses WeekdayName + MonthName + the Itoa'd day / year.
 fun (t Time) HumanDate() string {
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     b.WriteString(t.WeekdayName())
     b.WriteByte(44)   // ','
     b.WriteByte(32)   // ' '
@@ -651,7 +651,7 @@ fun (t Time) HumanDate() string {
 // Year" (e.g. "Jun 15, 2024"). Useful for tight UI rows that need
 // human-readable rather than ISO format.
 fun (t Time) ShortDate() string {
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     b.WriteString(t.MonthShortName())
     b.WriteByte(32)
     b.WriteString(strconv.Itoa(t.Day()))
@@ -665,7 +665,7 @@ fun (t Time) ShortDate() string {
 // joined by a single space (RFC-friendly but more readable than
 // the `T...Z` Format() output for log lines).
 fun (t Time) DateTimeString() string {
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     b.WriteString(t.DateString())
     b.WriteByte(32)   // ' '
     b.WriteString(t.TimeString())
@@ -682,7 +682,7 @@ fun (t Time) IsoCompact() string {
     var h int = t.Hour()
     var mi int = t.Minute()
     var s int = t.Second()
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     b.WriteString(pad4(y))
     b.WriteString(pad2(mo))
     b.WriteString(pad2(d))
@@ -702,7 +702,7 @@ fun (t Time) TimeString() string {
     var h int = t.Hour()
     var mi int = t.Minute()
     var s int = t.Second()
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     b.WriteString(pad2(h))
     b.WriteByte(58)   // ':'
     b.WriteString(pad2(mi))
@@ -716,7 +716,7 @@ fun (t Time) TimeString() string {
 fun (t Time) TimeStringShort() string {
     var h int = t.Hour()
     var mi int = t.Minute()
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     b.WriteString(pad2(h))
     b.WriteByte(58)
     b.WriteString(pad2(mi))
@@ -729,7 +729,7 @@ fun (t Time) TimeStringShort() string {
 fun (t Time) Format12Hour() string {
     var h int = t.Hour12()
     var mi int = t.Minute()
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     b.WriteString(strconv.Itoa(h))
     b.WriteByte(58)   // ':'
     b.WriteString(pad2(mi))
@@ -744,7 +744,7 @@ fun (t Time) Format12HourFull() string {
     var h int = t.Hour12()
     var mi int = t.Minute()
     var s int = t.Second()
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     b.WriteString(strconv.Itoa(h))
     b.WriteByte(58)
     b.WriteString(pad2(mi))
@@ -761,7 +761,7 @@ fun (t Time) DateString() string {
     var y int = t.Year()
     var mo int = t.Month()
     var d int = t.Day()
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     b.WriteString(pad4(y))
     b.WriteByte(45)
     b.WriteString(pad2(mo))
@@ -902,7 +902,7 @@ fun FormatDuration(ns int) string {
         neg = true
         ns = -ns
     }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     if neg { b.WriteByte(45) }   // '-'
     // Hours.
     if ns >= 3600000000000 {
@@ -1389,12 +1389,12 @@ fun HumanAgo(t Time) string {
     var delta int = nowT.Sub(t)   // > 0 if t is in the past
     if delta == 0 { ret "just now" }
     if delta > 0 {
-        var b *bytes.Builder = bytes.NewBuilder()
+        var b bytes.Builder = new bytes.Builder{}
         b.WriteString(HumanizeDuration(delta))
         b.WriteString(" ago")
         ret b.String()
     }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     b.WriteString("in ")
     b.WriteString(HumanizeDuration(-delta))
     ret b.String()
@@ -1407,12 +1407,12 @@ fun HumanAgo(t Time) string {
 fun HumanAgoFromNanos(delta int) string {
     if delta == 0 { ret "just now" }
     if delta < 0 {
-        var b *bytes.Builder = bytes.NewBuilder()
+        var b bytes.Builder = new bytes.Builder{}
         b.WriteString(HumanizeDuration(-delta))
         b.WriteString(" ago")
         ret b.String()
     }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     b.WriteString("in ")
     b.WriteString(HumanizeDuration(delta))
     ret b.String()
@@ -1437,7 +1437,7 @@ fun HumanizeDuration(ns int) string {
         neg = true
         v = -v
     }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     if neg { b.WriteByte(45) }   // '-'
     if v >= 86400000000000 {
         var d int = v / 86400000000000

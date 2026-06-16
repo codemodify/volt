@@ -124,7 +124,7 @@ fun (v *Value) ValAt(i int) *Value {
 
 // ---- QuoteString: escape + wrap with double quotes -----------------
 fun QuoteString(s string) string {
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     b.WriteByte(34)  // '"'
     var n int = len(s)
     for i:=0; i < n; i++ {
@@ -190,7 +190,7 @@ fun UnquoteString(s string) (string, error) {
     if n < 2 { ret "", errors.New("json: too short") }
     if s[0] != 34 { ret "", errors.New("json: missing opening quote") }
     if s[n-1] != 34 { ret "", errors.New("json: missing closing quote") }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var i int = 1
     for i < n-1 {
         var c byte = s[i]
@@ -247,7 +247,7 @@ fun UnquoteString(s string) (string, error) {
 // scalars (null/bool/int/string) the output matches Encode — there's
 // nothing to lay out. Arrays and objects expand onto multiple lines.
 fun EncodePretty(v *Value, indent string) string {
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     encodePrettyInto(v, indent, 0, b)
     ret b.String()
 }
@@ -314,7 +314,7 @@ fun Encode(v *Value) string {
     if v.kind == KindNumber { ret strconv.Itoa(v.numV) }
     if v.kind == KindString { ret QuoteString(v.strV) }
     if v.kind == KindArray {
-        var b *bytes.Builder = bytes.NewBuilder()
+        var b bytes.Builder = new bytes.Builder{}
         b.WriteByte(91)    // '['
         var n int = len(v.arr)
         for i:=0; i < n; i++ {
@@ -325,7 +325,7 @@ fun Encode(v *Value) string {
         ret b.String()
     }
     if v.kind == KindObject {
-        var b *bytes.Builder = bytes.NewBuilder()
+        var b bytes.Builder = new bytes.Builder{}
         b.WriteByte(123)   // '{'
         var n int = len(v.keys)
         for i:=0; i < n; i++ {

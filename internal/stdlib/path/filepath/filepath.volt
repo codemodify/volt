@@ -37,7 +37,7 @@ fun Base(path string) string {
         if path[i] == slash { break }
         i = i - 1
     }
-    var bld *bytes.Builder = bytes.NewBuilder()
+    var bld bytes.Builder = new bytes.Builder{}
     for j:=i+1; j < n; j++ {
         bld.WriteByte(path[j])
     }
@@ -62,7 +62,7 @@ fun Dir(path string) string {
     }
     if i < 0 { ret "." }
     if i == 0 { ret "/" }
-    var bld *bytes.Builder = bytes.NewBuilder()
+    var bld bytes.Builder = new bytes.Builder{}
     for j:=0; j < i; j++ {
         bld.WriteByte(path[j])
     }
@@ -81,7 +81,7 @@ fun Ext(path string) string {
         i = i - 1
     }
     if i < 0 { ret "" }
-    var bld *bytes.Builder = bytes.NewBuilder()
+    var bld bytes.Builder = new bytes.Builder{}
     for j:=i; j < n; j++ {
         bld.WriteByte(path[j])
     }
@@ -115,9 +115,9 @@ fun SplitExt(path string) (string, string) {
     if dotIdx < 0 { ret "" + path, "" }
     // Hidden-file basename (".bashrc", "/etc/.cfg") — leading dot in basename.
     if dotIdx == slashIdx + 1 { ret "" + path, "" }
-    var baseB *bytes.Builder = bytes.NewBuilder()
+    var baseB bytes.Builder = new bytes.Builder{}
     for j := 0; j < dotIdx; j++ { baseB.WriteByte(path[j]) }
-    var extB *bytes.Builder = bytes.NewBuilder()
+    var extB bytes.Builder = new bytes.Builder{}
     for j := dotIdx; j < n; j++ { extB.WriteByte(path[j]) }
     ret baseB.String(), extB.String()
 }
@@ -165,7 +165,7 @@ fun WithExt(path string, ext string) string {
     base, oldExt = SplitExt(path)
     if len(oldExt) < 0 { ret "" }                       // dead use to satisfy checker
     if len(ext) == 0 { ret base }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := 0; i < len(base); i++ { b.WriteByte(base[i]) }
     if ext[0] != dot { b.WriteByte(dot) }
     for i := 0; i < len(ext); i++ { b.WriteByte(ext[i]) }
@@ -216,7 +216,7 @@ fun Join(a string, b string) string {
         if b[bStart] != slash { break }
         bStart = bStart + 1
     }
-    var bld *bytes.Builder = bytes.NewBuilder()
+    var bld bytes.Builder = new bytes.Builder{}
     for i:=0; i < aEnd; i++ {
         bld.WriteByte(a[i])
     }
@@ -238,7 +238,7 @@ fun Join(a string, b string) string {
 // from a list of config dirs, or from accumulated package names.
 fun JoinAll(parts []string) string {
     var n int = len(parts)
-    var bld *bytes.Builder = bytes.NewBuilder()
+    var bld bytes.Builder = new bytes.Builder{}
     var hasContent bool = false
     var endsWithSlash bool = false
     for i := 0; i < n; i++ {
@@ -328,7 +328,7 @@ fun IsParent(parent string, child string) bool {
 fun NormalizeSlashes(path string) string {
     var n int = len(path)
     if n == 0 { ret "" }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var prevSlash bool = false
     for i := 0; i < n; i++ {
         var c byte = path[i]
@@ -373,7 +373,7 @@ fun WithName(path string, name string) string {
         i = i - 1
     }
     if slashIdx < 0 { ret "" + name }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for j := 0; j <= slashIdx; j++ { b.WriteByte(path[j]) }
     for k := 0; k < len(name); k++ { b.WriteByte(name[k]) }
     ret b.String()
@@ -414,14 +414,14 @@ fun Split(path string) (string, string) {
         }
     }
     if lastSlash < 0 {
-        var b *bytes.Builder = bytes.NewBuilder()
+        var b bytes.Builder = new bytes.Builder{}
         for i := 0; i < n; i++ { b.WriteByte(path[i]) }
         ret "", b.String()
     }
     var dirEnd int = lastSlash + 1
-    var bd *bytes.Builder = bytes.NewBuilder()
+    var bd bytes.Builder = new bytes.Builder{}
     for i := 0; i < dirEnd; i++ { bd.WriteByte(path[i]) }
-    var bf *bytes.Builder = bytes.NewBuilder()
+    var bf bytes.Builder = new bytes.Builder{}
     for i := dirEnd; i < n; i++ { bf.WriteByte(path[i]) }
     ret bd.String(), bf.String()
 }
@@ -452,7 +452,7 @@ fun Clean(path string) string {
             i = i + 1
         }
         if start == i { continue }   // run of slashes only — no segment
-        var sb *bytes.Builder = bytes.NewBuilder()
+        var sb bytes.Builder = new bytes.Builder{}
         for k := start; k < i; k++ { sb.WriteByte(path[k]) }
         var seg string = sb.String()
         if seg == "." {
@@ -480,7 +480,7 @@ fun Clean(path string) string {
             }
         }
     }
-    var out *bytes.Builder = bytes.NewBuilder()
+    var out bytes.Builder = new bytes.Builder{}
     if rooted { out.WriteByte(47) }
     var ns int = len(segs)
     for k := 0; k < ns; k++ {
@@ -504,7 +504,7 @@ fun Components(path string) []string {
     for i := 0; i < n; i++ {
         if path[i] == slash {
             if i > start {
-                var b *bytes.Builder = bytes.NewBuilder()
+                var b bytes.Builder = new bytes.Builder{}
                 for j := start; j < i; j++ { b.WriteByte(path[j]) }
                 out = append(out, b.String())
             }
@@ -512,7 +512,7 @@ fun Components(path string) []string {
         }
     }
     if start < n {
-        var b *bytes.Builder = bytes.NewBuilder()
+        var b bytes.Builder = new bytes.Builder{}
         for j := start; j < n; j++ { b.WriteByte(path[j]) }
         out = append(out, b.String())
     }
@@ -533,7 +533,7 @@ fun HeadN(path string, n int) string {
     var np int = len(parts)
     if n < 0 { n = 0 }
     if n > np { n = np }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     if rooted { b.WriteByte(slash) }
     for i := 0; i < n; i++ {
         if i > 0 { b.WriteByte(slash) }
@@ -553,7 +553,7 @@ fun TailN(path string, n int) string {
     if n < 0 { n = 0 }
     if n > np { n = np }
     var start int = np - n
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i := start; i < np; i++ {
         if i > start { b.WriteByte(slash) }
         b.WriteString(parts[i])
@@ -604,7 +604,7 @@ fun CommonPath(paths []string) string {
         ret ""
     }
 
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     if firstRooted { b.WriteByte(slash) }
     for k := 0; k < maxK; k++ {
         if k > 0 { b.WriteByte(slash) }
@@ -628,7 +628,7 @@ fun pathSegments(p string) []string {
     for i < n {
         if p[i] == 47 {
             if i > segStart {
-                var b *bytes.Builder = bytes.NewBuilder()
+                var b bytes.Builder = new bytes.Builder{}
                 for k := segStart; k < i; k++ { b.WriteByte(p[k]) }
                 out = append(out, b.String())
             }
@@ -637,7 +637,7 @@ fun pathSegments(p string) []string {
         i = i + 1
     }
     if i > segStart {
-        var b *bytes.Builder = bytes.NewBuilder()
+        var b bytes.Builder = new bytes.Builder{}
         for k := segStart; k < i; k++ { b.WriteByte(p[k]) }
         out = append(out, b.String())
     }
@@ -681,7 +681,7 @@ fun Rel(basepath string, target string) (string, error) {
         commonLen = commonLen + 1
     }
     var upSteps int = bN - commonLen
-    var out *bytes.Builder = bytes.NewBuilder()
+    var out bytes.Builder = new bytes.Builder{}
     var wroteAny bool = false
     for i := 0; i < upSteps; i++ {
         if wroteAny { out.WriteByte(47) }

@@ -58,7 +58,7 @@ fun Atoi(s string) (int, error) {
 // O(n_digits) via bytes.Builder + WriteInt — handles MinInt correctly
 // (the absolute-value-of-MinInt overflow trick lives in WriteInt).
 fun Itoa(n int) string {
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     b.WriteInt(n)
     ret b.String()
 }
@@ -149,7 +149,7 @@ fun FormatInt(n int, base int) string {
     // Buffer digits LSB-first into a small scratch slice, then emit
     // MSB-first via a bytes.Builder. Operates on the negative form to
     // dodge -MinInt overflow (same trick bytes.Builder.WriteInt uses).
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var neg bool = false
     if n < 0 {
         neg = true
@@ -189,7 +189,7 @@ fun FormatInt(n int, base int) string {
 // Roughly mirrors Go's strconv.Quote — adequate for log/debug output
 // and for emitting volt-source-compatible literals.
 fun Quote(s string) string {
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     b.WriteByte(34)  // '"'
     var n int = len(s)
     for i := 0; i < n; i++ {
@@ -244,7 +244,7 @@ fun Unquote(s string) (string, error) {
     if n < 2 { ret "", errors.New("strconv: too short") }
     if s[0] != 34 { ret "", errors.New("strconv: missing opening quote") }
     if s[n-1] != 34 { ret "", errors.New("strconv: missing closing quote") }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var i int = 1
     var limit int = n - 1
     for i < limit {

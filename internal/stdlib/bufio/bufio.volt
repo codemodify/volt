@@ -99,7 +99,7 @@ fun SplitLines(s string) []string {
             if end > start {
                 if s[end - 1] == 13 { end = end - 1 }   // strip '\r'
             }
-            var b *bytes.Builder = bytes.NewBuilder()
+            var b bytes.Builder = new bytes.Builder{}
             for k := start; k < end; k++ {
                 b.WriteByte(s[k])
             }
@@ -110,7 +110,7 @@ fun SplitLines(s string) []string {
     if start < n {
         var end int = n
         if s[end - 1] == 13 { end = end - 1 }
-        var b *bytes.Builder = bytes.NewBuilder()
+        var b bytes.Builder = new bytes.Builder{}
         for k := start; k < end; k++ {
             b.WriteByte(s[k])
         }

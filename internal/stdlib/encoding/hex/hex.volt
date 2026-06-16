@@ -39,7 +39,7 @@ fun nibble(c byte) int {
 // O(n) via bytes.Builder (Pass 108) — was O(n²) naive concat.
 fun EncodeToString(src string) string {
     var n int = len(src)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i:=0; i < n; i++ {
         var by int = src[i] & 255
         b.WriteByte(hexChar(by >> 4))
@@ -62,7 +62,7 @@ fun hexCharUpper(n int) byte {
 // which accepts both cases.
 fun EncodeToStringUpper(src string) string {
     var n int = len(src)
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     for i:=0; i < n; i++ {
         var by int = src[i] & 255
         b.WriteByte(hexCharUpper(by >> 4))
@@ -95,7 +95,7 @@ fun DecodeString(src string) (string, error) {
     if (n % 2) != 0 {
         ret "", errors.New("hex: odd length input")
     }
-    var b *bytes.Builder = bytes.NewBuilder()
+    var b bytes.Builder = new bytes.Builder{}
     var i int = 0
     for i < n {
         var hi int = nibble(src[i])
